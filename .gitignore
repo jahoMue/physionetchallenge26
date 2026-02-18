@@ -1,0 +1,26 @@
+# Daten – niemals committen!
+*.edf
+*.rec
+*.csv
+data/
+training_data/
+holdout_data/
+
+# Modelle & Outputs
+model/*
+!model/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Notebooks Checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
