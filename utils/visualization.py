@@ -1333,11 +1333,22 @@ def plot_cohort_overview(
     # --- 1. Target-Verteilung ---
     ax1 = fig.add_subplot(gs[0, 0])
     if has_target:
-        counts = patient_level_features[target_col].value_counts()
-        labels = ['No CI', 'CI']
-        colors_pie = ['#1E88E5', '#E53935']
-        ax1.pie(counts.values, labels=labels, colors=colors_pie,
-                autopct='%1.1f%%', startangle=90, textprops={'fontsize': 10})
+        counts = patient_level_features[target_col].value_counts().sort_index()
+        
+        # Dynamische Labels und Farben basierend auf den vorhandenen Daten
+        label_map = {0: 'No CI', 1: 'CI'}
+        color_map = {0: '#1E88E5', 1: '#E53935'}
+        
+        pie_labels = [label_map.get(val, str(val)) for val in counts.index]
+        pie_colors = [color_map.get(val, '#BDBDBD') for val in counts.index]
+        
+        ax1.pie(
+            counts.values, 
+            labels=pie_labels, 
+            colors=pie_colors,
+            autopct='%1.1f%%', 
+            startangle=90, textprops={'fontsize': 10}
+        )
         ax1.set_title(f'Target (n={len(patient_level_features)})', fontsize=12)
     else:
         ax1.text(0.5, 0.5, f'n={len(patient_level_features)}',
@@ -1416,10 +1427,18 @@ def plot_cohort_overview(
             sex_labels = {0: 'Männlich', 1: 'Weiblich'}
             
             if len(sex_target) > 0:
+                # Dynamische Spaltennamen und Farben
+                target_label_map = {0: 'No CI', 1: 'CI'}
+                plot_colors = []
+                if 0 in sex_target.columns:
+                    plot_colors.append('#1E88E5')
+                if 1 in sex_target.columns:
+                    plot_colors.append('#E53935')
+
                 sex_target.index = [sex_labels.get(i, str(i)) for i in sex_target.index]
-                sex_target.columns = ['No CI', 'CI']
+                sex_target.columns = [target_label_map.get(c, str(c)) for c in sex_target.columns]
                 sex_target.plot(kind='bar', ax=ax4,
-                                color=['#1E88E5', '#E53935'], alpha=0.7)
+                                color=plot_colors, alpha=0.7)
                 ax4.legend(fontsize=8)
         else:
             counts = patient_level_features[sex_col].value_counts()
@@ -1930,4 +1949,3 @@ def _select_key_visualization_features(
             break
     
     return selected
-
