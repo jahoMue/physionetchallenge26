@@ -86,6 +86,9 @@ def build_patient_feature_table(
         "segment_idx": range(n_segments),
     })
     
+    # Sammle neue Features in einem Dictionary, um DataFrame-Fragmentation zu vermeiden
+    new_features = {}
+    
     # --- Segment-Metadaten hinzufügen ---
     if segment_metadata is not None and len(segment_metadata) > 0:
         meta_cols = [
@@ -101,24 +104,31 @@ def build_patient_feature_table(
         for col in meta_cols:
             if col in segment_metadata.columns:
                 values = segment_metadata[col].values
+                # Versuche Konvertierung zu numerisch, um 'none' etc. abzufangen
+                try:
+                    values = pd.to_numeric(values, errors='coerce')
+                except Exception:
+                    pass
+                
                 if len(values) >= n_segments:
-                    feature_table[f"meta_{col}"] = values[:n_segments]
+                    new_features[f"meta_{col}"] = values[:n_segments]
                 else:
                     padded = np.full(n_segments, np.nan)
                     padded[:len(values)] = values
-                    feature_table[f"meta_{col}"] = padded
+                    new_features[f"meta_{col}"] = padded
     
     # --- ECG-Features hinzufügen ---
     if ecg_features is not None and len(ecg_features) > 0:
         ecg_cols = [c for c in ecg_features.columns if c != "segment_idx"]
         for col in ecg_cols:
-            values = ecg_features[col].values
+            # Konvertiere zu numerisch, Strings wie 'none' werden NaN
+            values = pd.to_numeric(ecg_features[col], errors='coerce').values
             if len(values) >= n_segments:
-                feature_table[col] = values[:n_segments]
+                new_features[col] = values[:n_segments]
             else:
                 padded = np.full(n_segments, np.nan)
                 padded[:len(values)] = values
-                feature_table[col] = padded
+                new_features[col] = padded
         
         if logger:
             logger.info(f"  ECG-Features: {len(ecg_cols)} Spalten")
@@ -127,13 +137,14 @@ def build_patient_feature_table(
     if eeg_features is not None and len(eeg_features) > 0:
         eeg_cols = [c for c in eeg_features.columns if c != "segment_idx"]
         for col in eeg_cols:
-            values = eeg_features[col].values
+            # Konvertiere zu numerisch, Strings wie 'none' werden NaN
+            values = pd.to_numeric(eeg_features[col], errors='coerce').values
             if len(values) >= n_segments:
-                feature_table[col] = values[:n_segments]
+                new_features[col] = values[:n_segments]
             else:
                 padded = np.full(n_segments, np.nan)
                 padded[:len(values)] = values
-                feature_table[col] = padded
+                new_features[col] = padded
         
         if logger:
             logger.info(f"  EEG-Features: {len(eeg_cols)} Spalten")
@@ -142,16 +153,21 @@ def build_patient_feature_table(
     if annotation_features is not None and len(annotation_features) > 0:
         ann_cols = [c for c in annotation_features.columns if c != "segment_idx"]
         for col in ann_cols:
-            values = annotation_features[col].values
+            # Konvertiere zu numerisch, Strings wie 'none' werden NaN
+            values = pd.to_numeric(annotation_features[col], errors='coerce').values
             if len(values) >= n_segments:
-                feature_table[col] = values[:n_segments]
+                new_features[col] = values[:n_segments]
             else:
                 padded = np.full(n_segments, np.nan)
                 padded[:len(values)] = values
-                feature_table[col] = padded
+                new_features[col] = padded
         
         if logger:
             logger.info(f"  Annotation-Features: {len(ann_cols)} Spalten")
+            
+    # --- Alle gesammelten Features zusammenführen ---
+    if new_features:
+        feature_table = pd.concat([feature_table, pd.DataFrame(new_features)], axis=1)
     
     # --- Feature-Bereinigung ---
     feature_table = _clean_feature_table(feature_table, logger)

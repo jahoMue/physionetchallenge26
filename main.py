@@ -245,35 +245,77 @@ def process_single_patient(
         # ==============================================================
         if patient_logger:
             patient_logger.info("Schritt 3: Preprocessing")
-        
+
         # --- ECG Preprocessing ---
         if ecg_idx is not None:
             ecg_signal, ecg_fs = extract_signal(record, ecg_idx)
             ecg_preprocessed = preprocess_ecg_signal(
                 ecg_signal, ecg_fs, logger=patient_logger
             )
-            # Speichere fs für spätere Verwendung
             if ecg_preprocessed:
                 ecg_preprocessed["fs"] = ecg_fs
-        
+
         # --- EEG Preprocessing ---
+        # Schritt 3a: Alle EEG-Kanäle filtern (ohne Bad-Channel-Prüfung)
+        eeg_filtered_signals = {}
+        eeg_fs_value = None
+
         for channel_name, channel_idx in eeg_channels.items():
             eeg_signal, eeg_fs = extract_signal(record, channel_idx)
+            eeg_fs_value = eeg_fs
+            
+            # Nur Filterung durchführen
+            try:
+                from preprocessing.preprocess_eeg import _bandpass_filter, _notch_filter
+                from config import EEG_FILTER
+                
+                filtered = _bandpass_filter(
+                    eeg_signal, eeg_fs,
+                    lowcut=EEG_FILTER["lowcut"],
+                    highcut=EEG_FILTER["highcut"],
+                    order=EEG_FILTER["order"]
+                )
+                if EEG_FILTER.get("notch"):
+                    filtered = _notch_filter(filtered, eeg_fs, freq=EEG_FILTER["notch"])
+                
+                eeg_filtered_signals[channel_name] = filtered
+            except Exception as e:
+                if patient_logger:
+                    patient_logger.error(f"EEG [{channel_name}] Filterung fehlgeschlagen: {e}")
+
+        # Schritt 3b: Bad-Channel-Erkennung + Skalierungsfaktor ermitteln
+        from preprocessing.preprocess_eeg import detect_bad_channels, _detect_eeg_unit_scale
+
+        scale_factor = _detect_eeg_unit_scale(eeg_filtered_signals, logger=patient_logger)
+
+        globally_bad_channels = detect_bad_channels(
+            raw_signals=eeg_filtered_signals,
+            fs=eeg_fs_value if eeg_fs_value else 200.0,
+            logger=patient_logger
+        )
+
+        # Schritt 3c: Einzelkanal-Preprocessing mit Skalierung
+        for channel_name, channel_idx in eeg_channels.items():
+            eeg_signal, eeg_fs = extract_signal(record, channel_idx)
+            is_bad = channel_name in globally_bad_channels
+            
             eeg_result = preprocess_eeg_signal(
                 eeg_signal, eeg_fs,
                 channel_name=channel_name,
+                is_globally_bad=is_bad,
+                scale_to_uv=scale_factor,  # NEU
                 logger=patient_logger
             )
             eeg_preprocessed[channel_name] = eeg_result
-        
-        # EEG Kanalstrategie entscheiden
+
+        # EEG Kanalstrategie entscheiden (unverändert)
         if eeg_preprocessed:
             eeg_strategies = decide_eeg_channel_strategy(
                 eeg_preprocessed, logger=patient_logger
             )
             for region, strategy in eeg_strategies.items():
                 stats.update("eeg_strategy", f"{region}:{strategy['strategy']}")
-        
+
         # --- Respirations-Signale extrahieren ---
         resp_signals = None
         if resp_channels and RSA_ENABLED:

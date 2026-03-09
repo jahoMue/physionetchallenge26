@@ -10,8 +10,9 @@ EEG-Vorverarbeitung:
 
 import numpy as np
 import pandas as pd
+import neurokit2 as nk
 from scipy import signal as scipy_signal
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from config import (
     EEG_FILTER, EEG_SQI_THRESHOLD, EEG_AMPLITUDE_MAX_UV,
@@ -21,10 +22,255 @@ from config import (
 )
 
 
+# ==============================================================================
+# NEU: Globale Bad-Channel-Erkennung über alle Kanäle
+# ==============================================================================
+
+def detect_bad_channels(
+    raw_signals: Dict[str, np.ndarray],
+    fs: float,
+    bad_threshold: float = 0.5,
+    distance_threshold: float = 0.99,
+    logger=None
+) -> Set[str]:
+
+    bad_channels = set()
+    channel_names = list(raw_signals.keys())
+
+    if len(raw_signals) < 2:
+        if logger:
+            logger.info(
+                f"nk.eeg_badchannels übersprungen: Nur {len(raw_signals)} Kanal/Kanäle "
+                f"verfügbar (mindestens 2 benötigt für Vergleich)."
+            )
+        return bad_channels
+
+    try:
+        min_len = min(len(sig) for sig in raw_signals.values())
+        
+        scale_factor = _detect_eeg_unit_scale(raw_signals, logger)
+        
+        max_samples = int(60 * fs)
+        if min_len > max_samples:
+            start = (min_len - max_samples) // 2
+            end = start + max_samples
+        else:
+            start = 0
+            end = min_len
+        
+        # ============================================================
+        # FIX: nk.eeg_badchannels v0.2.10 erwartet (n_channels, n_samples)
+        # Zeile 67: channel = eeg[i, :] → i = Kanal-Index
+        # ============================================================
+        eeg_array = np.column_stack([
+            raw_signals[name][start:end] * scale_factor 
+            for name in channel_names
+        ]).T  # Shape: (n_channels, n_samples)
+
+        if logger:
+            logger.info(
+                f"nk.eeg_badchannels: Prüfe {len(raw_signals)} Kanäle "
+                f"({channel_names}), shape={eeg_array.shape} "
+                f"(n_channels x n_samples), scale_factor={scale_factor:.0f}"
+            )
+            logger.debug(
+                f"  Nach Skalierung: std pro Kanal = "
+                f"{[f'{np.std(eeg_array[i, :]):.2f}' for i in range(eeg_array.shape[0])]}"
+            )
+
+        import traceback
+        try:
+            result = nk.eeg_badchannels(
+                eeg_array,
+                bad_threshold=bad_threshold,
+                distance_threshold=distance_threshold,
+                show=False
+            )
+
+            if logger:
+                logger.info(f"nk.eeg_badchannels Ergebnis: type={type(result)}, value={result}")
+
+        except Exception as inner_e:
+            if logger:
+                logger.warning(f"nk.eeg_badchannels INNER Exception: {type(inner_e).__name__}: {inner_e}")
+                logger.warning(f"FULL Traceback:\n{traceback.format_exc()}")
+            raise
+
+        # Ergebnis verarbeiten
+        if isinstance(result, (list, np.ndarray)):
+            result = np.asarray(result)
+
+            if result.dtype == bool or result.dtype == np.bool_:
+                for i, is_bad in enumerate(result):
+                    if is_bad and i < len(channel_names):
+                        bad_channels.add(channel_names[i])
+
+            elif np.issubdtype(result.dtype, np.integer):
+                for idx in result:
+                    if 0 <= idx < len(channel_names):
+                        bad_channels.add(channel_names[idx])
+
+            elif np.issubdtype(result.dtype, np.str_):
+                bad_channels = set(result)
+
+        if bad_channels:
+            if logger:
+                logger.warning(
+                    f"nk.eeg_badchannels: Schlechte Kanäle erkannt: {bad_channels}"
+                )
+        else:
+            if logger:
+                logger.info("nk.eeg_badchannels: Alle Kanäle OK.")
+
+    except Exception as e:
+        if logger:
+            logger.warning(f"nk.eeg_badchannels fehlgeschlagen: {e}")
+        bad_channels = _fallback_bad_channel_detection(raw_signals, fs, logger)
+
+    return bad_channels
+
+
+
+def _detect_eeg_unit_scale(
+    raw_signals: Dict[str, np.ndarray],
+    logger=None
+) -> float:
+    """
+    Erkennt die Einheit der EEG-Signale und gibt den Skalierungsfaktor
+    zurück, um auf Mikrovolt (µV) zu konvertieren.
+    
+    Typische EEG-Amplituden: 10-100 µV (std ~20-50 µV)
+    
+    Heuristik basierend auf Standardabweichung:
+    - std ~ 1e-5 bis 1e-4  → Volt      → Faktor 1e6
+    - std ~ 1e-2 bis 1e-1  → Millivolt → Faktor 1e3
+    - std ~ 10 bis 100     → Mikrovolt → Faktor 1
+    - std ~ 1e4 bis 1e5    → Nanovolt  → Faktor 1e-3
+    
+    Returns
+    -------
+    float
+        Skalierungsfaktor um auf µV zu konvertieren.
+    """
+    # Berechne mittlere Standardabweichung über alle Kanäle
+    stds = []
+    for name, sig in raw_signals.items():
+        # Nehme nur einen Ausschnitt für Effizienz
+        sample = sig[:min(len(sig), 100000)]
+        stds.append(np.std(sample))
+    
+    mean_std = np.mean(stds)
+    
+    if mean_std == 0:
+        if logger:
+            logger.warning("EEG Einheiten-Erkennung: std=0, nehme Faktor 1")
+        return 1.0
+    
+    # Bestimme Skalierungsfaktor
+    if mean_std < 1e-3:
+        # Wahrscheinlich Volt (std ~ 1e-5 für typisches EEG)
+        scale = 1e6
+        unit = "V"
+    elif mean_std < 1.0:
+        # Wahrscheinlich Millivolt
+        scale = 1e3
+        unit = "mV"
+    elif mean_std < 1000:
+        # Wahrscheinlich bereits Mikrovolt
+        scale = 1.0
+        unit = "µV"
+    else:
+        # Unbekannt, nehme µV an
+        scale = 1.0
+        unit = "µV (angenommen)"
+    
+    if logger:
+        logger.info(
+            f"EEG Einheiten-Erkennung: mean_std={mean_std:.6e} → "
+            f"vermutlich {unit}, Skalierungsfaktor={scale:.0f} "
+            f"(→ std nach Skalierung: {mean_std * scale:.1f} µV)"
+        )
+    
+    return scale
+
+
+
+def _fallback_bad_channel_detection(
+    raw_signals: Dict[str, np.ndarray],
+    fs: float,
+    logger=None
+) -> Set[str]:
+    """
+    Fallback-Erkennung schlechter Kanäle, falls nk.eeg_badchannels fehlschlägt.
+    """
+    bad_channels = set()
+    
+    if logger:
+        logger.info("Verwende Fallback Bad-Channel-Erkennung...")
+    
+    # Einheiten-Skalierung ermitteln
+    scale_factor = _detect_eeg_unit_scale(raw_signals, logger)
+    
+    for ch_name, sig in raw_signals.items():
+        is_bad = False
+        reasons = []
+        
+        # Skaliere auf µV für Schwellenwert-Vergleiche
+        sig_uv = sig * scale_factor
+        
+        # 1. Flatliner-Check: Standardabweichung zu niedrig
+        std_val = np.std(sig_uv)
+        if std_val < EEG_AMPLITUDE_MIN_UV:
+            is_bad = True
+            reasons.append(f"Flatliner (std={std_val:.3f} µV)")
+        
+        # 2. Amplituden-Check: Zu viele Samples außerhalb des Bereichs
+        abs_amp = np.abs(sig_uv)
+        pct_over = np.mean(abs_amp > EEG_AMPLITUDE_MAX_UV)
+        if pct_over > 0.3:
+            is_bad = True
+            reasons.append(f"Amplitude zu hoch ({pct_over*100:.1f}% über {EEG_AMPLITUDE_MAX_UV}µV)")
+        
+        # 3. Korrelation mit anderen Kanälen (einheitenunabhängig)
+        if len(raw_signals) >= 2:
+            correlations = []
+            for other_name, other_sig in raw_signals.items():
+                if other_name == ch_name:
+                    continue
+                min_len = min(len(sig), len(other_sig))
+                if min_len > 100:
+                    corr = np.corrcoef(sig[:min_len], other_sig[:min_len])[0, 1]
+                    if not np.isnan(corr):
+                        correlations.append(abs(corr))
+            
+            if correlations:
+                mean_corr = np.mean(correlations)
+                if mean_corr < 0.1:
+                    is_bad = True
+                    reasons.append(f"Niedrige Korrelation (mean={mean_corr:.3f})")
+        
+        if is_bad:
+            bad_channels.add(ch_name)
+            if logger:
+                logger.warning(f"Fallback: [{ch_name}] als schlecht markiert: {', '.join(reasons)}")
+        else:
+            if logger:
+                logger.debug(f"Fallback: [{ch_name}] OK (std={std_val:.1f} µV)")
+    
+    return bad_channels
+
+
+
+# ==============================================================================
+# Einzelkanal-Preprocessing (OHNE nk.eeg_badchannels)
+# ==============================================================================
+
 def preprocess_eeg_signal(
     eeg_raw: np.ndarray,
     fs: float,
     channel_name: str = "unknown",
+    is_globally_bad: bool = False,
+    scale_to_uv: float = None,  # NEU: Skalierungsfaktor
     logger=None
 ) -> Dict:
     """
@@ -38,6 +284,8 @@ def preprocess_eeg_signal(
         Sampling-Rate in Hz.
     channel_name : str
         Name des Kanals.
+    is_globally_bad : bool
+        Ob der Kanal von detect_bad_channels() als schlecht markiert wurde.
     logger : loguru.Logger, optional
     
     Returns
@@ -52,13 +300,23 @@ def preprocess_eeg_signal(
         "eeg_cleaned": None,
         "sqi_per_segment": None,
         "quality_mask": None,
-        "info": {"channel_name": channel_name}
+        "info": {
+            "channel_name": channel_name,
+            "is_globally_bad": is_globally_bad,
+        }
     }
     
     if logger:
         logger.info(f"EEG Preprocessing [{channel_name}]: {len(eeg_raw)} samples, "
-                     f"fs={fs} Hz, duration={len(eeg_raw)/fs:.1f}s")
-    
+                     f"fs={fs} Hz, duration={len(eeg_raw)/fs:.1f}s"
+                     f"{' [GLOBAL BAD]' if is_globally_bad else ''}")
+    # ------------------------------------------------------------------
+    # 0. Einheiten-Konvertierung (VOR Filterung)
+    # ------------------------------------------------------------------
+    if scale_to_uv is not None and scale_to_uv != 1.0:
+        eeg_raw = eeg_raw * scale_to_uv
+        if logger:
+            logger.debug(f"EEG [{channel_name}] skaliert mit Faktor {scale_to_uv:.0f} auf µV")
     # ------------------------------------------------------------------
     # 1. Bandpassfilterung
     # ------------------------------------------------------------------
@@ -89,12 +347,30 @@ def preprocess_eeg_signal(
     # ------------------------------------------------------------------
     # 2. SQI pro Segment
     # ------------------------------------------------------------------
-    sqi_df = compute_eeg_sqi_segments(
-        eeg_filtered, fs,
-        segment_length_sec=SEGMENT_LENGTH_SEC,
-        channel_name=channel_name,
-        logger=logger
-    )
+    if is_globally_bad:
+        # Wenn global schlecht, alle Segmente als schlecht markieren
+        n_segments = int(np.ceil(len(eeg_filtered) / (SEGMENT_LENGTH_SEC * fs)))
+        sqi_records = []
+        for seg_idx in range(n_segments):
+            sqi_records.append({
+                "segment_idx": seg_idx,
+                "start_sec": seg_idx * SEGMENT_LENGTH_SEC,
+                "end_sec": (seg_idx + 1) * SEGMENT_LENGTH_SEC,
+                "sqi": 0.0, "amp_sqi": 0.0, "flat_sqi": 0.0, "spec_sqi": 0.0,
+                "channel": channel_name,
+            })
+        sqi_df = pd.DataFrame(sqi_records)
+        if logger:
+            logger.warning(f"EEG [{channel_name}] als global schlecht markiert – "
+                           f"alle {n_segments} Segmente SQI=0.0")
+    else:
+        sqi_df = compute_eeg_sqi_segments(
+            eeg_filtered, fs,
+            segment_length_sec=SEGMENT_LENGTH_SEC,
+            channel_name=channel_name,
+            logger=logger
+        )
+    
     result["sqi_per_segment"] = sqi_df
     
     quality_mask = np.array([
@@ -117,148 +393,57 @@ def decide_eeg_channel_strategy(
     logger=None
 ) -> Dict[str, Dict]:
     """
-    Entscheidet für jedes homologe Kanalpaar die Strategie:
-    - "averaged": Beide Kanäle verfügbar und gute Qualität -> Mitteln
-    - "single_left" / "single_right": Nur ein Kanal nutzbar
-    - "none": Kein Kanal nutzbar
+    Entscheidet für jeden verfügbaren EEG-Kanal, ob er verwendet wird.
+    Anstatt homologe Paare zu mitteln, wird jeder Kanal einzeln behandelt,
+    was für schlafmedizinische Analysen sinnvoller ist.
     
     Parameters
     ----------
     available_channels : Dict[str, Dict]
         Dictionary mit Kanalnamen als Keys und preprocessing-Ergebnissen als Values.
-        z.B. {"F3-M2": {...}, "F4-M1": {...}, "C3-M2": {...}}
+        z.B. {"C3-M2": {...}, "C4-M1": {...}}
     
     Returns
     -------
     Dict[str, Dict]
-        Strategie pro Region mit:
-        - strategy: "averaged", "single_left", "single_right", "none"
+        Strategie pro Kanal mit:
+        - strategy: "single" oder "none"
         - channels_used: Liste der verwendeten Kanalnamen
-        - signal: Das resultierende Signal (gemittelt oder einzeln)
-        - sqi: Kombinierter SQI
-        - quality_mask: Kombinierte Quality-Maske
+        - signal: Das Signal des Kanals
+        - sqi_per_segment: SQI-Daten des Kanals
+        - quality_mask: Quality-Maske des Kanals
     """
     strategies = {}
-    
-    for region, (left_name, right_name) in EEG_HOMOLOG_PAIRS.items():
-        left_data = available_channels.get(left_name)
-        right_data = available_channels.get(right_name)
-        
-        left_ok = (
-            left_data is not None and 
-            left_data.get("eeg_cleaned") is not None and
-            left_data.get("quality_mask") is not None and
-            left_data["quality_mask"].mean() > 0.3  # Mindestens 30% gute Segmente
+
+    for channel_name, channel_data in available_channels.items():
+        is_ok = (
+            channel_data is not None and
+            channel_data.get("eeg_cleaned") is not None and
+            channel_data.get("quality_mask") is not None and
+            channel_data["quality_mask"].mean() > 0.1  # Mindestens 10% gute Segmente
         )
-        
-        right_ok = (
-            right_data is not None and 
-            right_data.get("eeg_cleaned") is not None and
-            right_data.get("quality_mask") is not None and
-            right_data["quality_mask"].mean() > 0.3
-        )
-        
-        if left_ok and right_ok:
-            # Beide verfügbar -> Prüfe Korrelation
-            corr = _compute_channel_correlation(
-                left_data["eeg_cleaned"],
-                right_data["eeg_cleaned"]
-            )
-            
-            if corr >= EEG_CORRELATION_THRESHOLD:
-                # Gute Korrelation -> Mitteln
-                averaged_signal = (
-                    left_data["eeg_cleaned"] + right_data["eeg_cleaned"]
-                ) / 2.0
-                
-                # Kombinierte Quality-Maske: Beide müssen gut sein
-                combined_mask = left_data["quality_mask"] & right_data["quality_mask"]
-                
-                # Kombinierter SQI: Mittelwert
-                combined_sqi = left_data["sqi_per_segment"].copy()
-                combined_sqi["sqi"] = (
-                    left_data["sqi_per_segment"]["sqi"].values + 
-                    right_data["sqi_per_segment"]["sqi"].values
-                ) / 2.0
-                
-                strategies[region] = {
-                    "strategy": "averaged",
-                    "channels_used": [left_name, right_name],
-                    "signal": averaged_signal,
-                    "sqi_per_segment": combined_sqi,
-                    "quality_mask": combined_mask,
-                    "correlation": corr,
-                }
-                
-                if logger:
-                    logger.info(f"EEG [{region}]: AVERAGED ({left_name} + {right_name}), "
-                                f"correlation={corr:.3f}")
-            else:
-                # Schlechte Korrelation -> Nutze den besseren Kanal
-                left_mean_sqi = left_data["sqi_per_segment"]["sqi"].mean()
-                right_mean_sqi = right_data["sqi_per_segment"]["sqi"].mean()
-                
-                if left_mean_sqi >= right_mean_sqi:
-                    best = left_data
-                    best_name = left_name
-                    strategy_name = "single_left"
-                else:
-                    best = right_data
-                    best_name = right_name
-                    strategy_name = "single_right"
-                
-                strategies[region] = {
-                    "strategy": strategy_name,
-                    "channels_used": [best_name],
-                    "signal": best["eeg_cleaned"],
-                    "sqi_per_segment": best["sqi_per_segment"],
-                    "quality_mask": best["quality_mask"],
-                    "correlation": corr,
-                }
-                
-                if logger:
-                    logger.warning(
-                        f"EEG [{region}]: LOW CORRELATION ({corr:.3f}), "
-                        f"using {strategy_name} ({best_name}, "
-                        f"mean SQI={best['sqi_per_segment']['sqi'].mean():.3f})"
-                    )
-        
-        elif left_ok:
-            strategies[region] = {
-                "strategy": "single_left",
-                "channels_used": [left_name],
-                "signal": left_data["eeg_cleaned"],
-                "sqi_per_segment": left_data["sqi_per_segment"],
-                "quality_mask": left_data["quality_mask"],
-                "correlation": None,
+
+        if is_ok:
+            strategies[channel_name] = {
+                "strategy": "single",
+                "channels_used": [channel_name],
+                "signal": channel_data["eeg_cleaned"],
+                "sqi_per_segment": channel_data["sqi_per_segment"],
+                "quality_mask": channel_data["quality_mask"],
             }
             if logger:
-                logger.info(f"EEG [{region}]: SINGLE ({left_name} only)")
-        
-        elif right_ok:
-            strategies[region] = {
-                "strategy": "single_right",
-                "channels_used": [right_name],
-                "signal": right_data["eeg_cleaned"],
-                "sqi_per_segment": right_data["sqi_per_segment"],
-                "quality_mask": right_data["quality_mask"],
-                "correlation": None,
-            }
-            if logger:
-                logger.info(f"EEG [{region}]: SINGLE ({right_name} only)")
-        
+                logger.info(f"EEG [{channel_name}]: Wird als Einzelkanal verwendet.")
         else:
-            strategies[region] = {
+            strategies[channel_name] = {
                 "strategy": "none",
                 "channels_used": [],
                 "signal": None,
                 "sqi_per_segment": None,
                 "quality_mask": None,
-                "correlation": None,
             }
             if logger:
-                logger.warning(f"EEG [{region}]: NONE – kein nutzbarer Kanal verfügbar.")
-    
+                logger.warning(f"EEG [{channel_name}]: Kanal wird nicht verwendet (Qualität zu schlecht oder nicht vorhanden).")
+
     return strategies
 
 

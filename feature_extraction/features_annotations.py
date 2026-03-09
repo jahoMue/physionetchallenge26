@@ -107,15 +107,18 @@ def extract_annotation_features(
     )
     
     # --- Zusammenführen ---
-    all_features = stage_features.copy()
+    dfs_to_concat = [stage_features]
     
     for df in [event_features, cycle_features, temporal_features, global_features]:
         if df is not None and len(df) > 0:
-            # Merge über segment_idx
-            merge_cols = [c for c in df.columns if c != "segment_idx"]
-            for col in merge_cols:
-                if col not in all_features.columns:
-                    all_features[col] = df[col].values[:len(all_features)]
+            # Entferne segment_idx um Duplikate zu vermeiden
+            cols_to_use = [c for c in df.columns if c != "segment_idx"]
+            if cols_to_use:
+                dfs_to_concat.append(df[cols_to_use])
+    
+    all_features = pd.concat(dfs_to_concat, axis=1)
+    # Entferne Duplikate (behalte erste)
+    all_features = all_features.loc[:, ~all_features.columns.duplicated()]
     
     # --- Kontextuelle Features (nach Zusammenführung) ---
     all_features = _add_contextual_features(
@@ -950,6 +953,9 @@ def _add_contextual_features(
     
     window_size = 2 * context_window + 1  # Gesamtfenstergröße
     
+    # Sammle neue Features in einem Dictionary, um DataFrame-Fragmentation zu vermeiden
+    new_ctx_features = {}
+    
     for feat_name in context_features:
         if feat_name not in features_df.columns:
             continue
@@ -958,27 +964,32 @@ def _add_contextual_features(
         
         # --- Gleitender Mittelwert ---
         rolling_mean = _rolling_mean(values, window=window_size)
-        features_df[f"{feat_name}_ctx_mean"] = rolling_mean
+        new_ctx_features[f"{feat_name}_ctx_mean"] = rolling_mean
         
         # --- Gleitende Standardabweichung ---
         rolling_std = _rolling_std(values, window=window_size)
-        features_df[f"{feat_name}_ctx_std"] = rolling_std
+        new_ctx_features[f"{feat_name}_ctx_std"] = rolling_std
         
         # --- Differenz zum vorherigen Segment (Trend) ---
         diff = np.full(len(values), np.nan)
         diff[1:] = values[1:] - values[:-1]
-        features_df[f"{feat_name}_ctx_diff"] = diff
+        new_ctx_features[f"{feat_name}_ctx_diff"] = diff
         
         # --- Abweichung vom gleitenden Mittelwert ---
         deviation = values - rolling_mean
-        features_df[f"{feat_name}_ctx_deviation"] = deviation
+        new_ctx_features[f"{feat_name}_ctx_deviation"] = deviation
         
         # --- Trend über Kontextfenster (lineare Steigung) ---
         trend = _rolling_trend(values, window=window_size)
-        features_df[f"{feat_name}_ctx_trend"] = trend
+        new_ctx_features[f"{feat_name}_ctx_trend"] = trend
+    
+    # --- Alle gesammelten Features zusammenführen ---
+    if new_ctx_features:
+        ctx_df = pd.DataFrame(new_ctx_features, index=features_df.index)
+        features_df = pd.concat([features_df, ctx_df], axis=1)
     
     if logger:
-        n_ctx_features = len(context_features) * 5  # 5 kontextuelle Features pro Basis-Feature
+        n_ctx_features = len(new_ctx_features)
         logger.info(f"Kontextuelle Features hinzugefügt: {n_ctx_features} "
                      f"(basierend auf {len(context_features)} Basis-Features)")
     
@@ -1139,4 +1150,3 @@ def _time_to_event(event_flags: np.ndarray, segment_length_sec: float) -> np.nda
             result[i] = (next_event_idx - i) * segment_length_sec
     
     return result
-
