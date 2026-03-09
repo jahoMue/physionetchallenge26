@@ -5,6 +5,7 @@ Zentrale Konfiguration für die PhysioNet Challenge 2026 Pipeline.
 """
 
 from pathlib import Path
+import os
 
 # ==============================================================================
 # PFADE – Alle Pfade als Path-Objekte!
@@ -188,3 +189,8 @@ EEG_FILTER = {
 EEG_AMPLITUDE_MAX_UV = 200.0    # Maximale physiologische Amplitude (µV)
 EEG_AMPLITUDE_MIN_UV = 0.5      # Minimale Amplitude (Flatliner-Erkennung)
 EEG_CORRELATION_THRESHOLD = 0.7 # Mindestkorrelation für Kanal-Mittelung
+
+# ==============================================================================
+# PARALLEL COMPUTING
+# ==============================================================================
+NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)

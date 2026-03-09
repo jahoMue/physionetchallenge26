@@ -60,6 +60,7 @@ def setup_logger(module_name: str = "pipeline"):
             rotation="50 MB",
             retention="30 days",
             compression="zip",
+            enqueue=True,
         )
         
         # Separater Error-Log
@@ -69,6 +70,7 @@ def setup_logger(module_name: str = "pipeline"):
             level="WARNING",
             rotation="10 MB",
             retention="30 days",
+            enqueue=True,
         )
     
     return _logger
