@@ -875,7 +875,7 @@ def run_full_pipeline(
     logger.info("=" * 70)
     logger.info(f"Gesamtzeit: {total_time:.1f}s ({total_time/60:.1f} min)")
     logger.info(f"Patienten: {results['preprocessing']['n_patients']}")
-    logger.info(f"Bestes Modell: {best_model} "
+    logger.info(f"Bestes Modell: {best_model_type} "
                  f"(AUROC={best_auroc:.4f})")
     
     if results.get("evaluation"):
