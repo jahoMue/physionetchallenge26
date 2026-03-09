@@ -11,6 +11,7 @@ model/*
 !model/.gitkeep
 outputs/*
 !outputs/.gitkeep
+output/
 
 # Python
 __pycache__/

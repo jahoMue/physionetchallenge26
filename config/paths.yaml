@@ -1,6 +1,0 @@
-# config/paths.yaml
-data:
-  external_root: "/mnt/data/physionet2026"
-  training_data: "${data.external_root}/training_data"
-  holdout_data: "${data.external_root}/holdout_data"
-  preprocessed: "${data.external_root}/preprocessed"
