@@ -8,9 +8,9 @@ dependencies:
   - python=3.10
 
   # Wissenschaftliche Basis
-  - defaults::numpy
-  - defaults::scipy=1.11.4
-  - mkl
+  - conda-forge::numpy
+  - conda-forge::scipy=1.11.4
+  - conda-forge::blas=*=openblas
   - pandas=2.1.4
   - matplotlib>=3.8.0
   - seaborn>=0.13.0

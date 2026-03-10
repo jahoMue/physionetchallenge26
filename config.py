@@ -15,7 +15,7 @@ import os
 PROJECT_DIR = Path(__file__).parent.resolve()
 
 # Training-Set Verzeichnis
-TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
+TRAINING_SET_DIR = Path(r"C:\Users\Biosig 1\Documents\Richard\Physionet26Data\training_set")
 
 # Unterverzeichnisse der Datenstruktur
 PHYSIOLOGICAL_DATA_DIR = TRAINING_SET_DIR / "physiological_data"
@@ -124,7 +124,7 @@ RSA_ENABLED = True
 # ==============================================================================
 # LOGGING
 # ==============================================================================
-LOG_LEVEL = "INFO"                 # "DEBUG", "INFO", "WARNING", "ERROR"
+LOG_LEVEL = "WARNING"                 # "DEBUG", "INFO", "WARNING", "ERROR"
 LOG_TO_FILE = True                 # Log in Datei schreiben
 LOG_TO_CONSOLE = True              # Log auf Konsole ausgeben
 LOG_ROTATION = "10 MB"             # Log-Datei Rotation
