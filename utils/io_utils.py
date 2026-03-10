@@ -42,6 +42,7 @@ from config import (
     ALGORITHMIC_ANNOTATIONS_DIR, HUMAN_ANNOTATIONS_DIR,
     ECG_CHANNEL_NAMES, EEG_CHANNEL_MAPPING,
     RESP_CHANNEL_NAMES, SLEEP_STAGE_ENCODING,
+    SIGNAL_DTYPE,
 )
 
 
@@ -127,6 +128,14 @@ def load_record(
             verbose=False
         )
 
+        # ==============================================================
+        # NEW: Convert MNE's internal data buffer to float32
+        # MNE stores data as float64 internally. For PSG signals with
+        # 12-16 bit ADC resolution, float32 (24-bit mantissa) is more
+        # than sufficient. This halves the memory of the Raw object.
+        # ==============================================================
+        raw._data = raw._data.astype(SIGNAL_DTYPE)
+
         metadata = {
             "record_name": record_name,
             "n_sig": len(raw.ch_names),
@@ -145,6 +154,7 @@ def load_record(
 
     except Exception as e:
         return None, {"error": str(e)}
+
 
 
 # ==============================================================================
@@ -368,15 +378,9 @@ def _load_annotations_from_edf(edf_path: Path) -> Optional[pd.DataFrame]:
 def _extract_annotations_from_signal_channels(raw: mne.io.Raw) -> Optional[pd.DataFrame]:
     """
     Extracts sleep stages and events from EDF annotation signal channels.
-    
-    Handles channels like:
-    - stage_expert / stage_caisr: Sleep stage values (may need rounding)
-    - arousal_expert / arousal_caisr: Binary arousal indicators
-    - resp_expert / resp_caisr: Respiratory event indicators
-    - limb_expert / limb_caisr: Limb movement indicators
     """
     try:
-        data = raw.get_data()
+        data = raw.get_data().astype(SIGNAL_DTYPE)  # CHANGED: cast to float32
         ch_names = [ch.lower().strip() for ch in raw.ch_names]
         fs = raw.info['sfreq']
         
@@ -944,9 +948,9 @@ def extract_signal(raw: mne.io.Raw, channel_idx: int) -> Tuple[np.ndarray, float
     Returns
     -------
     Tuple[np.ndarray, float]
-        Signal-Array und Sampling-Rate.
+        Signal-Array (float32) und Sampling-Rate.
     """
-    signal = raw.get_data(picks=[channel_idx])[0]
+    signal = raw.get_data(picks=[channel_idx])[0].astype(SIGNAL_DTYPE)  # CHANGED: cast to float32
     fs = raw.info['sfreq']
     return signal, fs
 

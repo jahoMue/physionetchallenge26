@@ -19,7 +19,7 @@ from typing import Dict, Optional
 
 from config import (
     ECG_FILTER, ECG_SQI_THRESHOLD, ECG_SQI_WINDOW_SEC,
-    HRV_RR_MIN_MS, HRV_RR_MAX_MS, SEGMENT_LENGTH_SEC
+    HRV_RR_MIN_MS, HRV_RR_MAX_MS, SEGMENT_LENGTH_SEC, SIGNAL_DTYPE
 )
 
 # Maximale Chunk-Größe für NeuroKit2 (in Sekunden)
@@ -204,20 +204,18 @@ def _clean_ecg_chunked(
     """
     Filtert das ECG-Signal mit nk.ecg_clean() in Chunks.
     
-    Für kurze Signale (<= 2 Chunks) wird direkt verarbeitet.
-    Für lange Signale wird in überlappende Chunks aufgeteilt,
-    jeder Chunk einzeln mit NeuroKit2 gefiltert, und die
-    Ergebnisse nahtlos zusammengefügt.
+    CHANGED: Output array uses SIGNAL_DTYPE (float32) to halve memory.
     """
     chunk_samples = int(chunk_duration_sec * fs)
     overlap_samples = int(overlap_sec * fs)
 
     # Kurzes Signal: Direkt verarbeiten
     if len(ecg_raw) <= chunk_samples * 2:
-        return nk.ecg_clean(ecg_raw, sampling_rate=int(fs), method="neurokit")
+        cleaned = nk.ecg_clean(ecg_raw, sampling_rate=int(fs), method="neurokit")
+        return cleaned.astype(SIGNAL_DTYPE)  # CHANGED
 
-    # Langes Signal: Chunk-weise
-    ecg_cleaned = np.zeros_like(ecg_raw)
+    # CHANGED: np.empty with SIGNAL_DTYPE instead of np.zeros_like (which copies input dtype)
+    ecg_cleaned = np.empty(len(ecg_raw), dtype=SIGNAL_DTYPE)
     n_chunks = int(np.ceil(len(ecg_raw) / chunk_samples))
 
     if logger:
@@ -226,17 +224,15 @@ def _clean_ecg_chunked(
 
     for chunk_idx in range(n_chunks):
         start = chunk_idx * chunk_samples
-
-        # Erweitere Chunk um Überlappung für Filterartefakte an den Rändern
         chunk_start = max(0, start - overlap_samples)
         chunk_end = min(len(ecg_raw), start + chunk_samples + overlap_samples)
 
         chunk = ecg_raw[chunk_start:chunk_end]
 
-        # Mindestlänge für NeuroKit2
         if len(chunk) < int(fs * 3):
-            ecg_cleaned[start:min(start + chunk_samples, len(ecg_raw))] = \
-                chunk[start - chunk_start:start - chunk_start + min(chunk_samples, len(ecg_raw) - start)]
+            dest_end = min(start + chunk_samples, len(ecg_raw))
+            local_start = start - chunk_start
+            ecg_cleaned[start:dest_end] = chunk[local_start:local_start + (dest_end - start)]
             continue
 
         try:
@@ -244,18 +240,18 @@ def _clean_ecg_chunked(
                 chunk, sampling_rate=int(fs), method="neurokit"
             )
         except Exception:
-            # Fallback für diesen Chunk: scipy Bandpass
             try:
                 chunk_cleaned = _bandpass_filter_scipy(chunk, fs)
             except Exception:
                 chunk_cleaned = chunk.copy()
 
-        # Kopiere nur den nicht-überlappenden Teil
         local_start = start - chunk_start
         dest_end = min(start + chunk_samples, len(ecg_raw))
         local_end = local_start + (dest_end - start)
 
         ecg_cleaned[start:dest_end] = chunk_cleaned[local_start:local_end]
+        
+        del chunk_cleaned  # NEW: explicit cleanup
 
         if logger and (chunk_idx + 1) % 10 == 0:
             logger.info(f"  ECG Filterung: {chunk_idx+1}/{n_chunks} Chunks")
@@ -363,13 +359,13 @@ def _bandpass_filter_scipy(
 ) -> np.ndarray:
     """
     Bandpassfilterung mit scipy als Fallback.
-    Wird nur verwendet wenn nk.ecg_clean() fehlschlägt.
     """
     nyq = 0.5 * fs
     low = max(ECG_FILTER["lowcut"] / nyq, 0.001)
     high = min(ECG_FILTER["highcut"] / nyq, 0.999)
     b, a = butter(ECG_FILTER["order"], [low, high], btype='band')
-    return filtfilt(b, a, ecg_raw)
+    filtered = filtfilt(b, a, ecg_raw)
+    return filtered.astype(SIGNAL_DTYPE)  # CHANGED: cast back to float32
 
 
 def _detect_rpeaks_scipy(

@@ -6,6 +6,7 @@ Zentrale Konfiguration für die PhysioNet Challenge 2026 Pipeline.
 
 from pathlib import Path
 import os
+import numpy as np
 
 # ==============================================================================
 # PFADE – Alle Pfade als Path-Objekte!
@@ -15,7 +16,8 @@ import os
 PROJECT_DIR = Path(__file__).parent.resolve()
 
 # Training-Set Verzeichnis
-TRAINING_SET_DIR = Path(r"C:\Users\Biosig 1\Documents\Richard\Physionet26Data\training_set")
+TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
+                    # Path(r"C:\Users\Biosig 1\Documents\Richard\Physionet26Data\training_set")
 
 # Unterverzeichnisse der Datenstruktur
 PHYSIOLOGICAL_DATA_DIR = TRAINING_SET_DIR / "physiological_data"
@@ -48,7 +50,7 @@ for d in [OUTPUT_DIR, FEATURE_DIR, MODEL_DIR, LOG_DIR, PLOT_DIR]:
 SEGMENT_LENGTH_SEC = 300           # 5 Minuten
 SEGMENT_OVERLAP_SEC = 0            # Keine Überlappung
 SLEEP_EPOCH_SEC = 30               # Standard-Schlafepoche
-
+SIGNAL_DTYPE = np.float32              # NEW: Halves memory for all signal arrays
 # ==============================================================================
 # QUALITÄT
 # ==============================================================================

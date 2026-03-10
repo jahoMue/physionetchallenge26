@@ -29,6 +29,7 @@ import time
 import traceback
 import numpy as np
 import pandas as pd
+import gc
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -118,48 +119,32 @@ def process_single_patient(
     patient_dir: Path,
     record_name: str = None,
     segment_length_sec: float = SEGMENT_LENGTH_SEC,
-    overlap_sec: float = SEGMENT_OVERLAP_SEC
+    overlap_sec: float = SEGMENT_OVERLAP_SEC,
+    feature_output_dir: Path = FEATURE_DIR,  # NEW parameter
 ) -> Optional[Dict]:
     """
     Verarbeitet einen einzelnen Patienten durch die gesamte Pipeline:
     Laden -> Preprocessing -> Segmentierung -> Feature-Extraktion.
     
-    Parameters
-    ----------
-    patient_id : str
-        Patienten-ID.
-    patient_dir : Path
-        Pfad zum Patienten-Verzeichnis.
-    record_name : str, optional
-        Name des Records (ohne Extension).
-    segment_length_sec : float
-        Segmentlänge in Sekunden.
-    overlap_sec : float
-        Überlappung in Sekunden.
-    logger : loguru.Logger, optional
-    
-    Returns
-    -------
-    Dict or None
-        Dictionary mit allen Ergebnissen oder None bei Fehler.
+    CHANGED: Features werden auf Disk gespeichert statt im Result-Dict
+    zurückgegeben. Das Result enthält nur leichtgewichtige Metadaten.
     """
     patient_logger = get_patient_logger(logger, "pipeline", patient_id)
     stats = PipelineStats(patient_id)
     
+    # CHANGED: result dict is now lightweight – no DataFrames
     result = {
         "patient_id": patient_id,
-        "segment_features": None,
-        "patient_features": None,
+        "seg_features_path": None,       # NEW: path to saved file
+        "pat_features_path": None,       # NEW: path to saved file
         "sleep_summary": None,
         "stats": None,
         "success": False,
     }
     
-    # start_time BEFORE try block so it's always defined
     start_time = time.time()
     
-    # Initialize variables that Step 7 visualization needs,
-    # so they exist even if an exception occurs before they're assigned
+    # Initialize variables for cleanup
     ecg_preprocessed = None
     eeg_preprocessed = {}
     eeg_strategies = None
@@ -167,6 +152,8 @@ def process_single_patient(
     segment_features = None
     sleep_summary = None
     recording = None
+    record = None                        # NEW: track for explicit cleanup
+    eeg_filtered_signals = {}            # NEW: track for explicit cleanup
     
     try:
         patient_logger.info(f"{'='*50}")
@@ -174,7 +161,7 @@ def process_single_patient(
         patient_logger.info(f"{'='*50}")
         
         # ==============================================================
-        # SCHRITT 1: DATEN LADEN
+        # SCHRITT 1: DATEN LADEN (unchanged)
         # ==============================================================
         patient_logger.info("Schritt 1: Daten laden")
         
@@ -194,7 +181,6 @@ def process_single_patient(
                             f"fs={fs} Hz, Dauer={total_duration_sec/60:.1f} min")
         patient_logger.info(f"Kanäle: {sig_names}")
         
-        # Annotationen laden
         annotations = load_annotations(
             patient_dir, record_name=record_name, patient_id=patient_id
         )
@@ -205,18 +191,16 @@ def process_single_patient(
             patient_logger.warning("Keine Annotationen gefunden.")
         
         # ==============================================================
-        # SCHRITT 2: KANÄLE IDENTIFIZIEREN
+        # SCHRITT 2: KANÄLE IDENTIFIZIEREN (unchanged)
         # ==============================================================
         patient_logger.info("Schritt 2: Kanäle identifizieren")
         
-        # ECG
         ecg_idx = find_ecg_channel(sig_names)
         if ecg_idx is not None:
             patient_logger.info(f"ECG-Kanal gefunden: {sig_names[ecg_idx]} (Index {ecg_idx})")
         else:
             patient_logger.warning("Kein ECG-Kanal gefunden.")
         
-        # EEG
         eeg_channels = find_eeg_channels(sig_names)
         if eeg_channels:
             patient_logger.info(f"EEG-Kanäle gefunden: {eeg_channels}")
@@ -224,17 +208,15 @@ def process_single_patient(
         else:
             patient_logger.warning("Keine EEG-Kanäle gefunden.")
         
-        # Respiration
         resp_channels = find_resp_channels(sig_names)
         if resp_channels and RSA_ENABLED:
             patient_logger.info(f"Respirations-Kanäle gefunden: {resp_channels}")
         
         # ==============================================================
-        # SCHRITT 3: PREPROCESSING
+        # SCHRITT 3: PREPROCESSING (unchanged)
         # ==============================================================
         patient_logger.info("Schritt 3: Preprocessing")
 
-        # --- ECG Preprocessing ---
         if ecg_idx is not None:
             ecg_signal, ecg_fs = extract_signal(record, ecg_idx)
             ecg_preprocessed = preprocess_ecg_signal(
@@ -243,16 +225,10 @@ def process_single_patient(
             if ecg_preprocessed:
                 ecg_preprocessed["fs"] = ecg_fs
 
-        # --- EEG Preprocessing ---
-        # Schritt 3a: Alle EEG-Kanäle filtern (ohne Bad-Channel-Prüfung)
-        eeg_filtered_signals = {}
         eeg_fs_value = None
-
         for channel_name, channel_idx in eeg_channels.items():
             eeg_signal, eeg_fs = extract_signal(record, channel_idx)
             eeg_fs_value = eeg_fs
-            
-            # Nur Filterung durchführen
             try:
                 from preprocessing.preprocess_eeg import _bandpass_filter, _notch_filter
                 from config import EEG_FILTER
@@ -270,32 +246,26 @@ def process_single_patient(
             except Exception as e:
                 patient_logger.error(f"EEG [{channel_name}] Filterung fehlgeschlagen: {e}")
 
-        # Schritt 3b: Bad-Channel-Erkennung + Skalierungsfaktor ermitteln
         from preprocessing.preprocess_eeg import detect_bad_channels, _detect_eeg_unit_scale
-
         scale_factor = _detect_eeg_unit_scale(eeg_filtered_signals, logger=patient_logger)
-
         globally_bad_channels = detect_bad_channels(
             raw_signals=eeg_filtered_signals,
             fs=eeg_fs_value if eeg_fs_value else 200.0,
             logger=patient_logger
         )
 
-        # Schritt 3c: Einzelkanal-Preprocessing mit Skalierung
         for channel_name, channel_idx in eeg_channels.items():
             eeg_signal, eeg_fs = extract_signal(record, channel_idx)
             is_bad = channel_name in globally_bad_channels
-            
             eeg_result = preprocess_eeg_signal(
                 eeg_signal, eeg_fs,
                 channel_name=channel_name,
                 is_globally_bad=is_bad,
-                scale_to_uv=scale_factor,  # NEU
+                scale_to_uv=scale_factor,
                 logger=patient_logger
             )
             eeg_preprocessed[channel_name] = eeg_result
 
-        # EEG Kanalstrategie entscheiden (unverändert)
         if eeg_preprocessed:
             eeg_strategies = decide_eeg_channel_strategy(
                 eeg_preprocessed, logger=patient_logger
@@ -303,7 +273,6 @@ def process_single_patient(
             for region, strategy in eeg_strategies.items():
                 stats.update("eeg_strategy", f"{region}:{strategy['strategy']}")
 
-        # --- Respirations-Signale extrahieren ---
         resp_signals = None
         if resp_channels and RSA_ENABLED:
             resp_signals = {}
@@ -314,14 +283,12 @@ def process_single_patient(
                     "fs": resp_fs,
                 }
         
-        # --- Annotationen verarbeiten ---
         if annotations:
             annotation_data = process_all_annotations(
                 annotations, total_duration_sec,
                 segment_length_sec=segment_length_sec,
                 logger=patient_logger
             )
-            
             if annotation_data and annotation_data.get("sleep_summary"):
                 summary = annotation_data["sleep_summary"]
                 stats.update("total_sleep_duration_min",
@@ -334,7 +301,7 @@ def process_single_patient(
                              summary.get("obstructive_apnea_count", 0))
         
         # ==============================================================
-        # SCHRITT 4: SEGMENTIERUNG
+        # SCHRITT 4: SEGMENTIERUNG (unchanged)
         # ==============================================================
         patient_logger.info("Schritt 4: Segmentierung")
         
@@ -352,7 +319,6 @@ def process_single_patient(
         
         stats.update("total_segments", recording.n_segments)
         
-        # Qualitäts-Statistiken
         n_ecg_ok = sum(
             1 for s in recording.ecg_segments
             if s is not None and s.quality_ok
@@ -371,25 +337,47 @@ def process_single_patient(
         print_segmentation_summary(recording)
         
         # ==============================================================
-        # SCHRITT 5: FEATURE-EXTRAKTION
+        # NEW: FREE FULL-LENGTH SIGNALS AFTER SEGMENTATION
+        # The segments now hold their own data slices.
+        # We no longer need the full preprocessed signals.
+        # ==============================================================
+        # Free the raw record (largest single object)
+        del record
+        record = None
+        
+        # Free filtered EEG signals (no longer needed)
+        del eeg_filtered_signals
+        eeg_filtered_signals = {}
+        
+        # Free full-length cleaned signals from preprocessing results
+        if ecg_preprocessed:
+            ecg_preprocessed.pop("ecg_cleaned", None)
+            ecg_preprocessed.pop("rpeaks", None)
+        
+        for ch_name in list(eeg_preprocessed.keys()):
+            if eeg_preprocessed[ch_name]:
+                eeg_preprocessed[ch_name].pop("eeg_cleaned", None)
+        
+        gc.collect()
+        patient_logger.info("Speicher freigegeben: Vollständige Signale nach Segmentierung entfernt.")
+        
+        # ==============================================================
+        # SCHRITT 5: FEATURE-EXTRAKTION (unchanged)
         # ==============================================================
         patient_logger.info("Schritt 5: Feature-Extraktion")
         
-        # --- ECG Features ---
         ecg_features = extract_ecg_features_all_segments(
             ecg_segments=recording.ecg_segments,
             resp_segments=recording.resp_segments if RSA_ENABLED else None,
             logger=patient_logger,
         )
         
-        # --- EEG Features ---
         eeg_features = extract_eeg_features_all_segments(
             eeg_segments=recording.eeg_segments,
             eeg_strategies=eeg_strategies,
             logger=patient_logger,
         )
         
-        # --- Annotation Features ---
         sleep_summary = (
             annotation_data.get("sleep_summary")
             if annotation_data else None
@@ -405,11 +393,10 @@ def process_single_patient(
         )
         
         # ==============================================================
-        # SCHRITT 6: FEATURE-TABELLE ERSTELLEN
+        # SCHRITT 6: FEATURE-TABELLE ERSTELLEN (unchanged logic)
         # ==============================================================
         patient_logger.info("Schritt 6: Feature-Tabelle erstellen")
         
-        # Segment-Level
         segment_features = build_patient_feature_table(
             patient_id=patient_id,
             ecg_features=ecg_features,
@@ -420,13 +407,30 @@ def process_single_patient(
             logger=patient_logger,
         )
         
-        # Patient-Level
         patient_features = aggregate_to_patient_level(
             segment_features, sleep_summary, logger=patient_logger
         )
         
-        result["segment_features"] = segment_features
-        result["patient_features"] = patient_features
+        # ==============================================================
+        # NEW: SAVE FEATURES TO DISK INSTEAD OF RETURNING THEM
+        # ==============================================================
+        safe_id = patient_id.replace("/", "_").replace("\\", "_")
+        seg_path = feature_output_dir / f"{safe_id}_segment_features.parquet"
+        pat_path = feature_output_dir / f"{safe_id}_patient_features.parquet"
+        
+        if segment_features is not None and len(segment_features) > 0:
+            segment_features.to_parquet(seg_path, engine="pyarrow", index=False)
+            result["seg_features_path"] = str(seg_path)
+            patient_logger.info(f"Segment-Features gespeichert: {seg_path} "
+                                f"({segment_features.shape})")
+        
+        if patient_features is not None and len(patient_features) > 0:
+            patient_features.to_parquet(pat_path, engine="pyarrow", index=False)
+            result["pat_features_path"] = str(pat_path)
+            patient_logger.info(f"Patient-Features gespeichert: {pat_path} "
+                                f"({patient_features.shape})")
+        
+        # Store only the lightweight sleep_summary dict (small)
         result["sleep_summary"] = sleep_summary
         result["success"] = True
         
@@ -443,12 +447,14 @@ def process_single_patient(
         
         # ==============================================================
         # SCHRITT 7: VISUALISIERUNG (optional)
+        # NOTE: We still have ecg_preprocessed (without ecg_cleaned)
+        # and eeg_preprocessed (without eeg_cleaned). If you need
+        # the signals for plotting, you must do it BEFORE the cleanup
+        # block above. For now, we skip signal-based plots in workers.
         # ==============================================================
         if PLOT_ENABLED and PLOT_PER_PATIENT:
             patient_logger.info("Schritt 7: Visualisierung")
-            
             try:
-                # Sammle SQI-Daten für Plots
                 sqi_ecg = None
                 if ecg_preprocessed and ecg_preprocessed.get("sqi_per_segment") is not None:
                     sqi_ecg = ecg_preprocessed["sqi_per_segment"]
@@ -456,24 +462,19 @@ def process_single_patient(
                 sqi_eeg = {}
                 if eeg_preprocessed:
                     for ch_name, ch_data in eeg_preprocessed.items():
-                        if ch_data.get("sqi_per_segment") is not None:
+                        if ch_data and ch_data.get("sqi_per_segment") is not None:
                             sqi_eeg[ch_name] = ch_data["sqi_per_segment"]
                 
-                # Sammle EEG-Signale für Plots
+                # NOTE: eeg_signals_for_plot is empty because we freed
+                # eeg_cleaned above. Signal-based plots are skipped.
                 eeg_signals_for_plot = {}
-                if eeg_preprocessed:
-                    for ch_name, ch_data in eeg_preprocessed.items():
-                        if ch_data.get("eeg_cleaned") is not None:
-                            eeg_signals_for_plot[ch_name] = ch_data["eeg_cleaned"]
                 
-                # Rohe Annotationen
                 stages_raw = None
                 events_raw = None
                 if annotation_data:
                     stages_raw = annotation_data.get("stages_raw")
                     events_raw = annotation_data.get("events_raw")
                 
-                # Alle Patienten-Plots erstellen
                 safe_patient_id = patient_id.replace("/", "_")
                 patient_plot_dir = PLOT_DIR / safe_patient_id
                 plot_paths = generate_all_patient_plots(
@@ -490,13 +491,19 @@ def process_single_patient(
                     output_dir=patient_plot_dir,
                     logger=patient_logger,
                 )
-                
                 result["plot_paths"] = plot_paths
-                
                 patient_logger.info(f"Visualisierung: {len(plot_paths)} Plots erstellt")
-            
             except Exception as e:
                 patient_logger.warning(f"Visualisierung fehlgeschlagen: {e}")
+        
+        # ==============================================================
+        # NEW: EXPLICIT CLEANUP BEFORE RETURNING
+        # ==============================================================
+        del segment_features, patient_features
+        del ecg_features, eeg_features, annotation_features
+        del recording, ecg_preprocessed, eeg_preprocessed
+        del annotation_data, eeg_strategies, resp_signals
+        gc.collect()
         
     except Exception as e:
         patient_logger.error(f"Fehler bei Patient {patient_id}: {e}")
@@ -518,16 +525,13 @@ def run_preprocessing_pipeline(
     Führt die Preprocessing- und Feature-Extraktions-Pipeline
     für alle Patienten durch.
     
-    Returns
-    -------
-    Tuple[pd.DataFrame, pd.DataFrame]
-        (segment_level_features, patient_level_features)
+    CHANGED: Workers save features to disk. Main process loads them
+    after all workers complete, controlling peak memory usage.
     """
     logger.info("=" * 60)
     logger.info("PREPROCESSING PIPELINE")
     logger.info("=" * 60)
     
-    # Patienten-Liste
     if patient_list is None:
         patient_list = get_patient_list(DATA_DIR)
     
@@ -536,21 +540,18 @@ def run_preprocessing_pipeline(
     
     logger.info(f"Patienten zu verarbeiten: {len(patient_list)}")
     
-    # Verarbeitung
-    patient_segment_tables = {}
-    patient_sleep_summaries = {}
+    # CHANGED: collect paths and summaries instead of DataFrames
+    successful_results = {}   # patient_id -> {seg_path, pat_path, sleep_summary}
     patient_stats = []
     
     total_start = time.time()
     
-    # --- Parallel Processing ---
     max_workers = min(NUM_WORKERS, len(patient_list)) if len(patient_list) > 0 else 1
     logger.info(f"Starte Verarbeitung mit {max_workers} parallelen Workern.")
     
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for i, patient_id in enumerate(patient_list):
-            # patient_id is "site_id/record_name"
             if "/" in patient_id:
                 site_id, record_name = patient_id.split("/", 1)
                 patient_dir = DATA_DIR / site_id
@@ -569,6 +570,7 @@ def run_preprocessing_pipeline(
                 record_name=record_name,
                 segment_length_sec=segment_length_sec,
                 overlap_sec=overlap_sec,
+                feature_output_dir=FEATURE_DIR,  # NEW parameter
             )
             futures[future] = patient_id
 
@@ -577,10 +579,13 @@ def run_preprocessing_pipeline(
             try:
                 result = future.result()
                 
+                # CHANGED: collect paths, not DataFrames
                 if result and result["success"]:
-                    patient_segment_tables[patient_id] = result["segment_features"]
-                    if result["sleep_summary"]:
-                        patient_sleep_summaries[patient_id] = result["sleep_summary"]
+                    successful_results[patient_id] = {
+                        "seg_features_path": result.get("seg_features_path"),
+                        "pat_features_path": result.get("pat_features_path"),
+                        "sleep_summary": result.get("sleep_summary"),
+                    }
                 
                 if result and result.get("stats"):
                     patient_stats.append(result["stats"])
@@ -589,7 +594,6 @@ def run_preprocessing_pipeline(
                 logger.error(f"Fehler bei Patient {patient_id}: {e}")
                 logger.error(traceback.format_exc())
             
-            # Fortschritt
             if (i + 1) % 10 == 0:
                 elapsed = time.time() - total_start
                 rate = (i + 1) / elapsed
@@ -599,11 +603,12 @@ def run_preprocessing_pipeline(
     
     total_elapsed = time.time() - total_start
     
-    n_success = len(patient_segment_tables)
+    n_success = len(successful_results)
     logger.info(f"\nPreprocessing abgeschlossen:")
     logger.info(f"  Erfolgreich: {n_success}/{len(patient_list)}")
     if len(patient_list) > 0:
-        logger.info(f"  Gesamtzeit: {total_elapsed:.1f}s ({total_elapsed/len(patient_list):.1f}s/Patient)")
+        logger.info(f"  Gesamtzeit: {total_elapsed:.1f}s "
+                     f"({total_elapsed/len(patient_list):.1f}s/Patient)")
     else:
         logger.info(f"  Gesamtzeit: {total_elapsed:.1f}s")
         logger.warning("Keine Patienten gefunden! Prüfe das Datenverzeichnis.")
@@ -615,10 +620,38 @@ def run_preprocessing_pipeline(
         stats_df.to_csv(stats_path, index=False)
         logger.info(f"Pipeline-Statistiken gespeichert: {stats_path}")
     
-    # Initialisiere leere DataFrames für den Fall, dass keine Patienten erfolgreich verarbeitet wurden
+    # ==================================================================
+    # NEW: LOAD FEATURES FROM DISK (sequential, memory-controlled)
+    # ==================================================================
+    logger.info("Lade gespeicherte Features von Disk...")
+    
+    patient_segment_tables = {}
+    patient_sleep_summaries = {}
+    
+    for patient_id, paths in successful_results.items():
+        # Load segment features
+        seg_path = paths.get("seg_features_path")
+        if seg_path and Path(seg_path).exists():
+            try:
+                patient_segment_tables[patient_id] = pd.read_parquet(seg_path)
+            except Exception as e:
+                logger.error(f"Fehler beim Laden von {seg_path}: {e}")
+        
+        # Collect sleep summaries
+        if paths.get("sleep_summary"):
+            patient_sleep_summaries[patient_id] = paths["sleep_summary"]
+    
+    logger.info(f"Features geladen: {len(patient_segment_tables)} Patienten")
+    
+    # Free the paths dict (no longer needed)
+    del successful_results
+    gc.collect()
+    
+    # ==================================================================
+    # REST: Build cohort table (unchanged logic)
+    # ==================================================================
     segment_level, patient_level = pd.DataFrame(), pd.DataFrame()
 
-    # Kohorten-Feature-Tabelle erstellen
     if patient_segment_tables:
         segment_level, patient_level = build_cohort_feature_table(
             patient_segment_tables=patient_segment_tables,
@@ -629,10 +662,9 @@ def run_preprocessing_pipeline(
             logger=logger
         )
     
-    # Kohorten-Visualisierungen
+    # Kohorten-Visualisierungen (unchanged)
     if PLOT_ENABLED and PLOT_COHORT and len(patient_level) > 0:
         logger.info("Erstelle Kohorten-Visualisierungen...")
-        
         try:
             cohort_plot_paths = generate_all_cohort_plots(
                 patient_level_features=patient_level,
@@ -641,13 +673,14 @@ def run_preprocessing_pipeline(
                 output_dir=PLOT_DIR / "cohort",
                 logger=logger
             )
-            
             if logger:
                 logger.info(f"Kohorten-Plots erstellt: {len(cohort_plot_paths)}")
         except Exception as e:
             if logger:
                 logger.warning(f"Kohorten-Visualisierung fehlgeschlagen: {e}")
+    
     return segment_level, patient_level
+
 
 
 def run_training_pipeline(
