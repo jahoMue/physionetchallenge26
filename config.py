@@ -14,7 +14,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).parent.resolve()
 
 # Training-Set Verzeichnis
-TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
+TRAINING_SET_DIR = Path(r"E:\Physionet26Data\training_set")
 
 # Unterverzeichnisse der Datenstruktur
 PHYSIOLOGICAL_DATA_DIR = TRAINING_SET_DIR / "physiological_data"
@@ -75,7 +75,6 @@ EEG_FREQUENCY_BANDS = {
 EEG_HOMOLOG_PAIRS = {
     "frontal": ("F3", "F4"),
     "central": ("C3", "C4"),
-    "occipital": ("O1", "O2"),
 }
 
 # ==============================================================================
@@ -155,8 +154,8 @@ EEG_CHANNEL_MAPPING = {
     "F4": ["f4", "f4-m1", "f4-a1", "eeg f4-m1", "eeg f4-a1", "eeg f4"],
     "C3": ["c3", "c3-m2", "c3-a2", "eeg c3-m2", "eeg c3-a2", "eeg c3"],
     "C4": ["c4", "c4-m1", "c4-a1", "eeg c4-m1", "eeg c4-a1", "eeg c4"],
-    "O1": ["o1", "o1-m2", "o1-a2", "eeg o1-m2", "eeg o1-a2", "eeg o1"],
-    "O2": ["o2", "o2-m1", "o2-a1", "eeg o2-m1", "eeg o2-a1", "eeg o2"],
+    "M1": ["m1", "eeg m1"],
+    "M2": ["m2", "eeg m2"]
 }
 
 # Respirations-Kanalnamen

@@ -58,7 +58,7 @@ from utils.logger import setup_logger, get_patient_logger, PipelineStats
 from utils.io_utils import (
     load_demographics, get_patient_list, load_record,
     load_annotations, find_ecg_channel, find_eeg_channels,
-    find_resp_channels, extract_signal
+    find_resp_channels, extract_signal, rereference_eeg_to_bipolar
 )
 
 # Preprocessing
@@ -213,16 +213,6 @@ def process_single_patient(
         if patient_logger:
             patient_logger.info("Schritt 2: Kanäle identifizieren")
         
-        # ECG
-        ecg_idx = find_ecg_channel(sig_names)
-        if ecg_idx is not None:
-            if patient_logger:
-                patient_logger.info(f"ECG-Kanal gefunden: {sig_names[ecg_idx]} "
-                                    f"(Index {ecg_idx})")
-        else:
-            if patient_logger:
-                patient_logger.warning("Kein ECG-Kanal gefunden.")
-        
         # EEG
         eeg_channels = find_eeg_channels(sig_names)
         if eeg_channels:
@@ -232,7 +222,26 @@ def process_single_patient(
         else:
             if patient_logger:
                 patient_logger.warning("Keine EEG-Kanäle gefunden.")
-        
+                
+        # Re-Referencing
+        record_reref, rereferenced = rereference_eeg_to_bipolar(record)
+
+        if rereferenced:
+            record = record_reref
+            sig_names = record_reref.ch_names
+            eeg_channels = []
+            eeg_channels = find_eeg_channels(sig_names)
+
+        # ECG
+        ecg_idx = find_ecg_channel(sig_names)
+        if ecg_idx is not None:
+            if patient_logger:
+                patient_logger.info(f"ECG-Kanal gefunden: {sig_names[ecg_idx]} "
+                                    f"(Index {ecg_idx})")
+        else:
+            if patient_logger:
+                patient_logger.warning("Kein ECG-Kanal gefunden.")
+
         # Respiration
         resp_channels = find_resp_channels(sig_names)
         if resp_channels and RSA_ENABLED:
@@ -570,7 +579,7 @@ def run_preprocessing_pipeline(
     
     total_start = time.time()
     
-    for i, patient_id in enumerate(patient_list):
+    for i, patient_id in enumerate(patient_list[55:]):
         # patient_id is "site_id/record_name"
         if "/" in patient_id:
             site_id, record_name = patient_id.split("/", 1)
