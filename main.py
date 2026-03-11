@@ -22,7 +22,6 @@ Verwendung:
     python main.py --patients 10            # Nur erste 10 Patienten
     python main.py --segment-length 300     # Segmentlänge ändern
 """
-
 import argparse
 import sys
 import time

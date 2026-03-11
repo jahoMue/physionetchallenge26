@@ -10,7 +10,6 @@ Lange Aufnahmen (>10 min) werden in Chunks verarbeitet,
 um Speicherprobleme und C-Level Crashes zu vermeiden.
 NeuroKit2 wird für alle Kernfunktionen verwendet [[1]] [[3]].
 """
-
 import numpy as np
 import pandas as pd
 import neurokit2 as nk

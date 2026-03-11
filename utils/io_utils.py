@@ -27,7 +27,6 @@ training_set/
 │   └── I0006/
 └── demographics.csv
 """
-
 import os
 import re
 import numpy as np

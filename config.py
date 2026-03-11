@@ -3,7 +3,6 @@ config.py
 ==========
 Zentrale Konfiguration für die PhysioNet Challenge 2026 Pipeline.
 """
-
 from pathlib import Path
 import os
 import numpy as np

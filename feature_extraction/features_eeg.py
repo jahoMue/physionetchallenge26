@@ -30,7 +30,6 @@ Asymmetrie-Features (falls beide Hemisphären verfügbar):
 Alle Features werden nur für Segmente mit ausreichender
 Signalqualität (SQI >= Schwellenwert) berechnet.
 """
-
 import numpy as np
 import pandas as pd
 from scipy import signal as scipy_signal

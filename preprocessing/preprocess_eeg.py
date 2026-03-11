@@ -7,7 +7,6 @@ EEG-Vorverarbeitung:
 - Signal Quality Index pro Kanal
 - Kanalauswahl-Strategie (beide mitteln, einzeln, oder verwerfen)
 """
-
 import numpy as np
 import pandas as pd
 import neurokit2 as nk
