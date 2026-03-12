@@ -125,7 +125,7 @@ RSA_ENABLED = True
 # ==============================================================================
 # LOGGING
 # ==============================================================================
-LOG_LEVEL = "WARNING"                 # "DEBUG", "INFO", "WARNING", "ERROR"
+LOG_LEVEL = "INFO"                 # "DEBUG", "INFO", "WARNING", "ERROR"
 LOG_TO_FILE = True                 # Log in Datei schreiben
 LOG_TO_CONSOLE = True              # Log auf Konsole ausgeben
 LOG_ROTATION = "10 MB"             # Log-Datei Rotation

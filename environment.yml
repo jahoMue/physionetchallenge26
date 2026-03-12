@@ -43,3 +43,4 @@ dependencies:
 
     # Logging
     - loguru>=0.7.0
+    - antropy>=0.1.6

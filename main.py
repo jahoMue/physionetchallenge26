@@ -333,7 +333,7 @@ def process_single_patient(
             )
             stats.update("valid_eeg_segments", n_eeg_ok)
         
-        print_segmentation_summary(recording)
+        print_segmentation_summary(recording, logger=patient_logger)
         
         # ==============================================================
         # NEW: FREE FULL-LENGTH SIGNALS AFTER SEGMENTATION

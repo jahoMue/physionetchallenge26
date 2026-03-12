@@ -672,6 +672,7 @@ def add_demographics(
 
     try:
         demographics = pd.read_csv(demographics_path)
+        feature_table = feature_table.copy()
 
         if logger:
             logger.info(f"Demographics geladen: {len(demographics)} Patienten, "

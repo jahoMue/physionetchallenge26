@@ -745,18 +745,19 @@ def get_segment_statistics(recording: SegmentedRecording) -> pd.DataFrame:
     return stats
 
 
-def print_segmentation_summary(recording: SegmentedRecording):
+def print_segmentation_summary(recording: SegmentedRecording,
+    logger=None):
     """
     Gibt eine lesbare Zusammenfassung der Segmentierung aus.
     """
-    print(f"\n{'='*60}")
-    print(f"Segmentierung: Patient {recording.patient_id}")
-    print(f"{'='*60}")
-    print(f"Aufnahmedauer:    {recording.total_duration_sec/60:.1f} min")
-    print(f"Segmentlänge:    {recording.segment_length_sec}s")
-    print(f"Überlappung:     {recording.segment_overlap_sec}s")
-    print(f"Anzahl Segmente: {recording.n_segments}")
-    print(f"{'-'*60}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Segmentierung: Patient {recording.patient_id}")
+    logger.info(f"{'='*60}")
+    logger.info(f"Aufnahmedauer:    {recording.total_duration_sec/60:.1f} min")
+    logger.info(f"Segmentlänge:    {recording.segment_length_sec}s")
+    logger.info(f"Überlappung:     {recording.segment_overlap_sec}s")
+    logger.info(f"Anzahl Segmente: {recording.n_segments}")
+    logger.info(f"{'-'*60}")
     
     # --- ECG ---
     n_ecg_valid = sum(1 for s in recording.ecg_segments if s is not None)
@@ -764,9 +765,9 @@ def print_segmentation_summary(recording: SegmentedRecording):
         1 for s in recording.ecg_segments 
         if s is not None and s.quality_ok
     )
-    print(f"\nECG:")
-    print(f"  Gültige Segmente:     {n_ecg_valid}/{recording.n_segments}")
-    print(f"  Qualität OK:          {n_ecg_quality}/{recording.n_segments} "
+    logger.info(f"\nECG:")
+    logger.info(f"  Gültige Segmente:     {n_ecg_valid}/{recording.n_segments}")
+    logger.info(f"  Qualität OK:          {n_ecg_quality}/{recording.n_segments} "
           f"({n_ecg_quality/recording.n_segments*100:.1f}%)" 
           if recording.n_segments > 0 else "  Qualität OK: N/A")
     
@@ -780,11 +781,11 @@ def print_segmentation_summary(recording: SegmentedRecording):
             if len(valid_rr) > 0:
                 hrs.append(60000 / np.mean(valid_rr))
     if hrs:
-        print(f"  Mittlere HR:          {np.mean(hrs):.1f} bpm "
+        logger.info(f"  Mittlere HR:          {np.mean(hrs):.1f} bpm "
               f"(Range: {np.min(hrs):.1f}-{np.max(hrs):.1f})")
     
     # --- EEG ---
-    print(f"\nEEG:")
+    logger.info(f"\nEEG:")
     if recording.eeg_segments:
         for region, segments in recording.eeg_segments.items():
             n_valid = sum(1 for s in segments if s is not None)
@@ -799,68 +800,68 @@ def print_segmentation_summary(recording: SegmentedRecording):
                     strategy = s.channel_name.split("_")[-1] if "_" in s.channel_name else "unknown"
                     break
             
-            print(f"  [{region}] Strategie: {strategy}")
-            print(f"    Gültige Segmente:   {n_valid}/{recording.n_segments}")
-            print(f"    Qualität OK:        {n_quality}/{recording.n_segments} "
+            logger.info(f"  [{region}] Strategie: {strategy}")
+            logger.info(f"    Gültige Segmente:   {n_valid}/{recording.n_segments}")
+            logger.info(f"    Qualität OK:        {n_quality}/{recording.n_segments} "
                   f"({n_quality/recording.n_segments*100:.1f}%)"
                   if recording.n_segments > 0 else "    Qualität OK: N/A")
     else:
-        print("  Keine EEG-Kanäle verfügbar.")
+        logger.info("  Keine EEG-Kanäle verfügbar.")
     
     # --- Respiration ---
-    print(f"\nRespiration:")
+    logger.info(f"\nRespiration:")
     if recording.resp_segments:
         for resp_name, segments in recording.resp_segments.items():
             n_valid = sum(1 for s in segments if s is not None)
-            print(f"  [{resp_name}] Gültige Segmente: {n_valid}/{recording.n_segments}")
+            logger.info(f"  [{resp_name}] Gültige Segmente: {n_valid}/{recording.n_segments}")
     else:
-        print("  Keine Respirationssignale verfügbar.")
+        logger.info("  Keine Respirationssignale verfügbar.")
     
     # --- Annotationen ---
-    print(f"\nAnnotationen:")
+    logger.info(f"\nAnnotationen:")
     if recording.stages_per_segment is not None:
         stages = recording.stages_per_segment
         stage_counts = stages["dominant_stage"].value_counts().to_dict()
-        print(f"  Schlafstadien vorhanden: Ja")
-        print(f"  Stadien-Verteilung (dominant pro Segment):")
+        logger.info(f"  Schlafstadien vorhanden: Ja")
+        logger.info(f"  Stadien-Verteilung (dominant pro Segment):")
         for stage, count in sorted(stage_counts.items()):
             pct = count / len(stages) * 100
-            print(f"    {stage}: {count} Segmente ({pct:.1f}%)")
+            logger.info(f"    {stage}: {count} Segmente ({pct:.1f}%)")
         
         # Mittlere Stabilität
         mean_stability = stages["stage_stability"].mean()
-        print(f"  Mittlere Stadien-Stabilität: {mean_stability:.2f}")
+        logger.info(f"  Mittlere Stadien-Stabilität: {mean_stability:.2f}")
     else:
-        print("  Schlafstadien: Nicht verfügbar")
+        logger.info("  Schlafstadien: Nicht verfügbar")
     
     if recording.events_per_segment is not None:
         events = recording.events_per_segment
-        print(f"  Events vorhanden: Ja")
+        logger.info(f"  Events vorhanden: Ja")
         
         if "any_event_present" in events.columns:
             n_with_events = events["any_event_present"].sum()
-            print(f"  Segmente mit Events: {n_with_events}/{len(events)} "
+            logger.info(f"  Segmente mit Events: {n_with_events}/{len(events)} "
                   f"({n_with_events/len(events)*100:.1f}%)")
         
         if "any_apnea_present" in events.columns:
             n_with_apnea = events["any_apnea_present"].sum()
-            print(f"  Segmente mit Apnoe:  {n_with_apnea}/{len(events)} "
+            logger.info(f"  Segmente mit Apnoe:  {n_with_apnea}/{len(events)} "
                   f"({n_with_apnea/len(events)*100:.1f}%)")
         
         if "arousal_present" in events.columns:
             n_with_arousal = events["arousal_present"].sum()
-            print(f"  Segmente mit Arousal: {n_with_arousal}/{len(events)} "
+            logger.info(f"  Segmente mit Arousal: {n_with_arousal}/{len(events)} "
                   f"({n_with_arousal/len(events)*100:.1f}%)")
     else:
-        print("  Events: Nicht verfügbar")
+        logger.info("  Events: Nicht verfügbar")
     
     # --- Segment-Metadaten Zusammenfassung ---
     if recording.segment_metadata is not None:
         meta = recording.segment_metadata
-        print(f"\nGesamtqualität:")
+        logger.info(f"\nGesamtqualität:")
         if "any_signal_quality_ok" in meta.columns:
             n_any_ok = meta["any_signal_quality_ok"].sum()
-            print(f"  Segmente mit mind. 1 gutem Signal: "
+            logger.info(f"  Segmente mit mind. 1 gutem Signal: "
                   f"{n_any_ok}/{len(meta)} ({n_any_ok/len(meta)*100:.1f}%)")
         
         # Nutzbare Segmente für Feature-Extraktion
@@ -875,10 +876,10 @@ def print_segmentation_summary(recording: SegmentedRecording):
             if ecg_ok or eeg_ok:
                 n_usable += 1
         
-        print(f"  Nutzbare Segmente (ECG oder EEG OK): "
+        logger.info(f"  Nutzbare Segmente (ECG oder EEG OK): "
               f"{n_usable}/{len(meta)} ({n_usable/len(meta)*100:.1f}%)")
     
-    print(f"\n{'='*60}\n")
+    logger.info(f"\n{'='*60}\n")
 
 
 # ==============================================================================

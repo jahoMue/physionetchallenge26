@@ -494,7 +494,7 @@ def _create_model(
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            use_label_encoder=False,
+            # use_label_encoder=False,
             n_jobs=-1,
             early_stopping_rounds=None,
         )
@@ -583,7 +583,7 @@ def _create_voting_ensemble(
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            use_label_encoder=False,
+            # use_label_encoder=False,
             n_jobs=-1,
         )),
         ("lgbm", lgb.LGBMClassifier(
@@ -626,7 +626,7 @@ def _create_stacking_ensemble(
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            use_label_encoder=False,
+            # use_label_encoder=False,
             n_jobs=-1,
         )),
         ("lgbm", lgb.LGBMClassifier(
@@ -966,7 +966,7 @@ def _tune_with_optuna(
                 "scale_pos_weight": scale_pos_weight if use_cw else 1.0,
                 "random_state": RANDOM_SEED,
                 "eval_metric": "auc",
-                "use_label_encoder": False,
+                # "use_label_encoder": False,
                 "n_jobs": -1,
             }
             model = xgb.XGBClassifier(**params)
@@ -1057,7 +1057,7 @@ def _tune_with_randomized_search(
             scale_pos_weight=scale_pos_weight if use_cw else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            use_label_encoder=False,
+            # use_label_encoder=False,
             n_jobs=-1,
         )
         param_distributions = {
