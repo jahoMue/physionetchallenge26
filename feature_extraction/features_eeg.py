@@ -30,7 +30,6 @@ Asymmetrie-Features (falls beide Hemisphären verfügbar):
 Alle Features werden nur für Segmente mit ausreichender
 Signalqualität (SQI >= Schwellenwert) berechnet.
 """
-
 import numpy as np
 import pandas as pd
 from scipy import signal as scipy_signal
@@ -39,7 +38,8 @@ from typing import Dict, List, Optional, Tuple
 
 from config import (
     EEG_FREQUENCY_BANDS, EEG_SQI_THRESHOLD,
-    SEGMENT_LENGTH_SEC, EEG_HOMOLOG_PAIRS
+    SEGMENT_LENGTH_SEC, EEG_HOMOLOG_PAIRS,
+    SIGNAL_DTYPE,
 )
 
 import warnings
@@ -531,9 +531,9 @@ def _compute_entropy_features(
     max_samples = 5000
     if len(signal) > max_samples:
         step = len(signal) // max_samples
-        signal_ds = signal[::step]
+        signal_ds = signal[::step].astype(SIGNAL_DTYPE)  # CHANGED: ensure float32 copy
     else:
-        signal_ds = signal
+        signal_ds = signal  # Already float32 from preprocessing
     
     # --- Sample Entropy ---
     try:

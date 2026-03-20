@@ -7,7 +7,6 @@ EEG-Vorverarbeitung:
 - Signal Quality Index pro Kanal
 - Kanalauswahl-Strategie (beide mitteln, einzeln, oder verwerfen)
 """
-
 import numpy as np
 import pandas as pd
 import neurokit2 as nk
@@ -18,7 +17,7 @@ from config import (
     EEG_FILTER, EEG_SQI_THRESHOLD, EEG_AMPLITUDE_MAX_UV,
     EEG_AMPLITUDE_MIN_UV, EEG_CORRELATION_THRESHOLD,
     EEG_HOMOLOG_PAIRS, EEG_FREQUENCY_BANDS,
-    SEGMENT_LENGTH_SEC
+    SEGMENT_LENGTH_SEC, SIGNAL_DTYPE
 )
 
 
@@ -65,7 +64,7 @@ def detect_bad_channels(
         eeg_array = np.column_stack([
             raw_signals[name][start:end] * scale_factor 
             for name in channel_names
-        ]).T  # Shape: (n_channels, n_samples)
+        ]).astype(SIGNAL_DTYPE).T  # CHANGED: ensure float32 before transpose
 
         if logger:
             logger.info(
@@ -314,7 +313,7 @@ def preprocess_eeg_signal(
     # 0. Einheiten-Konvertierung (VOR Filterung)
     # ------------------------------------------------------------------
     if scale_to_uv is not None and scale_to_uv != 1.0:
-        eeg_raw = eeg_raw * scale_to_uv
+        eeg_raw = (eeg_raw * SIGNAL_DTYPE(scale_to_uv))  # CHANGED: cast multiplier to float32
         if logger:
             logger.debug(f"EEG [{channel_name}] skaliert mit Faktor {scale_to_uv:.0f} auf µV")
     # ------------------------------------------------------------------
@@ -514,13 +513,12 @@ def _bandpass_filter(
     low = lowcut / nyq
     high = highcut / nyq
     
-    # Sicherheitscheck
     low = max(low, 0.001)
     high = min(high, 0.999)
     
     b, a = scipy_signal.butter(order, [low, high], btype='band')
     filtered = scipy_signal.filtfilt(b, a, signal_data)
-    return filtered
+    return filtered.astype(SIGNAL_DTYPE)  # CHANGED: cast to float32
 
 
 def _notch_filter(
@@ -532,11 +530,12 @@ def _notch_filter(
     """Notch-Filter für Netzfrequenz."""
     nyq = 0.5 * fs
     if freq >= nyq:
-        return signal_data  # Notch-Frequenz über Nyquist
+        return signal_data
     
     b, a = scipy_signal.iirnotch(freq, Q, fs)
     filtered = scipy_signal.filtfilt(b, a, signal_data)
-    return filtered
+    return filtered.astype(SIGNAL_DTYPE)  # CHANGED: cast to float32
+
 
 
 def _amplitude_sqi(segment: np.ndarray) -> float:

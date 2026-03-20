@@ -3,8 +3,9 @@ config.py
 ==========
 Zentrale Konfiguration für die PhysioNet Challenge 2026 Pipeline.
 """
-
 from pathlib import Path
+import os
+import numpy as np
 
 # ==============================================================================
 # PFADE – Alle Pfade als Path-Objekte!
@@ -15,6 +16,7 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 
 # Training-Set Verzeichnis
 TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
+                    # Path(r"C:\Users\Biosig 1\Documents\Richard\Physionet26Data\training_set")
 
 # Unterverzeichnisse der Datenstruktur
 PHYSIOLOGICAL_DATA_DIR = TRAINING_SET_DIR / "physiological_data"
@@ -47,7 +49,7 @@ for d in [OUTPUT_DIR, FEATURE_DIR, MODEL_DIR, LOG_DIR, PLOT_DIR]:
 SEGMENT_LENGTH_SEC = 300           # 5 Minuten
 SEGMENT_OVERLAP_SEC = 0            # Keine Überlappung
 SLEEP_EPOCH_SEC = 30               # Standard-Schlafepoche
-
+SIGNAL_DTYPE = np.float32              # NEW: Halves memory for all signal arrays
 # ==============================================================================
 # QUALITÄT
 # ==============================================================================
@@ -132,11 +134,11 @@ LOG_RETENTION = "30 days"          # Log-Dateien aufbewahren
 # ==============================================================================
 # VISUALISIERUNG
 # ==============================================================================
-PLOT_ENABLED = True
+PLOT_ENABLED = False
 PLOT_FORMAT = "png"
 PLOT_DPI = 150
-PLOT_PER_PATIENT = True
-PLOT_COHORT = True
+PLOT_PER_PATIENT = False
+PLOT_COHORT = False
 PLOT_MAX_PATIENTS = 20
 
 # ==============================================================================
@@ -188,3 +190,8 @@ EEG_FILTER = {
 EEG_AMPLITUDE_MAX_UV = 200.0    # Maximale physiologische Amplitude (µV)
 EEG_AMPLITUDE_MIN_UV = 0.5      # Minimale Amplitude (Flatliner-Erkennung)
 EEG_CORRELATION_THRESHOLD = 0.7 # Mindestkorrelation für Kanal-Mittelung
+
+# ==============================================================================
+# PARALLEL COMPUTING
+# ==============================================================================
+NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)

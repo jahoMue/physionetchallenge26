@@ -665,71 +665,73 @@ def add_demographics(
     demographics_path: Path = DEMOGRAPHICS_FILE,
     logger=None
 ) -> pd.DataFrame:
-    """
-    Fügt Demographics-Daten zur Feature-Tabelle hinzu.
-    
-    Parameters
-    ----------
-    feature_table : pd.DataFrame
-        Feature-Tabelle (Segment- oder Patient-Level).
-    demographics_path : Path
-        Pfad zur Demographics-CSV.
-    
-    Returns
-    -------
-    pd.DataFrame
-        Feature-Tabelle mit Demographics.
-    """
     if not demographics_path.exists():
         if logger:
             logger.warning(f"Demographics-Datei nicht gefunden: {demographics_path}")
         return feature_table
-    
+
     try:
         demographics = pd.read_csv(demographics_path)
-        
+        feature_table = feature_table.copy()
+
         if logger:
             logger.info(f"Demographics geladen: {len(demographics)} Patienten, "
                         f"Spalten: {list(demographics.columns)}")
-        
-        # Identifiziere die Join-Spalte
-        join_col = None
-        for candidate in ["BDSPPatientID", "PatientID", "patient_id", "SubjectID"]:
-            if candidate in demographics.columns:
-                join_col = candidate
-                break
-        
-        if join_col is None:
-            if logger:
-                logger.warning("Keine passende Join-Spalte in Demographics gefunden.")
-            return feature_table
-        
-        # Merge
-        # Stelle sicher dass patient_id in beiden DataFrames gleichen Typ hat
-        feature_table["patient_id"] = feature_table["patient_id"].astype(str)
-        demographics[join_col] = demographics[join_col].astype(str)
-        
-        merged = feature_table.merge(
-            demographics,
-            left_on="patient_id",
-            right_on=join_col,
-            how="left"
-        )
-        
-        # Entferne doppelte Join-Spalte falls nötig
-        if join_col != "patient_id" and join_col in merged.columns:
-            merged = merged.drop(columns=[join_col])
-        
+
+        # ===== NEUER MERGE-KEY =====
+        # patient_id Format: "I0002/sub-I0002150000686_ses-1"
+        # demographics hat: SiteID="I0002", BidsFolder="sub-I0002150000686", SessionID=1
+        # → Baue den gleichen Key in demographics:
+        #   "{SiteID}/{BidsFolder}_ses-{SessionID}"
+
+        if "BidsFolder" in demographics.columns and "SiteID" in demographics.columns:
+            demographics["_merge_key"] = (
+                demographics["SiteID"].astype(str) + "/" +
+                demographics["BidsFolder"].astype(str) + "_ses-" +
+                demographics["SessionID"].astype(str)
+            )
+            feature_table["_merge_key"] = feature_table["patient_id"].astype(str)
+
+            merged = feature_table.merge(
+                demographics,
+                on="_merge_key",
+                how="left"
+            )
+            merged = merged.drop(columns=["_merge_key"])
+        else:
+            # Fallback: Versuche über BDSPPatientID
+            import re
+            def extract_bdsp_id(pid):
+                name = str(pid).split("/")[-1]
+                name = re.sub(r'^sub-', '', name)
+                name = re.sub(r'_ses-\d+$', '', name)
+                for site in ["I0002", "I0006", "S0001"]:
+                    if name.startswith(site):
+                        name = name[len(site):]
+                        break
+                return name
+
+            feature_table["_merge_key"] = feature_table["patient_id"].apply(extract_bdsp_id)
+            demographics["BDSPPatientID"] = demographics["BDSPPatientID"].astype(str)
+
+            merged = feature_table.merge(
+                demographics,
+                left_on="_merge_key",
+                right_on="BDSPPatientID",
+                how="left"
+            )
+            merged = merged.drop(columns=["_merge_key"])
+
         # --- Demographics-Features aufbereiten ---
         merged = _process_demographics(merged, logger)
-        
+
         if logger:
+            from config import TARGET_COLUMN
             n_matched = merged[TARGET_COLUMN].notna().sum() if TARGET_COLUMN in merged.columns else 0
-            logger.info(f"Demographics gemerged: {n_matched}/{len(merged)} "
-                        f"mit Target-Variable")
-        
+            logger.info(f"Demographics gemerged: {n_matched}/{len(merged)} mit Target-Variable")
+
         return merged
-    
+
     except Exception as e:
         if logger:
             logger.error(f"Fehler beim Laden der Demographics: {e}")
@@ -787,10 +789,10 @@ def _process_demographics(df: pd.DataFrame, logger=None) -> pd.DataFrame:
         df = pd.concat([df, ethnicity_dummies], axis=1)
     
     # --- Time to Event ---
-    if TIME_TO_EVENT_COLUMN in df.columns:
-        df["demo_time_to_event"] = pd.to_numeric(
-            df[TIME_TO_EVENT_COLUMN], errors="coerce"
-        )
+    for col_to_drop in [TIME_TO_EVENT_COLUMN, "Last_Known_Visit_Date",
+                        "Time_to_Last_Visit"]:
+        if col_to_drop in df.columns:
+            df = df.drop(columns=[col_to_drop])
     
     # --- Target Variable ---
     if TARGET_COLUMN in df.columns:
