@@ -266,7 +266,9 @@ def prepare_training_data(
         "Cognitive_Impairment", "Time_to_Event",
         "SiteID", "BDSPPatientID", "CreationTime",
         "BidsFolder", "SessionID", "Last_Known_Visit_Date",
+        "Time_to_Last_Visit",
         "Age", "Sex", "Race", "Ethnicity", "BMI",
+        "demo_time_to_event", "demo_time_to_last_visit",
     ]
 
     string_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()

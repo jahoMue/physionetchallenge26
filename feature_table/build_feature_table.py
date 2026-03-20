@@ -789,10 +789,10 @@ def _process_demographics(df: pd.DataFrame, logger=None) -> pd.DataFrame:
         df = pd.concat([df, ethnicity_dummies], axis=1)
     
     # --- Time to Event ---
-    if TIME_TO_EVENT_COLUMN in df.columns:
-        df["demo_time_to_event"] = pd.to_numeric(
-            df[TIME_TO_EVENT_COLUMN], errors="coerce"
-        )
+    for col_to_drop in [TIME_TO_EVENT_COLUMN, "Last_Known_Visit_Date",
+                        "Time_to_Last_Visit"]:
+        if col_to_drop in df.columns:
+            df = df.drop(columns=[col_to_drop])
     
     # --- Target Variable ---
     if TARGET_COLUMN in df.columns:

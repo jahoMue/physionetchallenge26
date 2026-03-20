@@ -2,8 +2,6 @@
 utils/logger.py
 ===============
 Zentrales Logging-System für die gesamte Pipeline.
-Loggt sowohl in die Konsole als auch in Dateien.
-Erstellt pro Lauf und pro Patient separate Log-Einträge.
 """
 
 import sys
@@ -16,24 +14,18 @@ from config import LOG_DIR, LOG_LEVEL, LOG_TO_FILE, LOG_TO_CONSOLE
 def setup_logger(module_name: str = "pipeline"):
     """
     Konfiguriert den Logger für ein bestimmtes Modul.
-    
-    Parameters
-    ----------
-    module_name : str
-        Name des Moduls (wird im Dateinamen verwendet).
-    
-    Returns
-    -------
-    loguru.Logger
-        Konfigurierter Logger.
     """
-    # Entferne Standard-Handler
+    # Entferne ALLE bestehenden Handler
     _logger.remove()
-    
+
     # Timestamp für Log-Datei
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Format
+
+    # Configure default extra fields so that log messages
+    # without .bind() don't crash with KeyError
+    _logger.configure(extra={"module": module_name, "patient_id": "N/A"})
+
+    # Format – uses extra[] fields that now always have defaults
     log_format = (
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
@@ -41,7 +33,7 @@ def setup_logger(module_name: str = "pipeline"):
         "<cyan>{extra[patient_id]}</cyan> | "
         "{message}"
     )
-    
+
     # Konsolen-Handler
     if LOG_TO_CONSOLE:
         _logger.add(
@@ -49,8 +41,9 @@ def setup_logger(module_name: str = "pipeline"):
             format=log_format,
             level=LOG_LEVEL,
             colorize=True,
+            catch=True,  # Prevents logging errors from crashing the app
         )
-    
+
     # Datei-Handler: Hauptlog
     if LOG_TO_FILE:
         _logger.add(
@@ -61,8 +54,9 @@ def setup_logger(module_name: str = "pipeline"):
             retention="30 days",
             compression="zip",
             enqueue=True,
+            catch=True,
         )
-        
+
         # Separater Error-Log
         _logger.add(
             LOG_DIR / f"{module_name}_{timestamp}_errors.log",
@@ -71,28 +65,15 @@ def setup_logger(module_name: str = "pipeline"):
             rotation="10 MB",
             retention="30 days",
             enqueue=True,
+            catch=True,
         )
-    
+
     return _logger
 
 
 def get_patient_logger(logger, module_name: str, patient_id: str):
     """
     Erstellt einen kontextualisierten Logger für einen bestimmten Patienten.
-    
-    Parameters
-    ----------
-    logger : loguru.Logger
-        Basis-Logger.
-    module_name : str
-        Name des aktuellen Moduls.
-    patient_id : str
-        Patienten-ID.
-    
-    Returns
-    -------
-    loguru.Logger
-        Logger mit Patient-Kontext.
     """
     return logger.bind(module=module_name, patient_id=patient_id)
 
@@ -101,7 +82,7 @@ class PipelineStats:
     """
     Sammelt Statistiken über die Pipeline-Verarbeitung pro Patient.
     """
-    
+
     def __init__(self, patient_id: str):
         self.patient_id = patient_id
         self.stats = {
@@ -112,7 +93,7 @@ class PipelineStats:
             "valid_eeg_segments": 0,
             "rejected_eeg_segments": 0,
             "eeg_channels_used": [],
-            "eeg_strategy": "",  # "averaged", "single", "none"
+            "eeg_strategy": "",
             "total_arousals": 0,
             "total_central_apneas": 0,
             "total_obstructive_apneas": 0,
@@ -124,9 +105,8 @@ class PipelineStats:
             "errors": [],
             "warnings": [],
         }
-    
+
     def update(self, key: str, value):
-        """Update a statistic."""
         if key in self.stats:
             if isinstance(self.stats[key], list):
                 if isinstance(value, list):
@@ -135,18 +115,15 @@ class PipelineStats:
                     self.stats[key].append(value)
             else:
                 self.stats[key] = value
-    
+
     def increment(self, key: str, amount: int = 1):
-        """Increment a numeric statistic."""
         if key in self.stats and isinstance(self.stats[key], (int, float)):
             self.stats[key] += amount
-    
+
     def get_summary(self) -> dict:
-        """Return summary statistics."""
         return self.stats.copy()
-    
+
     def log_summary(self, logger):
-        """Log the summary statistics."""
         logger.info("=" * 60)
         logger.info(f"Pipeline Summary for Patient: {self.patient_id}")
         logger.info("=" * 60)
