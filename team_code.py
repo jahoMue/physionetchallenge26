@@ -334,14 +334,18 @@ def run_model(model, record, data_folder, verbose):
         feature_output_dir = Path(tmp_model_dir) / "features"
         feature_output_dir.mkdir(parents=True, exist_ok=True)
 
-        result = process_single_patient(
-            patient_id=pipeline_patient_id,
-            patient_dir=patient_dir,
-            record_name=record_name,
-            segment_length_sec=config.SEGMENT_LENGTH_SEC,
-            overlap_sec=config.SEGMENT_OVERLAP_SEC,
-            feature_output_dir=feature_output_dir,
-        )
+        # Parallel preprocessing using ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
+            future = executor.submit(
+                process_single_patient,
+                patient_id=pipeline_patient_id,
+                patient_dir=patient_dir,
+                record_name=record_name,
+                segment_length_sec=config.SEGMENT_LENGTH_SEC,
+                overlap_sec=config.SEGMENT_OVERLAP_SEC,
+                feature_output_dir=feature_output_dir,
+            )
+            result = future.result()
 
         if result is None or not result["success"]:
             if verbose:
