@@ -405,12 +405,14 @@ def _extract_annotations_from_signal_channels(raw: mne.io.Raw) -> Optional[pd.Da
                 if event_df is not None and len(event_df) > 0:
                     all_annotations.append(event_df)
             
-            # --- RESPIRATORY EVENTS ---
+                        # --- RESPIRATORY EVENTS ---
             elif 'resp' in ch_name:
                 if 'prob' in ch_name:
                     continue
-                event_df = _parse_binary_event_channel(
-                    signal, fs, ch_name, event_type="respiratory_event"
+                # Respiratory channels use multi-class encoding (0-9),
+                # NOT binary. Use the multiclass parser.
+                event_df = _parse_multiclass_event_channel(
+                    signal, fs, ch_name
                 )
                 if event_df is not None and len(event_df) > 0:
                     all_annotations.append(event_df)
@@ -549,6 +551,100 @@ def _parse_binary_event_channel(
         return pd.DataFrame(records)
     return None
 
+def _parse_multiclass_event_channel(
+    signal: np.ndarray,
+    fs: float,
+    ch_name: str,
+    event_map: Dict[int, str] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Parses a multi-class event channel (e.g., respiratory events with codes 0-9)
+    into event annotations with onset, duration, and the specific event type.
+
+    PhysioNet Challenge 2026 respiratory encoding:
+        0 = No Event
+        1 = Obstructive Apnea
+        2 = Central Apnea
+        3 = Mixed Apnea
+        4 = Obstructive Hypopnea
+        5 = Central Hypopnea
+        6 = Mixed Hypopnea
+        7 = RERA
+        8 = Apnea (unspecified)
+        9 = Hypopnea (unspecified)
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        The raw signal values from the annotation channel.
+    fs : float
+        Sampling frequency of the annotation channel.
+    ch_name : str
+        Channel name (for logging/debugging).
+    event_map : Dict[int, str], optional
+        Mapping from integer code to event description string.
+        If None, uses the default respiratory event map.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        DataFrame with columns: onset, duration, description
+    """
+    if event_map is None:
+        event_map = {
+            1: "obstructive_apnea",
+            2: "central_apnea",
+            3: "mixed_apnea",
+            4: "obstructive_hypopnea",
+            5: "central_hypopnea",
+            6: "mixed_hypopnea",
+            7: "rera",
+            8: "apnea_unspecified",
+            9: "hypopnea_unspecified",
+        }
+
+    # Round to nearest integer (signal may have float noise)
+    rounded = np.round(signal).astype(int)
+
+    records = []
+    n_samples = len(rounded)
+    i = 0
+
+    while i < n_samples:
+        code = rounded[i]
+
+        # Skip "no event" samples (code 0 or not in map)
+        if code not in event_map:
+            i += 1
+            continue
+
+        # Found the start of an event — find its end
+        event_start_sample = i
+        event_code = code
+
+        while i < n_samples and rounded[i] == event_code:
+            i += 1
+
+        event_end_sample = i  # one past the last sample of this event
+
+        onset_sec = event_start_sample / fs
+        duration_sec = (event_end_sample - event_start_sample) / fs
+
+        # Filter very short events (< 1 second likely noise)
+        if duration_sec < 1.0:
+            continue
+
+        description = event_map[event_code]
+
+        records.append({
+            "onset": float(onset_sec),
+            "duration": float(duration_sec),
+            "description": description,
+        })
+
+    if records:
+        return pd.DataFrame(records)
+    return None
 
 def _map_numeric_to_stage(value: int) -> str:
     """
@@ -632,15 +728,15 @@ def _extract_annotations_from_pyedflib(f, signal_labels: list) -> Optional[pd.Da
                     if event_df is not None and len(event_df) > 0:
                         all_annotations.append(event_df)
             
-            # --- RESPIRATORY ---
+                        # --- RESPIRATORY ---
             elif 'resp' in label and 'prob' not in label:
-                unique_vals = np.unique(signal)
-                if len(unique_vals) <= 5:
-                    event_df = _parse_binary_event_channel(
-                        signal, fs, label, event_type="respiratory_event"
-                    )
-                    if event_df is not None and len(event_df) > 0:
-                        all_annotations.append(event_df)
+                # Respiratory channels use multi-class encoding (0-9)
+                event_df = _parse_multiclass_event_channel(
+                    signal, fs, label
+                )
+                if event_df is not None and len(event_df) > 0:
+                    all_annotations.append(event_df)
+
             
             # --- LIMB ---
             elif 'limb' in label and 'prob' not in label:
