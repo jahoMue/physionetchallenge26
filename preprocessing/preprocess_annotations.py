@@ -6,6 +6,14 @@ Verarbeitung der Schlaf-Annotationen:
 - Event-Extraktion (Arousal, Central Apnea, Obstructive Apnea, etc.)
 - Mapping auf Segmente
 - Berechnung von Event-Distanzen und Event-Dichte
+
+Supports the PhysioNet Challenge 2026 numeric annotation encoding:
+  Sleep stages (stage): 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable
+  Arousals (arousal):   0=No event, 1=Arousal
+  Respiratory (resp):   0=No Event, 1=Obstructive Apnea, 2=Central Apnea,
+                         3=Mixed Apnea, 4=Obstructive Hypopnea,
+                         5=Central Hypopnea, 6=Mixed Hypopnea, 7=RERA,
+                         8=Apnea (unspecified), 9=Hypopnea (unspecified)
 """
 
 import numpy as np
@@ -18,6 +26,56 @@ from config import (
     SEGMENT_LENGTH_SEC, SLEEP_EPOCH_SEC,
     EVENT_DISTANCE_MAX_SEC, EVENT_DENSITY_WINDOW_SEC
 )
+
+
+# ==============================================================================
+# NUMERIC ENCODING MAPS (PhysioNet Challenge 2026)
+# ==============================================================================
+
+# Sleep stage numeric encoding -> label
+NUMERIC_STAGE_MAP = {
+    1: "N3",
+    2: "N2",
+    3: "N1",
+    4: "REM",
+    5: "W",
+    9: None,  # Unavailable
+}
+
+# Respiratory event numeric encoding -> standardized event type
+NUMERIC_RESP_EVENT_MAP = {
+    0: None,                    # No Event
+    1: "obstructive_apnea",     # Obstructive Apnea
+    2: "central_apnea",         # Central Apnea
+    3: "mixed_apnea",           # Mixed Apnea
+    4: "obstructive_hypopnea",  # Obstructive Hypopnea
+    5: "central_hypopnea",      # Central Hypopnea
+    6: "mixed_hypopnea",        # Mixed Hypopnea
+    7: "rera",                  # RERA
+    8: "apnea_unspecified",     # Apnea (unspecified)
+    9: "hypopnea_unspecified",  # Hypopnea (unspecified)
+}
+
+# Arousal event numeric encoding -> standardized event type
+NUMERIC_AROUSAL_EVENT_MAP = {
+    0: None,       # No event
+    1: "arousal",  # Arousal
+}
+
+# Mapping from fine-grained respiratory types to the categories tracked
+# in SLEEP_EVENTS_OF_INTEREST
+RESP_TO_INTEREST_MAP = {
+    "obstructive_apnea": "obstructive_apnea",
+    "central_apnea": "central_apnea",
+    "mixed_apnea": "mixed_apnea",
+    "obstructive_hypopnea": "hypopnea",
+    "central_hypopnea": "hypopnea",
+    "mixed_hypopnea": "hypopnea",
+    "rera": "rera",
+    "apnea_unspecified": "obstructive_apnea",  # conservative default
+    "hypopnea_unspecified": "hypopnea",
+    "arousal": "arousal",
+}
 
 
 # ==============================================================================
@@ -87,7 +145,7 @@ def _parse_stages_from_dataframe(
 ) -> Optional[pd.DataFrame]:
     """
     Parst Schlafstadien aus einem DataFrame (TSV/CSV).
-    Unterstützt verschiedene Spaltenformate.
+    Unterstützt sowohl numerische Kodierung als auch Text-Annotationen.
     """
     # Spalten normalisieren
     df.columns = [c.lower().strip() for c in df.columns]
@@ -120,21 +178,21 @@ def _parse_stages_from_dataframe(
                          f"{list(df.columns)}")
         return None
     
-    # Filtere nur Schlafstadien-Einträge
-    stage_keywords = [
-        "sleep stage", "stage", "w", "wake", "n1", "n2", "n3", "rem",
-        "nrem", "nrem1", "nrem2", "nrem3", "r", "movement"
-    ]
-    
     stages_rows = []
     for _, row in df.iterrows():
-        annotation = str(row[stage_col]).lower().strip()
+        raw_value = row[stage_col]
+        annotation = str(raw_value).strip()
         
-        # Prüfe ob es ein Schlafstadium ist
-        stage_label = _map_annotation_to_stage(annotation)
+        # Try numeric encoding first
+        stage_label = _map_numeric_to_stage(raw_value)
+        
+        # Fall back to text-based mapping
+        if stage_label is None:
+            stage_label = _map_annotation_to_stage(annotation.lower())
+        
         if stage_label is not None:
             onset = float(row[onset_col])
-            duration = float(row[duration_col]) if duration_col else SLEEP_EPOCH_SEC
+            duration = float(row[duration_col]) if duration_col and pd.notna(row.get(duration_col)) else SLEEP_EPOCH_SEC
             epoch_idx = int(onset / SLEEP_EPOCH_SEC)
             
             stages_rows.append({
@@ -178,11 +236,17 @@ def _parse_stages_from_wfdb(
             # Versuche Stage aus Symbol oder aux_note zu lesen
             annotation_text = ""
             if i < len(aux_notes) and aux_notes[i]:
-                annotation_text = str(aux_notes[i]).lower().strip()
+                annotation_text = str(aux_notes[i]).strip()
             elif i < len(symbols) and symbols[i]:
-                annotation_text = str(symbols[i]).lower().strip()
+                annotation_text = str(symbols[i]).strip()
             
-            stage_label = _map_annotation_to_stage(annotation_text)
+            # Try numeric encoding first
+            stage_label = _map_numeric_to_stage(annotation_text)
+            
+            # Fall back to text-based mapping
+            if stage_label is None:
+                stage_label = _map_annotation_to_stage(annotation_text.lower())
+            
             if stage_label is not None:
                 epoch_idx = int(onset_sec / SLEEP_EPOCH_SEC)
                 stages_rows.append({
@@ -206,9 +270,34 @@ def _parse_stages_from_wfdb(
         return None
 
 
+def _map_numeric_to_stage(value) -> Optional[str]:
+    """
+    Maps a numeric stage code to a standardized sleep stage label.
+    
+    PhysioNet Challenge 2026 encoding:
+        1 = N3, 2 = N2, 3 = N1, 4 = REM, 5 = Wake, 9 = Unavailable
+    
+    Parameters
+    ----------
+    value : int, float, or str
+        The raw value from the annotation.
+    
+    Returns
+    -------
+    str or None
+        "W", "N1", "N2", "N3", "REM", or None if not recognized.
+    """
+    try:
+        numeric_val = int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+    
+    return NUMERIC_STAGE_MAP.get(numeric_val, None)
+
+
 def _map_annotation_to_stage(annotation: str) -> Optional[str]:
     """
-    Mappt eine Annotation auf ein standardisiertes Schlafstadium.
+    Mappt eine Text-Annotation auf ein standardisiertes Schlafstadium.
     
     Returns
     -------
@@ -216,6 +305,12 @@ def _map_annotation_to_stage(annotation: str) -> Optional[str]:
         "W", "N1", "N2", "N3", "REM", oder None wenn kein Stadium erkannt.
     """
     ann = annotation.lower().strip().replace(" ", "")
+    
+    # First try numeric encoding (handles cases where numeric values
+    # are passed as strings)
+    numeric_result = _map_numeric_to_stage(ann)
+    if numeric_result is not None:
+        return numeric_result
     
     # Direkte Mappings
     direct_map = {
@@ -236,7 +331,7 @@ def _map_annotation_to_stage(annotation: str) -> Optional[str]:
         "rapideyemovement": "REM",
     }
     
-    # Versuche numerisches Encoding (aus config)
+    # Versuche numerisches Encoding (aus config SLEEP_STAGE_ENCODING)
     for numeric_val, label in SLEEP_STAGE_ENCODING.items():
         if ann == str(numeric_val):
             return label if label != "Unknown" else None
@@ -271,6 +366,9 @@ def parse_sleep_events(
     """
     Extrahiert Schlaf-Events (Arousal, Apnea, Hypopnea, etc.).
     
+    Supports both numeric encoding (PhysioNet Challenge 2026) and
+    text-based annotations.
+    
     Parameters
     ----------
     annotations : Dict
@@ -291,12 +389,15 @@ def parse_sleep_events(
     events_list = []
     
     for key, data in annotations.items():
+        # Determine annotation channel type from key name
+        ann_channel = _detect_annotation_channel(key)
+        
         if isinstance(data, pd.DataFrame):
-            events_df = _parse_events_from_dataframe(data, logger)
+            events_df = _parse_events_from_dataframe(data, ann_channel, logger)
             if events_df is not None and len(events_df) > 0:
                 events_list.append(events_df)
         else:
-            events_df = _parse_events_from_wfdb(data, logger)
+            events_df = _parse_events_from_wfdb(data, ann_channel, logger)
             if events_df is not None and len(events_df) > 0:
                 events_list.append(events_df)
     
@@ -321,11 +422,34 @@ def parse_sleep_events(
     return combined
 
 
+def _detect_annotation_channel(key: str) -> Optional[str]:
+    """
+    Detect the annotation channel type from the key/filename.
+    
+    Returns
+    -------
+    str or None
+        "resp", "arousal", "stage", or None if unknown.
+    """
+    key_lower = key.lower()
+    if "resp" in key_lower:
+        return "resp"
+    elif "arousal" in key_lower or "arsl" in key_lower:
+        return "arousal"
+    elif "stage" in key_lower or "sleep" in key_lower or "hypno" in key_lower:
+        return "stage"
+    return None
+
+
 def _parse_events_from_dataframe(
     df: pd.DataFrame,
+    ann_channel: Optional[str] = None,
     logger=None
 ) -> Optional[pd.DataFrame]:
-    """Parst Events aus einem DataFrame."""
+    """
+    Parst Events aus einem DataFrame.
+    Supports numeric encoding for resp and arousal channels.
+    """
     df.columns = [c.lower().strip() for c in df.columns]
     
     # Finde relevante Spalten
@@ -353,8 +477,15 @@ def _parse_events_from_dataframe(
     
     events_rows = []
     for _, row in df.iterrows():
-        annotation = str(row[event_col]).lower().strip()
-        event_type = _map_annotation_to_event(annotation)
+        raw_value = row[event_col]
+        annotation = str(raw_value).strip()
+        
+        # Try numeric encoding first based on channel type
+        event_type = _map_numeric_to_event(raw_value, ann_channel)
+        
+        # Fall back to text-based mapping
+        if event_type is None:
+            event_type = _map_annotation_to_event(annotation.lower())
         
         if event_type is not None:
             onset = float(row[onset_col])
@@ -376,6 +507,7 @@ def _parse_events_from_dataframe(
 
 def _parse_events_from_wfdb(
     ann_obj,
+    ann_channel: Optional[str] = None,
     logger=None
 ) -> Optional[pd.DataFrame]:
     """Parst Events aus einem WFDB Annotation-Objekt."""
@@ -395,15 +527,19 @@ def _parse_events_from_wfdb(
             
             annotation_text = ""
             if i < len(aux_notes) and aux_notes[i]:
-                annotation_text = str(aux_notes[i]).lower().strip()
+                annotation_text = str(aux_notes[i]).strip()
             elif i < len(symbols) and symbols[i]:
-                annotation_text = str(symbols[i]).lower().strip()
+                annotation_text = str(symbols[i]).strip()
             
-            event_type = _map_annotation_to_event(annotation_text)
+            # Try numeric encoding first
+            event_type = _map_numeric_to_event(annotation_text, ann_channel)
+            
+            # Fall back to text-based mapping
+            if event_type is None:
+                event_type = _map_annotation_to_event(annotation_text.lower())
             
             if event_type is not None:
                 # Versuche Dauer zu bestimmen
-                # Manche Formate haben Start/End-Marker
                 duration = _estimate_event_duration(
                     event_type, i, samples, aux_notes, fs
                 )
@@ -429,6 +565,60 @@ def _parse_events_from_wfdb(
         return None
 
 
+def _map_numeric_to_event(value, ann_channel: Optional[str] = None) -> Optional[str]:
+    """
+    Maps a numeric event code to a standardized event type string.
+    
+    Uses the annotation channel type to determine which encoding map to use.
+    
+    PhysioNet Challenge 2026 encoding:
+        Respiratory (resp):
+            0=No Event, 1=Obstructive Apnea, 2=Central Apnea,
+            3=Mixed Apnea, 4=Obstructive Hypopnea, 5=Central Hypopnea,
+            6=Mixed Hypopnea, 7=RERA, 8=Apnea (unspecified),
+            9=Hypopnea (unspecified)
+        Arousal (arousal):
+            0=No event, 1=Arousal
+    
+    Parameters
+    ----------
+    value : int, float, or str
+        The raw annotation value.
+    ann_channel : str or None
+        The annotation channel type: "resp", "arousal", or None.
+    
+    Returns
+    -------
+    str or None
+        Standardized event type, mapped through RESP_TO_INTEREST_MAP,
+        or None if no event / not recognized.
+    """
+    try:
+        numeric_val = int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+    
+    raw_event_type = None
+    
+    if ann_channel == "resp":
+        raw_event_type = NUMERIC_RESP_EVENT_MAP.get(numeric_val, None)
+    elif ann_channel == "arousal":
+        raw_event_type = NUMERIC_AROUSAL_EVENT_MAP.get(numeric_val, None)
+    else:
+        # Unknown channel: try resp first (more codes), then arousal
+        raw_event_type = NUMERIC_RESP_EVENT_MAP.get(numeric_val, None)
+        if raw_event_type is None:
+            raw_event_type = NUMERIC_AROUSAL_EVENT_MAP.get(numeric_val, None)
+    
+    if raw_event_type is None:
+        return None
+    
+    # Map fine-grained type to the categories in SLEEP_EVENTS_OF_INTEREST
+    mapped = RESP_TO_INTEREST_MAP.get(raw_event_type, raw_event_type)
+    
+    return mapped
+
+
 def _map_annotation_to_event(annotation: str) -> Optional[str]:
     """
     Mappt eine Annotation auf einen standardisierten Event-Typ.
@@ -440,6 +630,26 @@ def _map_annotation_to_event(annotation: str) -> Optional[str]:
         "hypopnea", oder None.
     """
     ann = annotation.lower().strip()
+    
+    # Skip empty or "no event" annotations
+    if not ann or ann in ("0", "0.0", "no event", "none", ""):
+        return None
+    
+    # Try numeric encoding (handles string-encoded numbers without channel info)
+    try:
+        numeric_val = int(float(ann))
+        # Try resp map first (it has more distinct codes)
+        raw_type = NUMERIC_RESP_EVENT_MAP.get(numeric_val, None)
+        if raw_type is not None:
+            return RESP_TO_INTEREST_MAP.get(raw_type, raw_type)
+        # Try arousal map
+        raw_type = NUMERIC_AROUSAL_EVENT_MAP.get(numeric_val, None)
+        if raw_type is not None:
+            return RESP_TO_INTEREST_MAP.get(raw_type, raw_type)
+    except (ValueError, TypeError):
+        pass
+    
+    # --- Text-based matching (legacy / other datasets) ---
     
     # Arousal
     arousal_keywords = [
@@ -518,6 +728,16 @@ def _estimate_event_duration(
             next_note = str(aux_notes[current_idx + 1]).lower().strip()
             if "end" in next_note or ")" in next_note:
                 return gap
+        
+        # For numeric annotations: if the next sample has value 0 (no event),
+        # the gap is the event duration
+        if current_idx + 1 < len(aux_notes):
+            try:
+                next_val = int(float(str(aux_notes[current_idx + 1]).strip()))
+                if next_val == 0:
+                    return gap
+            except (ValueError, TypeError):
+                pass
     
     return default_durations.get(event_type, 10.0)
 
@@ -546,7 +766,7 @@ def map_stages_to_segments(
     
     Returns
     -------
-    pd.DataFrame
+        pd.DataFrame
         DataFrame mit Spalten: segment_idx, start_sec, end_sec,
         dominant_stage, dominant_stage_numeric, stage_stability,
         n1_fraction, n2_fraction, n3_fraction, rem_fraction, w_fraction
@@ -781,7 +1001,7 @@ def map_events_to_segments(
                 if density_window_actual > 0 else 0.0
             )  # Events pro Minute
         
-                # --- Aggregierte Event-Features (über alle Typen) ---
+        # --- Aggregierte Event-Features (über alle Typen) ---
         any_event_present = any(
             record.get(f"{et}_present", False) for et in event_types
         )
