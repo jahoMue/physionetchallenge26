@@ -983,12 +983,16 @@ def identify_channel(sig_names: List[str], target_names: List[str]) -> Optional[
             if name_clean == target.lower().strip():
                 return i
     # Zweiter Durchlauf: Teilstring-Matching
+    # Vorläufig entfernt, da sonst doppelte Registrierung der Mastoid Channel
+    """
     for i, name in enumerate(sig_names):
         name_clean = name.lower().strip()
         for target in target_names:
             if target.lower().strip() in name_clean:
                 return i
+    """
     return None
+    
 
 
 def find_ecg_channel(sig_names: List[str]) -> Optional[int]:
@@ -1073,3 +1077,72 @@ def load_features(patient_id: str, output_dir: Path,
     if filepath.exists():
         return pd.read_parquet(filepath)
     return None
+
+# ==============================================================================
+# Re-referencing
+# ==============================================================================
+
+def rereference_eeg_to_bipolar(
+    raw: mne.io.Raw,
+) -> Tuple[mne.io.Raw, bool]:
+    """
+    Erzeugt bipolare EEG-Ableitungen (F3-M2, F4-M1, C3-M2, C4-M1) aus unipolaren Kanälen.
+
+    Parameter
+    ---------
+    raw : mne.io.Raw
+        Das geladene EEG-Rohdatenobjekt (muss preload=True haben).
+    eeg_channel_map : dict
+        Mapping von Standardnamen ('F3', 'F4', 'C3', 'C4', 'M1', 'M2') zu tatsächlichen Kanalnamen im Datensatz.
+
+    Rückgabe
+    --------
+    raw_bipolar : mne.io.Raw
+        Raw-Objekt mit den bipolaren Kanälen.
+    ch_names : list[str]
+        Liste der erzeugten (oder bereits vorhandenen) bipolaren Kanalnamen.
+    ch_index_map : dict[str, int]
+        Dictionary: Kanalname → Index im Raw-Objekt (raw_bipolar.ch_names).
+    """
+    # Definiere gewünschte Ableitungen
+    bipolar_pairs = [
+        ('F3', 'M2', 'F3-M2'),
+        ('F4', 'M1', 'F4-M1'),
+        ('C3', 'M2', 'C3-M2'),
+        ('C4', 'M1', 'C4-M1'),
+    ]
+
+    rereferenced = False
+    # Prüfe, ob bereits bipolare Kanäle vorhanden sind (z.B. "F3-M2")
+    already_bipolar = any('-M' in ch for ch in raw.ch_names)
+    if already_bipolar:
+        #existing_bipolar_names = [ch for ch in raw.ch_names if '-' in ch]
+        #ch_index_map = {name: raw.ch_names.index(name) for name in existing_bipolar_names}
+        return raw, rereferenced
+
+    # Erzeuge Listen für set_bipolar_reference
+    anodes, cathodes, ch_names = [], [], []
+    for anode, cathode, new_name in bipolar_pairs:
+        #anode_actual   = eeg_channel_map.get(anode)
+        #cathode_actual = eeg_channel_map.get(cathode)
+        if anode in raw.ch_names and cathode in raw.ch_names:
+            anodes.append(anode)
+            cathodes.append(cathode)
+            ch_names.append(new_name)
+
+    if not anodes:
+        #raise RuntimeError("Keine passenden Kanäle für bipolare Ableitungen gefunden.")
+        raw_bipolar = []
+        rereferenced = False
+        return raw_bipolar, rereferenced
+
+    # Bipolare Referenzierung durchführen
+    raw_bipolar = mne.set_bipolar_reference(
+        raw, anode=anodes, cathode=cathodes, ch_name=ch_names,
+        drop_refs=True, copy=True
+    )
+    rereferenced = True
+    # Index-Mapping: Kanalname → Index im Raw-Objekt
+    #ch_index_map = {name: raw_bipolar.ch_names.index(name) for name in ch_names}
+
+    return raw_bipolar, rereferenced

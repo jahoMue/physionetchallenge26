@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
+
 # Konfiguration – EINZIGER Import-Block (Zeile ~37)
 from config import (
     # Pfade
@@ -57,7 +58,7 @@ from config import (
 from utils.io_utils import (
     load_demographics, get_patient_list, load_record,
     load_annotations, find_ecg_channel, find_eeg_channels,
-    find_resp_channels, extract_signal
+    find_resp_channels, extract_signal, rereference_eeg_to_bipolar
 )
 
 # Preprocessing
@@ -76,6 +77,12 @@ from segmentation.segment_signals import (
 from feature_extraction.features_ecg import extract_ecg_features_all_segments
 from feature_extraction.features_eeg import extract_eeg_features_all_segments
 from feature_extraction.features_annotations import extract_annotation_features
+
+# CAP-Feature-Extraktion
+from CAP_classification.signal_eeg import SignalEEG
+from CAP_classification.signal_features import get_features_paper
+from CAP_classification.cap_classification import cap_classification
+
 
 # Feature-Tabelle
 from feature_table.build_feature_table import (
@@ -112,6 +119,35 @@ logger = setup_logger(module_name="main")
 # ==============================================================================
 # PIPELINE-SCHRITTE
 # ==============================================================================
+# [CAP-Integration] CAP-Feature-Extraktion pro Patient
+def extract_cap_features_for_patient(
+    eeg_signal, fs, event, duration, eventtime, patient_id,
+    lstm_predict_fn=None, flags=None, logger=None
+):
+    cap_feature_keys = [
+        "ID", "SLDUR", "NRAPH", "APHDUR", "AVGAPHDUR", "NRAPHPH", "RAPHSL",
+        "NRA1PH", "NRA2PH", "NRA3PH", "A1PHDUR", "A2PHDUR", "A3PHDUR",
+        "AVGA1PHDUR", "AVGA2PHDUR", "AVGA3PHDUR",
+        "A1RAPHPH", "A2RAPHPH", "A3RAPHPH",
+        "A1SL", "A2SL", "A3SL",
+        "A1PHH", "A2PHH", "A3PHH",
+        "NCAPSEQ", "CAPDUR", "AVGCAPDUR", "CAPR", "AVGCYCLEDUR", "AVGBPHDUR"
+    ]
+    cap_feature_keys_prefixed = [f"cap_{k}" for k in cap_feature_keys]
+    cap_features = {k: np.nan for k in cap_feature_keys_prefixed}
+    cap_features["cap_ID"] = patient_id
+    try:
+        eeg = SignalEEG(eeg_signal, fs, event, duration, eventtime, patient_id)
+        eeg.eeg_features = get_features_paper(eeg.eeg, eeg.fs, eeg.event, eeg.duration, eeg.eventtime)
+        input_list = eeg.create_multi_class_input()
+        stats = cap_classification(
+            input_list, eeg, flags or {"Scoring": "CAP"},
+        )
+    except Exception as e:
+        if logger:
+            logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion fehlgeschlagen für {patient_id}: {e}")
+    return stats
+
 
 def process_single_patient(
     patient_id: str,
@@ -205,8 +241,20 @@ def process_single_patient(
             patient_logger.info(f"EEG-Kanäle gefunden: {eeg_channels}")
             stats.update("eeg_channels_used", list(eeg_channels.keys()))
         else:
-            patient_logger.warning("Keine EEG-Kanäle gefunden.")
-        
+            if patient_logger:
+                patient_logger.warning("Keine EEG-Kanäle gefunden.")
+                
+        # Re-Referencing
+        record_reref, rereferenced = rereference_eeg_to_bipolar(record)
+
+        if rereferenced:
+            record = record_reref
+            sig_names = record_reref.ch_names
+            eeg_channels = []
+            eeg_channels = find_eeg_channels(sig_names)
+
+
+        # Respiration
         resp_channels = find_resp_channels(sig_names)
         if resp_channels and RSA_ENABLED:
             patient_logger.info(f"Respirations-Kanäle gefunden: {resp_channels}")
@@ -390,6 +438,31 @@ def process_single_patient(
             segment_length_sec=segment_length_sec,
             logger=patient_logger,
         )
+
+        # --- CAP Features ---
+        cap_features = {}
+
+        try:
+            cap_eeg_channel = None
+            if eeg_preprocessed:
+                cap_eeg_channel = next(iter(eeg_preprocessed.keys()))
+            if cap_eeg_channel:
+                cap_eeg_signal = eeg_preprocessed[cap_eeg_channel]["eeg_cleaned"]
+                #cap_fs = eeg_preprocessed[cap_eeg_channel]["fs"]
+                cap_fs = eeg_fs
+                cap_event = annotation_data["stages_raw"].stage_numeric if annotation_data and "stages_raw" in annotation_data else None
+                cap_duration = annotation_data["stages_raw"].duration_sec if annotation_data and "stages_raw" in annotation_data else None
+                cap_eventtime = annotation_data["stages_raw"].start_sec if annotation_data and "stages_raw" in annotation_data else None
+                if cap_event is not None and cap_duration is not None and cap_eventtime is not None:
+                    cap_features = extract_cap_features_for_patient(
+                        cap_eeg_signal, cap_fs, cap_event, cap_duration, cap_eventtime, patient_id,
+                        logger=patient_logger
+                    )
+        except Exception as e:
+            if patient_logger:
+                patient_logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion übersprungen: {e}")
+
+
         
         # ==============================================================
         # SCHRITT 6: FEATURE-TABELLE ERSTELLEN (unchanged logic)
@@ -409,6 +482,8 @@ def process_single_patient(
         patient_features = aggregate_to_patient_level(
             segment_features, sleep_summary, logger=patient_logger
         )
+        result["segment_features"] = segment_features
+        result["patient_features"] = patient_features
         
         # ==============================================================
         # NEW: SAVE FEATURES TO DISK INSTEAD OF RETURNING THEM

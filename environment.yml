@@ -43,4 +43,6 @@ dependencies:
 
     # Logging
     - loguru>=0.7.0
-    - antropy>=0.1.6
+
+    # ONNX Model Inference (für LSTM-Modell-Laden in CAP-Pipeline)
+    - onnxruntime
