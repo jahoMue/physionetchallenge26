@@ -273,7 +273,131 @@ def load_model(model_folder, verbose):
         nf = len(model_dict.get("selected_features", []))
         print(f"Model loaded: type={mt}, features={nf}")
 
+    # Initialize prefetch state — actual prefetching happens on first run_model() call
+    # because we don't have data_folder yet at load_model() time.
+    model_dict["_prefetch_done"] = False
+    model_dict["_preprocess_futures"] = {}   # pipeline_patient_id -> future
+    model_dict["_preprocess_tmp_dirs"] = {}  # pipeline_patient_id -> tmp_dir
+    model_dict["_executor"] = None
+
     return model_dict
+
+
+# ---------------------------------------------------------------------------
+# PREFETCH WORKER: Runs in a child process
+# ---------------------------------------------------------------------------
+
+def _preprocess_worker(
+    data_folder,
+    tmp_model_dir,
+    pipeline_patient_id,
+    patient_dir_str,
+    record_name,
+    segment_length_sec,
+    overlap_sec,
+    feature_output_dir_str,
+):
+    """
+    Worker function that patches config in the child process and runs
+    process_single_patient. This is the same function that train_model
+    submits to its ProcessPoolExecutor.
+    """
+    # Each worker process needs its own config patching
+    _patch_config(data_folder, tmp_model_dir)
+
+    from main import process_single_patient
+
+    result = process_single_patient(
+        patient_id=pipeline_patient_id,
+        patient_dir=Path(patient_dir_str),
+        record_name=record_name,
+        segment_length_sec=segment_length_sec,
+        overlap_sec=overlap_sec,
+        feature_output_dir=Path(feature_output_dir_str),
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PREFETCH: Submit ALL patients on first run_model() call
+# ---------------------------------------------------------------------------
+
+def _prefetch_all_preprocessing(model_dict, data_folder, verbose):
+    """
+    Submit preprocessing for ALL patients to a ProcessPoolExecutor.
+    Called once on the first run_model() invocation.
+
+    This mirrors the parallelization pattern in train_model:
+    all patients are submitted to the pool at once, and NUM_WORKERS
+    workers process them concurrently.
+    """
+    if model_dict.get("_prefetch_done", False):
+        return
+
+    # Patch config in the MAIN process so we can read paths correctly
+    import tempfile
+    master_tmp_dir = tempfile.mkdtemp(prefix="physionet_prefetch_master_")
+    _patch_config(data_folder, master_tmp_dir)
+
+    import config
+    from helper_code import find_patients, DEMOGRAPHICS_FILE, HEADERS
+
+    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    patient_metadata_list = find_patients(patient_data_file)
+    num_records = len(patient_metadata_list)
+
+    if verbose:
+        print(f"Prefetching preprocessing for {num_records} patients "
+              f"with {config.NUM_WORKERS} workers...")
+
+    max_workers = min(config.NUM_WORKERS, num_records) if num_records > 0 else 1
+    executor = ProcessPoolExecutor(max_workers=max_workers)
+    model_dict["_executor"] = executor
+
+    submitted = 0
+
+    for i in range(num_records):
+        record = patient_metadata_list[i]
+        patient_id_bids = record[HEADERS['bids_folder']]
+        site_id = record[HEADERS['site_id']]
+        session_id = record[HEADERS['session_id']]
+
+        record_name = f"{patient_id_bids}_ses-{session_id}"
+        pipeline_patient_id = f"{site_id}/{record_name}"
+
+        # Build the patient_dir using the PATCHED config
+        patient_dir = config.PHYSIOLOGICAL_DATA_DIR / site_id
+
+        if not patient_dir.exists():
+            if verbose:
+                print(f"  ! Prefetch: Patient dir not found: {patient_dir}. Skipping.")
+            continue
+
+        # Each worker gets its own temp dir for config patching
+        tmp_model_dir = tempfile.mkdtemp(prefix=f"physionet_run_{i}_")
+        feature_output_dir = Path(tmp_model_dir) / "features"
+        feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+        future = executor.submit(
+            _preprocess_worker,
+            data_folder=data_folder,
+            tmp_model_dir=tmp_model_dir,
+            pipeline_patient_id=pipeline_patient_id,
+            patient_dir_str=str(patient_dir),
+            record_name=record_name,
+            segment_length_sec=config.SEGMENT_LENGTH_SEC,
+            overlap_sec=config.SEGMENT_OVERLAP_SEC,
+            feature_output_dir_str=str(feature_output_dir),
+        )
+        model_dict["_preprocess_futures"][pipeline_patient_id] = future
+        model_dict["_preprocess_tmp_dirs"][pipeline_patient_id] = tmp_model_dir
+        submitted += 1
+
+    model_dict["_prefetch_done"] = True
+    model_dict["_master_tmp_dir"] = master_tmp_dir
+
+    if verbose:
+        print(f"Submitted {submitted} preprocessing jobs.")
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +407,11 @@ def load_model(model_folder, verbose):
 def run_model(model, record, data_folder, verbose):
     """
     Run the trained model on a single patient record.
+
+    On the first call, submits ALL patients' preprocessing to a shared
+    ProcessPoolExecutor (NUM_WORKERS=4 concurrent workers), matching
+    the parallelization pattern used in train_model. Subsequent calls
+    simply retrieve the already-completed (or in-progress) result.
 
     Parameters
     ----------
@@ -308,44 +437,38 @@ def run_model(model, record, data_folder, verbose):
     if model.get("fallback", False):
         return 0, 0.5
 
-    # ---- Patch config for this data_folder --------------------------------
-    # Use a temporary model folder (we won't save anything during inference)
+    # ---- On first call: submit ALL preprocessing jobs in parallel ---------
+    _prefetch_all_preprocessing(model, data_folder, verbose)
+
+    # Patch config in main process for feature loading below
     import tempfile
-    tmp_model_dir = tempfile.mkdtemp(prefix="physionet_run_")
-    _patch_config(data_folder, tmp_model_dir)
+    tmp_main = tempfile.mkdtemp(prefix="physionet_run_main_")
+    _patch_config(data_folder, tmp_main)
 
     logger = _setup_logger(verbose)
 
     import config
-    from main import process_single_patient
 
-    # ---- Build paths our pipeline expects ---------------------------------
+    # ---- Build patient identifier -----------------------------------------
     record_name = f"{patient_id_bids}_ses-{session_id}"
     pipeline_patient_id = f"{site_id}/{record_name}"
-    patient_dir = config.PHYSIOLOGICAL_DATA_DIR / site_id
 
-    if not patient_dir.exists():
+    # ---- Retrieve the preprocessing result --------------------------------
+    preprocess_futures = model.get("_preprocess_futures", {})
+    future = preprocess_futures.get(pipeline_patient_id)
+
+    if future is None:
         if verbose:
-            print(f"  ! Patient dir not found: {patient_dir}")
+            print(f"  ! No preprocessing future for {pipeline_patient_id}")
         return 0, 0.5
 
-    # ---- Run the full pipeline on this single patient ---------------------
-    try:
-        feature_output_dir = Path(tmp_model_dir) / "features"
-        feature_output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_model_dir = model.get("_preprocess_tmp_dirs", {}).get(pipeline_patient_id)
 
-        # Parallel preprocessing using ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
-            future = executor.submit(
-                process_single_patient,
-                patient_id=pipeline_patient_id,
-                patient_dir=patient_dir,
-                record_name=record_name,
-                segment_length_sec=config.SEGMENT_LENGTH_SEC,
-                overlap_sec=config.SEGMENT_OVERLAP_SEC,
-                feature_output_dir=feature_output_dir,
-            )
-            result = future.result()
+    try:
+        # This blocks until THIS patient's preprocessing is done.
+        # But other patients are being preprocessed concurrently in the
+        # background by the other workers — just like train_model.
+        result = future.result()
 
         if result is None or not result["success"]:
             if verbose:
@@ -401,10 +524,20 @@ def run_model(model, record, data_folder, verbose):
 
     finally:
         gc.collect()
-        # Clean up temp dir (best effort)
+        # Remove the consumed future to free memory
+        preprocess_futures.pop(pipeline_patient_id, None)
+        model.get("_preprocess_tmp_dirs", {}).pop(pipeline_patient_id, None)
+        # Clean up this patient's temp dir
+        if tmp_model_dir:
+            try:
+                import shutil
+                shutil.rmtree(tmp_model_dir, ignore_errors=True)
+            except Exception:
+                pass
+        # Clean up main process temp dir
         try:
             import shutil
-            shutil.rmtree(tmp_model_dir, ignore_errors=True)
+            shutil.rmtree(tmp_main, ignore_errors=True)
         except Exception:
             pass
 
