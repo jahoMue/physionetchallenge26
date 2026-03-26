@@ -109,6 +109,48 @@ class ModelSelector:
         return self.transform(X)
 
 
+class PrevalenceAdjustedKFold:
+    """
+    Custom K-Fold split that downsamples the positive class in the validation set 
+    to match an expected prevalence. Unused positive samples are shifted back to 
+    the training set so no data is wasted.
+    """
+    def __init__(self, n_splits=5, expected_prevalence=0.10, random_state=42):
+        self.n_splits = n_splits
+        self.expected_prevalence = expected_prevalence
+        self.random_state = random_state
+
+    def split(self, X, y, groups=None):
+        rng = np.random.RandomState(self.random_state)
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+        
+        for train_idx, val_idx in skf.split(X, y):
+            y_val = y[val_idx]
+            pos_idx = val_idx[y_val == 1]
+            neg_idx = val_idx[y_val == 0]
+            
+            # prevalence = P / (P + N) => P = expected_prevalence * N / (1 - expected_prevalence)
+            target_pos_count = int(len(neg_idx) * self.expected_prevalence / (1.0 - self.expected_prevalence))
+            target_pos_count = max(1, target_pos_count)
+            
+            if target_pos_count < len(pos_idx):
+                selected_pos_idx = rng.choice(pos_idx, target_pos_count, replace=False)
+                new_val_idx = np.concatenate([neg_idx, selected_pos_idx])
+                
+                unused_pos_idx = np.setdiff1d(pos_idx, selected_pos_idx)
+                new_train_idx = np.concatenate([train_idx, unused_pos_idx])
+            else:
+                new_val_idx = val_idx
+                new_train_idx = train_idx
+                
+            rng.shuffle(new_train_idx)
+            rng.shuffle(new_val_idx)
+            
+            yield new_train_idx, new_val_idx
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
 # ==============================================================================
 # HAUPT-FUNKTION: MODELL TRAINIEREN
 # ==============================================================================
@@ -174,7 +216,7 @@ def train_model(
     )
 
     cv_results = _cross_validate_model(
-        model, X_scaled, y, handle_imbalance, logger
+        model, X_scaled, y, handle_imbalance, logger, expected_test_prevalence
     )
 
     if handle_imbalance == "smote":
@@ -711,16 +753,17 @@ def _cross_validate_model(
     X: np.ndarray,
     y: np.ndarray,
     handle_imbalance: str,
-    logger=None
+    logger=None,
+    expected_test_prevalence: Optional[float] = 0.10
 ) -> Dict:
-    if logger:
-        logger.info(f"Cross-Validation: {CV_FOLDS}-Fold Stratified")
-
-    cv = StratifiedKFold(
-        n_splits=CV_FOLDS,
-        shuffle=True,
-        random_state=RANDOM_SEED
-    )
+    if expected_test_prevalence is not None:
+        cv = PrevalenceAdjustedKFold(n_splits=CV_FOLDS, expected_prevalence=expected_test_prevalence, random_state=RANDOM_SEED)
+        if logger:
+            logger.info(f"Cross-Validation: {CV_FOLDS}-Fold (Val-Prevalence adjusted to {expected_test_prevalence*100:.0f}%)")
+    else:
+        cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+        if logger:
+            logger.info(f"Cross-Validation: {CV_FOLDS}-Fold Stratified")
 
     scoring = {
         "auroc": "roc_auc",
@@ -1000,7 +1043,10 @@ def _tune_with_optuna(
     class_weight_dict = {0: 1.0, 1: scale_pos_weight} if use_cw else None
 
     def objective(trial):
-        cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+        if expected_test_prevalence is not None:
+            cv = PrevalenceAdjustedKFold(n_splits=CV_FOLDS, expected_prevalence=expected_test_prevalence, random_state=RANDOM_SEED)
+        else:
+            cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
         if model_type == "xgboost":
             params = {
@@ -1168,7 +1214,10 @@ def _tune_with_randomized_search(
             logger.warning(f"RandomizedSearch nicht konfiguriert für {model_type}")
         return {"best_params": {}, "best_score": 0, "method": "none"}
 
-    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    if expected_test_prevalence is not None:
+        cv = PrevalenceAdjustedKFold(n_splits=CV_FOLDS, expected_prevalence=expected_test_prevalence, random_state=RANDOM_SEED)
+    else:
+        cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
     search = RandomizedSearchCV(
         model,
