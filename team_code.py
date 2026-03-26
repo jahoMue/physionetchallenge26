@@ -226,19 +226,49 @@ def train_model(data_folder, model_folder, verbose):
         _save_fallback_model(model_folder)
         return
 
-    # --- 3. Train the ML model ---------------------------------------------
+        # --- 3. Train the ML model ---------------------------------------------
     if verbose:
         print(f"Training model on {len(patient_level)} patients, "
               f"{len(patient_level.columns)} features...")
 
-    model_result = classification_train_model(
+    # Import the multi-model training function (with tuning support)
+    from classification.train_model import train_multiple_models
+
+    # Train all standard model types with hyperparameter optimization,
+    # mirroring: python main.py --step train --tune
+    model_types = ["xgboost", "lightgbm", "random_forest", "ensemble"]
+
+    all_results = train_multiple_models(
         feature_table=patient_level,
-        model_type="ensemble",
-        feature_selection=True,
+        model_types=model_types,
         handle_imbalance="class_weight",
+        feature_selection=True,
+        tune=True,                  # <-- enables Optuna / RandomizedSearch tuning
+        n_tune_trials=30,
         output_dir=config.MODEL_DIR,
         logger=logger if verbose else None,
     )
+
+    # Select the best model by CV AUROC
+    best_model_type = None
+    best_auroc = -1.0
+    for model_type, result in all_results.items():
+        if isinstance(result, dict) and "cv_results" in result:
+            auroc = result["cv_results"].get("auroc_mean", 0)
+            if auroc > best_auroc:
+                best_auroc = auroc
+                best_model_type = model_type
+
+    if best_model_type is None or best_model_type not in all_results:
+        if verbose:
+            print("ERROR: No model trained successfully. Saving fallback model.")
+        _save_fallback_model(model_folder)
+        return
+
+    model_result = all_results[best_model_type]
+
+    if verbose:
+        print(f"Best model: {best_model_type} (CV AUROC={best_auroc:.4f})")
 
     # --- 4. Save to model_folder -------------------------------------------
     save_model(model_folder, model_result)
@@ -248,6 +278,7 @@ def train_model(data_folder, model_folder, verbose):
         print(f"Training complete. "
               f"CV AUROC={cv.get('auroc_mean', 'N/A')}")
         print("Done.")
+
 
 
 # ---------------------------------------------------------------------------

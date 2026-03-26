@@ -5,6 +5,7 @@
 data/
 training_data/
 holdout_data/
+save_model_test.py
 
 # Modelle & Outputs
 model/*
