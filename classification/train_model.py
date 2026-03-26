@@ -118,6 +118,7 @@ def train_model(
     model_type: str = "ensemble",
     feature_selection: bool = True,
     handle_imbalance: str = "class_weight",
+    expected_test_prevalence: float = 0.10,
     n_features_select: Optional[int] = None,
     output_dir: Path = MODEL_DIR,
     logger=None
@@ -164,7 +165,12 @@ def train_model(
         logger.info(f"Features nach Selection: {len(selected_features)}")
 
     model = _create_model(
-        model_type, handle_imbalance, X_scaled.shape[1], y, logger
+        model_type=model_type,
+        handle_imbalance=handle_imbalance,
+        n_features=X_scaled.shape[1],
+        y=y,
+        logger=logger,
+        expected_test_prevalence=expected_test_prevalence
     )
 
     cv_results = _cross_validate_model(
@@ -472,15 +478,27 @@ def _create_model(
     handle_imbalance: str,
     n_features: int,
     y: np.ndarray,
-    logger=None
+    logger=None,
+    expected_test_prevalence: Optional[float] = 0.10
 ) -> Any:
     class_counts = np.bincount(y.astype(int))
     if len(class_counts) >= 2 and class_counts.min() > 0:
-        scale_pos_weight = class_counts[0] / class_counts[1]
+        if expected_test_prevalence is not None:
+            # Adjust weights to match the expected test set prevalence (Prior Probability Shift)
+            target_pos_ratio = expected_test_prevalence / (1.0 - expected_test_prevalence)
+            actual_pos_ratio = class_counts[1] / class_counts[0]
+            scale_pos_weight = target_pos_ratio / actual_pos_ratio
+        else:
+            # Standard balancing
+            scale_pos_weight = class_counts[0] / class_counts[1]
     else:
         scale_pos_weight = 1.0
 
     use_class_weight = handle_imbalance == "class_weight"
+    
+    # Create class_weight dictionary for models that support it (RF, LogReg)
+    class_weight_dict = {0: 1.0, 1: scale_pos_weight} if use_class_weight else None
+
 
     if model_type == "xgboost":
         model = xgb.XGBClassifier(
@@ -509,6 +527,7 @@ def _create_model(
             subsample=0.8,
             colsample_bytree=0.8,
             min_child_samples=20,
+            metric="auc",
             reg_alpha=0.1,
             reg_lambda=1.0,
             is_unbalance=use_class_weight,
@@ -524,7 +543,7 @@ def _create_model(
             min_samples_split=5,
             min_samples_leaf=3,
             max_features="sqrt",
-            class_weight="balanced" if use_class_weight else None,
+            class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             n_jobs=-1,
         )
@@ -535,7 +554,7 @@ def _create_model(
             penalty="l2",
             solver="lbfgs",
             max_iter=1000,
-            class_weight="balanced" if use_class_weight else None,
+            class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
         )
 
@@ -552,12 +571,12 @@ def _create_model(
 
     elif model_type == "ensemble":
         model = _create_voting_ensemble(
-            use_class_weight, scale_pos_weight
+            use_class_weight, scale_pos_weight, class_weight_dict
         )
 
     elif model_type == "stacking":
         model = _create_stacking_ensemble(
-            use_class_weight, scale_pos_weight
+            use_class_weight, scale_pos_weight, class_weight_dict
         )
 
     else:
@@ -573,7 +592,8 @@ def _create_model(
 
 def _create_voting_ensemble(
     use_class_weight: bool,
-    scale_pos_weight: float
+    scale_pos_weight: float,
+    class_weight_dict: Optional[dict] = None
 ) -> VotingClassifier:
     estimators = [
         ("xgb", xgb.XGBClassifier(
@@ -595,6 +615,7 @@ def _create_voting_ensemble(
             subsample=0.8,
             colsample_bytree=0.8,
             is_unbalance=use_class_weight,
+            metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
@@ -603,7 +624,7 @@ def _create_voting_ensemble(
             n_estimators=300,
             max_depth=8,
             min_samples_leaf=3,
-            class_weight="balanced" if use_class_weight else None,
+            class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             n_jobs=-1,
         )),
@@ -618,7 +639,8 @@ def _create_voting_ensemble(
 
 def _create_stacking_ensemble(
     use_class_weight: bool,
-    scale_pos_weight: float
+    scale_pos_weight: float,
+    class_weight_dict: Optional[dict] = None
 ) -> StackingClassifier:
     estimators = [
         ("xgb", xgb.XGBClassifier(
@@ -636,6 +658,7 @@ def _create_stacking_ensemble(
             max_depth=5,
             learning_rate=0.05,
             is_unbalance=use_class_weight,
+            metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
@@ -643,7 +666,7 @@ def _create_stacking_ensemble(
         ("rf", RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
-            class_weight="balanced" if use_class_weight else None,
+            class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             n_jobs=-1,
         )),
@@ -653,7 +676,7 @@ def _create_stacking_ensemble(
         estimators=estimators,
         final_estimator=LogisticRegression(
             C=1.0,
-            class_weight="balanced" if use_class_weight else None,
+            class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             max_iter=1000,
         ),
@@ -914,7 +937,8 @@ def tune_hyperparameters(
     model_type: str = "xgboost",
     n_trials: int = 50,
     handle_imbalance: str = "class_weight",
-    logger=None
+    logger=None,
+    expected_test_prevalence: Optional[float] = 0.10
 ) -> Dict:
     if logger:
         logger.info(f"Hyperparameter-Tuning: {model_type}, {n_trials} Trials")
@@ -923,13 +947,13 @@ def tune_hyperparameters(
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         return _tune_with_optuna(
-            X, y, model_type, n_trials, handle_imbalance, logger
+            X, y, model_type, n_trials, handle_imbalance, logger, expected_test_prevalence
         )
     except ImportError:
         if logger:
             logger.info("Optuna nicht verfügbar, verwende RandomizedSearch")
         return _tune_with_randomized_search(
-            X, y, model_type, n_trials, handle_imbalance, logger
+            X, y, model_type, n_trials, handle_imbalance, logger, expected_test_prevalence
         )
 
 
@@ -939,7 +963,8 @@ def _tune_with_optuna(
     model_type: str,
     n_trials: int,
     handle_imbalance: str,
-    logger=None
+    logger=None,
+    expected_test_prevalence: Optional[float] = 0.10
 ) -> Dict:
     import optuna
 
@@ -949,7 +974,14 @@ def _tune_with_optuna(
         if len(class_counts) >= 2 and class_counts.min() > 0
         else 1.0
     )
+    
+    if expected_test_prevalence is not None and len(class_counts) >= 2 and class_counts.min() > 0:
+        target_pos_ratio = expected_test_prevalence / (1.0 - expected_test_prevalence)
+        actual_pos_ratio = class_counts[1] / class_counts[0]
+        scale_pos_weight = target_pos_ratio / actual_pos_ratio
+        
     use_cw = handle_imbalance == "class_weight"
+    class_weight_dict = {0: 1.0, 1: scale_pos_weight} if use_cw else None
 
     def objective(trial):
         cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
@@ -985,6 +1017,7 @@ def _tune_with_optuna(
                 "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True),
                 "num_leaves": trial.suggest_int("num_leaves", 15, 127),
                 "is_unbalance": use_cw,
+                "metric": "auc",
                 "random_state": RANDOM_SEED,
                 "verbose": -1,
                 "n_jobs": -1,
@@ -1000,7 +1033,7 @@ def _tune_with_optuna(
                 "max_features": trial.suggest_categorical(
                     "max_features", ["sqrt", "log2", 0.3, 0.5, 0.7]
                 ),
-                "class_weight": "balanced" if use_cw else None,
+                "class_weight": class_weight_dict,
                 "random_state": RANDOM_SEED,
                 "n_jobs": -1,
             }
@@ -1041,7 +1074,8 @@ def _tune_with_randomized_search(
     model_type: str,
     n_trials: int,
     handle_imbalance: str,
-    logger=None
+    logger=None,
+    expected_test_prevalence: Optional[float] = 0.10
 ) -> Dict:
     from sklearn.model_selection import RandomizedSearchCV
     from scipy.stats import uniform, randint, loguniform
@@ -1052,7 +1086,14 @@ def _tune_with_randomized_search(
         if len(class_counts) >= 2 and class_counts.min() > 0
         else 1.0
     )
+    
+    if expected_test_prevalence is not None and len(class_counts) >= 2 and class_counts.min() > 0:
+        target_pos_ratio = expected_test_prevalence / (1.0 - expected_test_prevalence)
+        actual_pos_ratio = class_counts[1] / class_counts[0]
+        scale_pos_weight = target_pos_ratio / actual_pos_ratio
+        
     use_cw = handle_imbalance == "class_weight"
+    class_weight_dict = {0: 1.0, 1: scale_pos_weight} if use_cw else None
 
     if model_type == "xgboost":
         model = xgb.XGBClassifier(
@@ -1077,6 +1118,7 @@ def _tune_with_randomized_search(
     elif model_type == "lightgbm":
         model = lgb.LGBMClassifier(
             is_unbalance=use_cw,
+            metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
@@ -1095,7 +1137,7 @@ def _tune_with_randomized_search(
 
     elif model_type == "random_forest":
         model = RandomForestClassifier(
-            class_weight="balanced" if use_cw else None,
+            class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             n_jobs=-1,
         )
@@ -1304,6 +1346,7 @@ def train_multiple_models(
     model_types: Optional[List[str]] = None,
     handle_imbalance: str = "class_weight",
     feature_selection: bool = True,
+    expected_test_prevalence: float = 0.10,
     tune: bool = False,
     n_tune_trials: int = 30,
     output_dir: Path = MODEL_DIR,
@@ -1334,6 +1377,7 @@ def train_multiple_models(
                 model_type=model_type,
                 feature_selection=feature_selection,
                 handle_imbalance=handle_imbalance,
+                expected_test_prevalence=expected_test_prevalence,
                 output_dir=output_dir,
                 logger=logger,
             )
@@ -1351,7 +1395,8 @@ def train_multiple_models(
 
                     tune_result = tune_hyperparameters(
                         X_scaled, y, model_type, n_tune_trials,
-                        handle_imbalance, logger
+                        handle_imbalance, logger,
+                        expected_test_prevalence=expected_test_prevalence
                     )
                     result["tuning_result"] = tune_result
 
