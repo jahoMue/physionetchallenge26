@@ -502,15 +502,15 @@ def _create_model(
 
     if model_type == "xgboost":
         model = xgb.XGBClassifier(
-            n_estimators=500,
-            max_depth=6,
+            n_estimators=200,
+            max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_weight=3,
-            gamma=0.1,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
+            min_child_weight=5,
+            gamma=0.5,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
@@ -521,16 +521,16 @@ def _create_model(
 
     elif model_type == "lightgbm":
         model = lgb.LGBMClassifier(
-            n_estimators=500,
-            max_depth=6,
+            n_estimators=200,
+            max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_samples=20,
+            min_child_samples=30,
             metric="auc",
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            is_unbalance=use_class_weight,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
+            scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
@@ -538,10 +538,10 @@ def _create_model(
 
     elif model_type == "random_forest":
         model = RandomForestClassifier(
-            n_estimators=500,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=3,
+            n_estimators=300,
+            max_depth=6,
+            min_samples_split=10,
+            min_samples_leaf=5,
             max_features="sqrt",
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
@@ -560,12 +560,12 @@ def _create_model(
 
     elif model_type == "gradient_boosting":
         model = GradientBoostingClassifier(
-            n_estimators=300,
-            max_depth=5,
+            n_estimators=150,
+            max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
-            min_samples_split=5,
-            min_samples_leaf=3,
+            min_samples_split=10,
+            min_samples_leaf=5,
             random_state=RANDOM_SEED,
         )
 
@@ -597,33 +597,39 @@ def _create_voting_ensemble(
 ) -> VotingClassifier:
     estimators = [
         ("xgb", xgb.XGBClassifier(
-            n_estimators=300,
-            max_depth=5,
+            n_estimators=150,
+            max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
+            min_child_weight=5,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            # use_label_encoder=False,
             n_jobs=-1,
         )),
         ("lgbm", lgb.LGBMClassifier(
-            n_estimators=300,
-            max_depth=5,
+            n_estimators=150,
+            max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            is_unbalance=use_class_weight,
+            min_child_samples=30,
+            scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
             metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
         )),
         ("rf", RandomForestClassifier(
-            n_estimators=300,
-            max_depth=8,
-            min_samples_leaf=3,
+            n_estimators=200,
+            max_depth=6,
+            min_samples_split=10,
+            min_samples_leaf=5,
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             n_jobs=-1,
@@ -644,28 +650,38 @@ def _create_stacking_ensemble(
 ) -> StackingClassifier:
     estimators = [
         ("xgb", xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=5,
+            n_estimators=100,
+            max_depth=3,
             learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=5,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            # use_label_encoder=False,
             n_jobs=-1,
         )),
         ("lgbm", lgb.LGBMClassifier(
-            n_estimators=200,
-            max_depth=5,
+            n_estimators=100,
+            max_depth=3,
             learning_rate=0.05,
-            is_unbalance=use_class_weight,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_samples=30,
+            scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
             metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
         )),
         ("rf", RandomForestClassifier(
-            n_estimators=200,
-            max_depth=8,
+            n_estimators=150,
+            max_depth=5,
+            min_samples_leaf=5,
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
             n_jobs=-1,
@@ -988,15 +1004,15 @@ def _tune_with_optuna(
 
         if model_type == "xgboost":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 800),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 6),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
                 "subsample": trial.suggest_float("subsample", 0.6, 1.0),
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
                 "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
                 "gamma": trial.suggest_float("gamma", 0, 1.0),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 10, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 10, log=True),
                 "scale_pos_weight": scale_pos_weight if use_cw else 1.0,
                 "random_state": RANDOM_SEED,
                 "eval_metric": "auc",
@@ -1007,16 +1023,16 @@ def _tune_with_optuna(
 
         elif model_type == "lightgbm":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 800),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 6),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
                 "subsample": trial.suggest_float("subsample", 0.6, 1.0),
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True),
-                "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-                "is_unbalance": use_cw,
+                "min_child_samples": trial.suggest_int("min_child_samples", 10, 50),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 10, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 10, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+                "scale_pos_weight": scale_pos_weight if use_cw else 1.0,
                 "metric": "auc",
                 "random_state": RANDOM_SEED,
                 "verbose": -1,
@@ -1026,10 +1042,10 @@ def _tune_with_optuna(
 
         elif model_type == "random_forest":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 800),
-                "max_depth": trial.suggest_int("max_depth", 3, 15),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 8),
+                "min_samples_split": trial.suggest_int("min_samples_split", 5, 20),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 10),
                 "max_features": trial.suggest_categorical(
                     "max_features", ["sqrt", "log2", 0.3, 0.5, 0.7]
                 ),
@@ -1100,39 +1116,38 @@ def _tune_with_randomized_search(
             scale_pos_weight=scale_pos_weight if use_cw else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            # use_label_encoder=False,
             n_jobs=-1,
         )
         param_distributions = {
-            "n_estimators": randint(100, 800),
-            "max_depth": randint(3, 10),
+            "n_estimators": randint(50, 300),
+            "max_depth": randint(3, 6),
             "learning_rate": loguniform(0.01, 0.3),
             "subsample": uniform(0.6, 0.4),
             "colsample_bytree": uniform(0.5, 0.5),
             "min_child_weight": randint(1, 10),
             "gamma": uniform(0, 1),
-            "reg_alpha": loguniform(1e-4, 10),
-            "reg_lambda": loguniform(1e-4, 10),
+            "reg_alpha": loguniform(0.1, 10),
+            "reg_lambda": loguniform(0.1, 10),
         }
 
     elif model_type == "lightgbm":
         model = lgb.LGBMClassifier(
-            is_unbalance=use_cw,
+            scale_pos_weight=scale_pos_weight if use_cw else 1.0,
             metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
             n_jobs=-1,
         )
         param_distributions = {
-            "n_estimators": randint(100, 800),
-            "max_depth": randint(3, 10),
+            "n_estimators": randint(50, 300),
+            "max_depth": randint(3, 6),
             "learning_rate": loguniform(0.01, 0.3),
             "subsample": uniform(0.6, 0.4),
             "colsample_bytree": uniform(0.5, 0.5),
-            "min_child_samples": randint(5, 50),
-            "num_leaves": randint(15, 127),
-            "reg_alpha": loguniform(1e-4, 10),
-            "reg_lambda": loguniform(1e-4, 10),
+            "min_child_samples": randint(10, 50),
+            "num_leaves": randint(15, 63),
+            "reg_alpha": loguniform(0.1, 10),
+            "reg_lambda": loguniform(0.1, 10),
         }
 
     elif model_type == "random_forest":
@@ -1142,10 +1157,10 @@ def _tune_with_randomized_search(
             n_jobs=-1,
         )
         param_distributions = {
-            "n_estimators": randint(100, 800),
-            "max_depth": randint(3, 15),
-            "min_samples_split": randint(2, 20),
-            "min_samples_leaf": randint(1, 10),
+            "n_estimators": randint(50, 300),
+            "max_depth": randint(3, 8),
+            "min_samples_split": randint(5, 20),
+            "min_samples_leaf": randint(2, 10),
         }
 
     else:
