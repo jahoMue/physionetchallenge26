@@ -42,6 +42,13 @@ from config import (
     SIGNAL_DTYPE,
 )
 
+from feature_extraction.features_eeg_spindle_so import (
+    extract_spindle_so_coupling_features,
+    _get_empty_spindle_features,
+    _get_empty_so_features,
+    _get_empty_coupling_features,
+)
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -111,6 +118,17 @@ def extract_eeg_features_segment(
     features.update(_compute_entropy_features(segment_data, prefix))
     features.update(_compute_complexity_features(segment_data, fs, prefix))
     features.update(_compute_temporal_features(segment_data, fs, prefix))
+
+    features.update(
+        extract_spindle_so_coupling_features(
+            segment_data=segment_data,
+            fs=fs,
+            region=region,
+            sqi=sqi,
+            segment_idx=segment_idx,
+            logger=logger,
+        )
+    )
     
     if logger:
         logger.debug(f"Segment {segment_idx} [{region}]: "
@@ -1072,6 +1090,8 @@ def _get_empty_asymmetry_features(prefix: str) -> Dict:
 def _get_empty_eeg_features(segment_idx: int, prefix: str) -> Dict:
     """
     Erstellt ein leeres Feature-Dictionary mit allen EEG-Feature-Namen.
+    
+    === CHANGED: Now includes spindle, SO, and coupling feature keys ===
     """
     features = {
         "segment_idx": segment_idx,
@@ -1126,6 +1146,44 @@ def _get_empty_eeg_features(segment_idx: int, prefix: str) -> Dict:
                  "n_peaks", "peak_rate_hz", "energy_variability",
                  "amplitude_range_iqr"]:
         features[f"{prefix}_{key}"] = np.nan
+    
+    # === NEW: Spindle features ===
+    sp_prefix = f"{prefix}_sp"
+    for key in ["count", "density",
+                 "duration_mean", "duration_std", "duration_median",
+                 "amplitude_mean", "amplitude_std", "amplitude_median",
+                 "rms_mean",
+                 "frequency_mean", "frequency_std",
+                 "slow_count", "fast_count",
+                 "slow_density", "fast_density",
+                 "fast_slow_ratio",
+                 "symmetry_mean",
+                 "rel_power_mean",
+                 "oscillations_mean"]:
+        features[f"{sp_prefix}_{key}"] = np.nan
+    
+    # === NEW: Slow Oscillation features ===
+    so_prefix = f"{prefix}_so"
+    for key in ["count", "density",
+                 "duration_mean", "duration_std",
+                 "ptp_amplitude_mean", "ptp_amplitude_std", "ptp_amplitude_median",
+                 "neg_peak_mean", "neg_peak_std",
+                 "pos_peak_mean",
+                 "frequency_mean",
+                 "slope_mean", "slope_std"]:
+        features[f"{so_prefix}_{key}"] = np.nan
+    
+    # === NEW: SO-Spindle Coupling features ===
+    coup_prefix = f"{prefix}_coup"
+    for key in ["count", "rate",
+                 "mean_phase_rad", "mean_phase_deg",
+                 "mrl",
+                 "phase_std_rad",
+                 "rayleigh_z", "rayleigh_p",
+                 "preferred_phase_quadrant",
+                 "pac_mi"]:
+        features[f"{coup_prefix}_{key}"] = np.nan
+    # === END NEW ===
     
     return features
 
