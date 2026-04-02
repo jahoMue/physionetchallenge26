@@ -1412,7 +1412,7 @@ def train_multiple_models(
     feature_selection: bool = True,
     expected_test_prevalence: float = 0.10,
     tune: bool = False,
-    n_tune_trials: int = 30,
+    n_tune_trials: int = 100,
     output_dir: Path = MODEL_DIR,
     logger=None
 ) -> Dict[str, Dict]:
