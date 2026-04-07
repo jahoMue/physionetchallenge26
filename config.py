@@ -184,7 +184,7 @@ EEG_FILTER = {
     "lowcut": 0.3,
     "highcut": 35.0,
     "order": 4,
-    "notch": 50.0,  # Netzfrequenz (50 Hz EU, 60 Hz US)
+    "notch": 60.0,  # Netzfrequenz (50 Hz EU, 60 Hz US)
 }
 EEG_AMPLITUDE_MAX_UV = 200.0    # Maximale physiologische Amplitude (µV)
 EEG_AMPLITUDE_MIN_UV = 0.5      # Minimale Amplitude (Flatliner-Erkennung)
