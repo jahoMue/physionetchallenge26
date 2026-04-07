@@ -44,11 +44,7 @@ from config import (
 
 from feature_extraction.features_eeg_spindle_so import (
     extract_spindle_so_coupling_features,
-    _get_empty_spindle_features,
-    _get_empty_so_features,
-    _get_empty_coupling_features,
 )
-
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -1149,39 +1145,26 @@ def _get_empty_eeg_features(segment_idx: int, prefix: str) -> Dict:
     
     # === NEW: Spindle features ===
     sp_prefix = f"{prefix}_sp"
-    for key in ["count", "density",
-                 "duration_mean", "duration_std", "duration_median",
-                 "amplitude_mean", "amplitude_std", "amplitude_median",
-                 "rms_mean",
-                 "frequency_mean", "frequency_std",
-                 "slow_count", "fast_count",
-                 "slow_density", "fast_density",
-                 "fast_slow_ratio",
-                 "symmetry_mean",
-                 "rel_power_mean",
-                 "oscillations_mean"]:
+    for key in ["count", "density", "duration_mean", "duration_std",
+                 "duration_median", "amplitude_mean", "amplitude_std",
+                 "amplitude_median", "rms_mean", "frequency_mean",
+                 "frequency_std", "slow_count", "fast_count",
+                 "slow_density", "fast_density", "fast_slow_ratio",
+                 "symmetry_mean", "rel_power_mean", "oscillations_mean"]:
         features[f"{sp_prefix}_{key}"] = np.nan
-    
-    # === NEW: Slow Oscillation features ===
+
     so_prefix = f"{prefix}_so"
-    for key in ["count", "density",
-                 "duration_mean", "duration_std",
-                 "ptp_amplitude_mean", "ptp_amplitude_std", "ptp_amplitude_median",
-                 "neg_peak_mean", "neg_peak_std",
-                 "pos_peak_mean",
-                 "frequency_mean",
-                 "slope_mean", "slope_std"]:
+    for key in ["count", "density", "duration_mean", "duration_std",
+                 "ptp_amplitude_mean", "ptp_amplitude_std",
+                 "ptp_amplitude_median", "neg_peak_mean", "neg_peak_std",
+                 "pos_peak_mean", "frequency_mean", "slope_mean",
+                 "slope_std"]:
         features[f"{so_prefix}_{key}"] = np.nan
-    
-    # === NEW: SO-Spindle Coupling features ===
+
     coup_prefix = f"{prefix}_coup"
-    for key in ["count", "rate",
-                 "mean_phase_rad", "mean_phase_deg",
-                 "mrl",
-                 "phase_std_rad",
-                 "rayleigh_z", "rayleigh_p",
-                 "preferred_phase_quadrant",
-                 "pac_mi"]:
+    for key in ["count", "rate", "mean_phase_rad", "mean_phase_deg",
+                 "mrl", "phase_std_rad", "rayleigh_z", "rayleigh_p",
+                 "preferred_phase_quadrant", "pac_mi"]:
         features[f"{coup_prefix}_{key}"] = np.nan
     # === END NEW ===
     
