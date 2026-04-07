@@ -80,6 +80,23 @@ EEG_HOMOLOG_PAIRS = {
 }
 
 # ==============================================================================
+# SPINDLE & SLOW OSCILLATION DETECTION (YASA-based)
+# ==============================================================================
+SPINDLE_FREQ_RANGE = (12.0, 16.0)       # Hz
+SPINDLE_FREQ_SLOW = (12.0, 14.0)        # Slow spindles
+SPINDLE_FREQ_FAST = (14.0, 16.0)        # Fast spindles
+SPINDLE_DURATION_RANGE = (0.5, 2.0)     # seconds
+SPINDLE_MIN_AMPLITUDE_UV = 12.0         # µV (per Adra et al. 2022)
+
+SO_FREQ_RANGE = (0.3, 1.5)              # Hz
+SO_DURATION_RANGE = (0.8, 2.0)          # seconds
+SO_MIN_AMPLITUDE_UV = 75.0              # µV (peak-to-trough)
+
+COUPLING_ANALYSIS_ENABLED = True
+COUPLING_MIN_SPINDLES = 10              # Minimum spindles for coupling stats
+COUPLING_MIN_SOS = 10                   # Minimum SOs for coupling stats
+
+# ==============================================================================
 # SCHLAF
 # ==============================================================================
 SLEEP_STAGE_ENCODING = {
@@ -184,7 +201,7 @@ EEG_FILTER = {
     "lowcut": 0.3,
     "highcut": 35.0,
     "order": 4,
-    "notch": 50.0,  # Netzfrequenz (50 Hz EU, 60 Hz US)
+    "notch": 60.0,  # Netzfrequenz (50 Hz EU, 60 Hz US)
 }
 EEG_AMPLITUDE_MAX_UV = 200.0    # Maximale physiologische Amplitude (µV)
 EEG_AMPLITUDE_MIN_UV = 0.5      # Minimale Amplitude (Flatliner-Erkennung)
