@@ -474,6 +474,8 @@ def _select_key_features_for_comparison(
     """
     Wählt Schlüssel-Features für Nacht-Drittel und Zyklus-Vergleiche.
     Fokus auf schlafmedizinisch relevante Features.
+    
+    === CHANGED: Added spindle, SO, and coupling patterns ===
     """
     key_patterns = [
         # HRV
@@ -485,7 +487,7 @@ def _select_key_features_for_comparison(
         # EEG Bandpower
         "delta_power_rel", "theta_power_rel", "alpha_power_rel",
         "sigma_power_rel", "beta_power_rel",
-        # EEG Schlafspezifisch
+        # EEG Schlafspezifisch (spectral proxies)
         "swa_power", "spindle_power_total", "slowing_ratio",
         "theta_alpha_ratio", "dar",
         # EEG Komplexität
@@ -494,6 +496,38 @@ def _select_key_features_for_comparison(
         # Annotation
         "ann_sleep_depth", "ann_total_event_count",
         "ann_arousal_count", "ann_respiratory_event_count",
+        
+        # === NEW: Discrete spindle features ===
+        # Spindle density and amplitude are the most sensitive
+        # biomarkers for cognitive impairment across the night
+        "_sp_density",
+        "_sp_amplitude_mean",
+        "_sp_duration_mean",
+        "_sp_frequency_mean",
+        "_sp_slow_density",
+        "_sp_fast_density",
+        "_sp_fast_slow_ratio",
+        "_sp_rms_mean",
+        "_sp_rel_power_mean",
+        
+        # === NEW: Slow oscillation features ===
+        # SO amplitude and slope decline is a marker of cortical
+        # integrity loss; tracking across the night is informative
+        "_so_density",
+        "_so_ptp_amplitude_mean",
+        "_so_slope_mean",
+        "_so_neg_peak_mean",
+        "_so_frequency_mean",
+        
+        # === NEW: SO-spindle coupling features ===
+        # Coupling strength (MRL) and preferred phase are among
+        # the strongest predictors of memory consolidation deficits
+        "_coup_mrl",
+        "_coup_mean_phase_deg",
+        "_coup_rate",
+        "_coup_pac_mi",
+        "_coup_rayleigh_z",
+        # === END NEW ===
     ]
     
     selected = []
@@ -504,6 +538,7 @@ def _select_key_features_for_comparison(
                 break
     
     return selected
+
 
 
 # ==============================================================================
@@ -1187,6 +1222,8 @@ def get_feature_importance_groups() -> Dict[str, List[str]]:
     Definiert Feature-Gruppen für Feature-Importance-Analyse.
     Nützlich für die Interpretation der ML-Ergebnisse.
     
+    === CHANGED: Added spindle, SO, coupling, and coupling dynamics groups ===
+    
     Returns
     -------
     Dict[str, List[str]]
@@ -1228,6 +1265,44 @@ def get_feature_importance_groups() -> Dict[str, List[str]]:
             "higuchi_fd", "dfa_alpha", "lzc",
             "hjorth_complexity"
         ],
+        
+        # === NEW: Discrete spindle detection features ===
+        "spindle_detection": [
+            "_sp_density", "_sp_count",
+            "_sp_amplitude_mean", "_sp_amplitude_std",
+            "_sp_duration_mean", "_sp_duration_std",
+            "_sp_frequency_mean", "_sp_frequency_std",
+            "_sp_rms_mean",
+            "_sp_slow_density", "_sp_fast_density",
+            "_sp_fast_slow_ratio",
+            "_sp_symmetry_mean",
+            "_sp_rel_power_mean",
+            "_sp_oscillations_mean",
+        ],
+        
+        # === NEW: Slow oscillation features ===
+        "slow_oscillation": [
+            "_so_density", "_so_count",
+            "_so_ptp_amplitude_mean", "_so_ptp_amplitude_std",
+            "_so_neg_peak_mean", "_so_neg_peak_std",
+            "_so_pos_peak_mean",
+            "_so_duration_mean", "_so_duration_std",
+            "_so_slope_mean", "_so_slope_std",
+            "_so_frequency_mean",
+        ],
+        
+        # === NEW: SO-spindle coupling features ===
+        "so_spindle_coupling": [
+            "_coup_count", "_coup_rate",
+            "_coup_mrl",
+            "_coup_mean_phase_rad", "_coup_mean_phase_deg",
+            "_coup_phase_std_rad",
+            "_coup_rayleigh_z", "_coup_rayleigh_p",
+            "_coup_preferred_phase_quadrant",
+            "_coup_pac_mi",
+        ],
+        # === END NEW ===
+        
         "sleep_architecture": [
             "sleep_efficiency", "tst_min", "waso_min",
             "n3_pct", "rem_pct", "sol_min", "rem_latency_min"
@@ -1247,3 +1322,4 @@ def get_feature_importance_groups() -> Dict[str, List[str]]:
             "third_diff", "cycle_trend", "ctx_trend"
         ],
     }
+
