@@ -75,7 +75,7 @@ from segmentation.segment_signals import (
 
 # Feature-Extraktion
 from feature_extraction.features_ecg import extract_ecg_features_all_segments
-from feature_extraction.features_eeg import extract_eeg_features_all_segments
+from feature_extraction.features_eeg import extract_eeg_features_all_segments, compute_delta_power_entropy
 from feature_extraction.features_annotations import extract_annotation_features
 
 # CAP-Feature-Extraktion
@@ -347,6 +347,22 @@ def process_single_patient(
                 stats.update("total_obstructive_apneas",
                              summary.get("obstructive_apnea_count", 0))
         
+        # --- Delta Power Entropy ---
+        try:        
+            stages_raw = annotation_data["stages_raw"]
+            delta_entropy, num_chan = compute_delta_power_entropy(
+                eeg_raw=record,
+                sfreq=eeg_fs,
+                stages_raw=stages_raw,
+                logger=logger  # Optional
+            )
+            patient_logger.info(
+            f"Delta-power entropy (sleep period only) from {num_chan} channel(s): {delta_entropy:.4f} bits"
+            )
+        except Exception as e:
+            if patient_logger:
+                patient_logger.warning(f"[Sleep-Depth Integration] Skipped Calculation of Advanced Sleep Depth Parameters: {e}")
+        
         # ==============================================================
         # SCHRITT 4: SEGMENTIERUNG (unchanged)
         # ==============================================================
@@ -390,7 +406,9 @@ def process_single_patient(
         # ==============================================================
         # Free the raw record (largest single object)
         del record
+        del record_reref
         record = None
+        record_reref = None
         
         # Free filtered EEG signals (no longer needed)
         del eeg_filtered_signals
@@ -482,6 +500,17 @@ def process_single_patient(
         patient_features = aggregate_to_patient_level(
             segment_features, sleep_summary, logger=patient_logger
         )
+
+        # --- CAP Features mergen ---
+        if isinstance(patient_features, dict):
+            patient_features.update(cap_features)
+        elif isinstance(patient_features, pd.Series):
+            for k, v in cap_features.items():
+                patient_features[k] = v
+        elif isinstance(patient_features, pd.DataFrame):
+            for k, v in cap_features.items():
+                patient_features.at[0, k] = v
+
         result["segment_features"] = segment_features
         result["patient_features"] = patient_features
         
@@ -636,7 +665,7 @@ def run_preprocessing_pipeline(
             if not patient_dir.exists():
                 logger.warning(f"Verzeichnis nicht gefunden: {patient_dir}")
                 continue
-            
+
             future = executor.submit(
                 process_single_patient,
                 patient_id=patient_id,
@@ -667,7 +696,7 @@ def run_preprocessing_pipeline(
             except Exception as e:
                 logger.error(f"Fehler bei Patient {patient_id}: {e}")
                 logger.error(traceback.format_exc())
-            
+                
             if (i + 1) % 10 == 0:
                 elapsed = time.time() - total_start
                 rate = (i + 1) / elapsed

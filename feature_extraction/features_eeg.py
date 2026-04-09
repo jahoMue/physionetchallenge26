@@ -31,9 +31,13 @@ Alle Features werden nur für Segmente mit ausreichender
 Signalqualität (SQI >= Schwellenwert) berechnet.
 """
 import numpy as np
+import mne 
 import pandas as pd
+from mne.io import Raw
 from scipy import signal as scipy_signal
 from scipy.stats import skew, kurtosis
+from scipy.ndimage import gaussian_filter1d
+from scipy.fft import fft
 from typing import Dict, List, Optional, Tuple
 
 from config import (
@@ -954,11 +958,147 @@ def _compute_temporal_features(
     
     return features
 
+# ==============================================================================
+# DELTA POWER ENTROPY
+# ==============================================================================
+
+def compute_delta_power_entropy(
+    eeg_raw: Raw,
+    sfreq: float,
+    stages_raw: pd.DataFrame,
+    logger: Optional[object] = None,
+    window_sec: float = 5.0,
+    delta_band: tuple = (0.5, 4.5),
+    multitaper_bandwidth: float = 2.0  # Recommended for 5s windows
+) -> float:
+    """
+    Compute the average delta power entropy (spectral entropy of the smoothed delta density function)
+    across all preprocessed EEG derivations using multitaper PSD estimation.
+
+    Args:
+        eeg_raw (mne.io.Raw): MNE Raw EEG object with all preprocessed EEG channels.
+        sfreq (float): Sampling frequency in Hz.
+        stages_raw (pd.DataFrame): DataFrame with columns ['start_sec', 'end_sec', 'stage'].
+            Stage encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable.
+        logger (object, optional): Logger for error messages.
+        window_sec (float): Window length in seconds (default: 5).
+        delta_band (tuple): Delta band (low, high) in Hz (default: (0.5, 4.5)).
+        multitaper_bandwidth (float): Bandwidth parameter for multitaper (Hz).
+
+    Returns:
+        float: Mean delta power entropy across all EEG derivations.
+    """
+    channel_names = ["F3-M2", "F4-M1", "C4-M1", "C3-M2"]
+    try:
+        # --- 1. Sleep onset/offset detection ---
+        WAKE_CODE, UNAVAILABLE_CODE = 5, 9
+        sleep_epochs = stages_raw[~stages_raw["stage_numeric"].isin([WAKE_CODE, UNAVAILABLE_CODE])]
+
+        if sleep_epochs.empty:
+            logger.warning("No non-Wake/Unavailable epochs found – returning nan.")
+            return np.nan
+        
+        onset_sec  = float(sleep_epochs["start_sec"].iloc[0])
+        offset_sec = float(sleep_epochs["end_sec"].iloc[-1])
+
+        if offset_sec <= onset_sec:
+            logger.warning("Sleep offset ≤ onset – returning nan.")
+            return np.nan
+
+        # --- 2. EEG slice for sleep period ---
+        eeg_picks = mne.pick_channels(eeg_raw.info["ch_names"], include=channel_names)
+
+        if len(eeg_picks) == 0:
+            logger.warning("No EEG channels found in eeg_raw – returning nan.")
+            return np.nan
+        
+        onset_sample  = int(np.round(onset_sec  * sfreq))
+        offset_sample = int(np.round(offset_sec * sfreq))
+        eeg_data = eeg_raw.get_data(picks=eeg_picks)[:, onset_sample:offset_sample]
+        n_sleep_samples = eeg_data.shape[1]
+        win_samples = int(window_sec * sfreq)
+        n_windows = n_sleep_samples // win_samples
+
+        if n_windows == 0:
+            logger.warning("Sleep period too short for a single window – returning nan.")
+            return np.nan
+
+        # --- 3. Window times and stage mapping ---
+        window_centers_sec = np.array([
+            onset_sec + (w * win_samples + win_samples / 2) / sfreq
+            for w in range(n_windows)
+        ])
+
+        stage_starts = stages_raw["start_sec"].values
+        stage_indices = np.searchsorted(stage_starts, window_centers_sec, side="right") - 1
+        stage_indices = np.clip(stage_indices, 0, len(stages_raw) - 1)
+        window_stages = stages_raw["stage_numeric"].values[stage_indices]
+
+        # --- 4–8. Per-channel entropy calculation ---
+        N1_CODE = 3
+        fmin, fmax = delta_band
+        entropies = []
+        for ch_idx in range(eeg_data.shape[0]):
+            ch_signal = eeg_data[ch_idx]
+            delta_powers = []
+            for w in range(n_windows):
+                segment = ch_signal[w * win_samples : (w + 1) * win_samples]
+                # Multitaper PSD (MNE)
+                psd, freqs = mne.time_frequency.psd_array_multitaper(
+                    segment,
+                    sfreq=sfreq,
+                    fmin=fmin,
+                    fmax=fmax,
+                    bandwidth=multitaper_bandwidth,
+                    adaptive=True,
+                    low_bias=True,
+                    normalization='full',
+                    output='power',
+                    verbose=False
+                )
+                delta_power = np.sum(psd)
+
+                # Mask Wake/N1
+                if window_stages[w] in [WAKE_CODE, N1_CODE]:
+                    delta_power = 0.0
+                delta_powers.append(delta_power)
+            delta_powers = np.array(delta_powers)
+            if np.sum(delta_powers) == 0.0:
+                logger.warning(f"Channel {eeg_raw.ch_names[eeg_picks[ch_idx]]}: all windows masked – skipped.")
+                continue
+
+            # Smoothing
+            smoothed = gaussian_filter1d(delta_powers, sigma=10)
+            total = np.sum(smoothed)
+            if total == 0.0:
+                continue
+            delta = smoothed / total
+
+            delta_fft = fft(delta)
+            delta_len = len(delta)
+            delta_fft = np.abs(delta_fft[0:delta_len//2])
+
+            # Spectral entropy (Shannon entropy)
+            delta_fft_nonzero = delta_fft[delta_fft > 0]
+            entropy = -np.sum(delta_fft_nonzero * np.log2(delta_fft_nonzero))
+            entropies.append(entropy)
+
+        if len(entropies) == 0:
+            logger.warning("No valid channel entropies computed – returning nan.")
+            return np.nan
+        
+        mean_entropy = float(np.mean(entropies))
+
+        return mean_entropy, len(entropies)
+
+    except Exception as exc:
+        logger.error(f"compute_delta_power_entropy failed: {exc}", exc_info=True)
+        return np.nan
+
 
 # ==============================================================================
 # ASYMMETRIE-FEATURES (INTERHEMISPHÄRISCH)
 # ==============================================================================
-
 def compute_asymmetry_features(
     left_features: Dict,
     right_features: Dict,
