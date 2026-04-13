@@ -244,7 +244,7 @@ def train_model(data_folder, model_folder, verbose):
         handle_imbalance="class_weight",
         feature_selection=True,
         tune=True,                  # <-- enables Optuna / RandomizedSearch tuning
-        n_tune_trials=30,
+        n_tune_trials=100,
         output_dir=config.MODEL_DIR,
         logger=logger if verbose else None,
     )

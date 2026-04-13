@@ -789,7 +789,7 @@ def run_preprocessing_pipeline(
 def run_training_pipeline(
     patient_level_features: Optional[pd.DataFrame] = None,
     model_types: Optional[List[str]] = None,
-    tune: bool = False
+    tune: bool = True
 ) -> Dict:
     """
     Führt die Trainings-Pipeline durch.
@@ -889,7 +889,7 @@ def run_full_pipeline(
     max_patients: Optional[int] = None,
     segment_length_sec: float = SEGMENT_LENGTH_SEC,
     model_types: Optional[List[str]] = None,
-    tune: bool = False
+    tune: bool = True
 ) -> Dict:
     """
     Führt die vollständige Pipeline durch:

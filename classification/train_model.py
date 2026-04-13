@@ -1411,7 +1411,7 @@ def train_multiple_models(
     handle_imbalance: str = "class_weight",
     feature_selection: bool = True,
     expected_test_prevalence: float = 0.10,
-    tune: bool = False,
+    tune: bool = True,
     n_tune_trials: int = 100,
     output_dir: Path = MODEL_DIR,
     logger=None
