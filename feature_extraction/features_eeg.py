@@ -31,9 +31,7 @@ Alle Features werden nur für Segmente mit ausreichender
 Signalqualität (SQI >= Schwellenwert) berechnet.
 """
 import numpy as np
-import mne 
 import pandas as pd
-from mne.io import Raw
 from scipy import signal as scipy_signal
 from scipy.stats import skew, kurtosis
 from scipy.ndimage import gaussian_filter1d
@@ -963,7 +961,7 @@ def _compute_temporal_features(
 # ==============================================================================
 
 def compute_delta_power_entropy(
-    eeg_raw: Raw,
+    eeg_preprocessed: Dict[str, Dict],
     sfreq: float,
     stages_raw: pd.DataFrame,
     logger: Optional[object] = None,
@@ -976,9 +974,9 @@ def compute_delta_power_entropy(
     across all preprocessed EEG derivations using multitaper PSD estimation.
 
     Args:
-        eeg_raw (mne.io.Raw): MNE Raw EEG object with all preprocessed EEG channels.
+        eeg_preprocessed (Dict[str, Dict]): Dict mapping channel_name to dict with key 'eeg_cleaned' (np.ndarray).
         sfreq (float): Sampling frequency in Hz.
-        stages_raw (pd.DataFrame): DataFrame with columns ['start_sec', 'end_sec', 'stage'].
+        stages_raw (pd.DataFrame): DataFrame with columns ['start_sec', 'end_sec', 'stage_numeric'].
             Stage encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable.
         logger (object, optional): Logger for error messages.
         window_sec (float): Window length in seconds (default: 5).
@@ -986,42 +984,43 @@ def compute_delta_power_entropy(
         multitaper_bandwidth (float): Bandwidth parameter for multitaper (Hz).
 
     Returns:
-        float: Mean delta power entropy across all EEG derivations.
+        float: Mean delta power entropy across all EEG derivations, number of channels used.
     """
-    channel_names = ["F3-M2", "F4-M1", "C4-M1", "C3-M2"]
+    import numpy as np
+    import mne
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.fft import fft
+
+    channel_names = ["F3", "F4", "C4", "C3"]
     try:
         # --- 1. Sleep onset/offset detection ---
         WAKE_CODE, UNAVAILABLE_CODE = 5, 9
         sleep_epochs = stages_raw[~stages_raw["stage_numeric"].isin([WAKE_CODE, UNAVAILABLE_CODE])]
 
         if sleep_epochs.empty:
-            logger.warning("No non-Wake/Unavailable epochs found – returning nan.")
-            return np.nan
-        
+            if logger:
+                logger.warning("No non-Wake/Unavailable epochs found – returning nan.")
+            return np.nan, 0
+
         onset_sec  = float(sleep_epochs["start_sec"].iloc[0])
         offset_sec = float(sleep_epochs["end_sec"].iloc[-1])
 
         if offset_sec <= onset_sec:
-            logger.warning("Sleep offset ≤ onset – returning nan.")
-            return np.nan
+            if logger:
+                logger.warning("Sleep offset ≤ onset – returning nan.")
+            return np.nan, 0
 
-        # --- 2. EEG slice for sleep period ---
-        eeg_picks = mne.pick_channels(eeg_raw.info["ch_names"], include=channel_names)
-
-        if len(eeg_picks) == 0:
-            logger.warning("No EEG channels found in eeg_raw – returning nan.")
-            return np.nan
-        
+        # --- 2. Prepare sample indices for sleep period ---
         onset_sample  = int(np.round(onset_sec  * sfreq))
         offset_sample = int(np.round(offset_sec * sfreq))
-        eeg_data = eeg_raw.get_data(picks=eeg_picks)[:, onset_sample:offset_sample]
-        n_sleep_samples = eeg_data.shape[1]
         win_samples = int(window_sec * sfreq)
+        n_sleep_samples = offset_sample - onset_sample
         n_windows = n_sleep_samples // win_samples
 
         if n_windows == 0:
-            logger.warning("Sleep period too short for a single window – returning nan.")
-            return np.nan
+            if logger:
+                logger.warning("Sleep period too short for a single window – returning nan.")
+            return np.nan, 0
 
         # --- 3. Window times and stage mapping ---
         window_centers_sec = np.array([
@@ -1038,8 +1037,29 @@ def compute_delta_power_entropy(
         N1_CODE = 3
         fmin, fmax = delta_band
         entropies = []
-        for ch_idx in range(eeg_data.shape[0]):
-            ch_signal = eeg_data[ch_idx]
+        used_channels = []
+
+        for channel_name, ch_data in eeg_preprocessed.items():
+            if (
+                channel_name not in channel_names or
+                ch_data is None or
+                "eeg_cleaned" not in ch_data or
+                ch_data["eeg_cleaned"] is None
+            ):
+                continue
+
+            full_signal = ch_data["eeg_cleaned"]
+            if len(full_signal) < offset_sample:
+                if logger:
+                    logger.warning(f"Channel {channel_name}: Signal too short for sleep period – skipped.")
+                continue
+
+            ch_signal = full_signal[onset_sample:offset_sample]
+            if len(ch_signal) < n_windows * win_samples:
+                if logger:
+                    logger.warning(f"Channel {channel_name}: Not enough data for all windows – skipped.")
+                continue
+
             delta_powers = []
             for w in range(n_windows):
                 segment = ch_signal[w * win_samples : (w + 1) * win_samples]
@@ -1064,7 +1084,8 @@ def compute_delta_power_entropy(
                 delta_powers.append(delta_power)
             delta_powers = np.array(delta_powers)
             if np.sum(delta_powers) == 0.0:
-                logger.warning(f"Channel {eeg_raw.ch_names[eeg_picks[ch_idx]]}: all windows masked – skipped.")
+                if logger:
+                    logger.warning(f"Channel {channel_name}: all windows masked – skipped.")
                 continue
 
             # Smoothing
@@ -1082,20 +1103,21 @@ def compute_delta_power_entropy(
             delta_fft_nonzero = delta_fft[delta_fft > 0]
             entropy = -np.sum(delta_fft_nonzero * np.log2(delta_fft_nonzero))
             entropies.append(entropy)
+            used_channels.append(channel_name)
 
         if len(entropies) == 0:
-            logger.warning("No valid channel entropies computed – returning nan.")
-            return np.nan
-        
-        mean_entropy = float(np.mean(entropies))
+            if logger:
+                logger.warning("No valid channel entropies computed – returning nan.")
+            return np.nan, 0
 
+        mean_entropy = float(np.mean(entropies))
         return mean_entropy, len(entropies)
 
     except Exception as exc:
-        logger.error(f"compute_delta_power_entropy failed: {exc}", exc_info=True)
-        return np.nan
-
-
+        if logger:
+            logger.error(f"compute_delta_power_entropy failed: {exc}", exc_info=True)
+        return np.nan, 0
+    
 # ==============================================================================
 # ASYMMETRIE-FEATURES (INTERHEMISPHÄRISCH)
 # ==============================================================================

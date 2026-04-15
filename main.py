@@ -351,7 +351,7 @@ def process_single_patient(
         try:        
             stages_raw = annotation_data["stages_raw"]
             delta_entropy, num_chan = compute_delta_power_entropy(
-                eeg_raw=record,
+                eeg_preprocessed=eeg_preprocessed,
                 sfreq=eeg_fs,
                 stages_raw=stages_raw,
                 logger=logger  # Optional
@@ -398,6 +398,30 @@ def process_single_patient(
             stats.update("valid_eeg_segments", n_eeg_ok)
         
         print_segmentation_summary(recording, logger=patient_logger)
+
+        # --- CAP Features ---
+        cap_features = {}
+
+        try:
+            cap_eeg_channel = None
+            if eeg_preprocessed:  # Use the filtered EEG signals
+                cap_eeg_channel = next(iter(eeg_preprocessed.keys()))
+            if cap_eeg_channel:
+                cap_ch_data = eeg_preprocessed[cap_eeg_channel]  # Corrected reference
+                cap_eeg_signal = (cap_ch_data["eeg_cleaned"] if isinstance(cap_ch_data, dict) and "eeg_cleaned" in cap_ch_data else cap_ch_data)
+                cap_fs = eeg_fs  # Sampling frequency
+                cap_event = annotation_data["stages_raw"].stage_numeric if annotation_data and "stages_raw" in annotation_data else None
+                cap_duration = annotation_data["stages_raw"].duration_sec if annotation_data and "stages_raw" in annotation_data else None
+                cap_eventtime = annotation_data["stages_raw"].start_sec if annotation_data and "stages_raw" in annotation_data else None
+                if cap_event is not None and cap_duration is not None and cap_eventtime is not None:
+                    cap_features = extract_cap_features_for_patient(
+                        cap_eeg_signal, cap_fs, cap_event, cap_duration, cap_eventtime, patient_id,
+                        logger=patient_logger
+                    )
+        except Exception as e:
+            if patient_logger:
+                patient_logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion übersprungen: {e}")
+
         
         # ==============================================================
         # NEW: FREE FULL-LENGTH SIGNALS AFTER SEGMENTATION
@@ -457,30 +481,6 @@ def process_single_patient(
             logger=patient_logger,
         )
 
-        # --- CAP Features ---
-        cap_features = {}
-
-        try:
-            cap_eeg_channel = None
-            if eeg_filtered_signals:  # Use the filtered EEG signals
-                cap_eeg_channel = next(iter(eeg_filtered_signals.keys()))
-            if cap_eeg_channel:
-                cap_eeg_signal = eeg_filtered_signals[cap_eeg_channel]  # Corrected reference
-                cap_fs = eeg_fs  # Sampling frequency
-                cap_event = annotation_data["stages_raw"].stage_numeric if annotation_data and "stages_raw" in annotation_data else None
-                cap_duration = annotation_data["stages_raw"].duration_sec if annotation_data and "stages_raw" in annotation_data else None
-                cap_eventtime = annotation_data["stages_raw"].start_sec if annotation_data and "stages_raw" in annotation_data else None
-                if cap_event is not None and cap_duration is not None and cap_eventtime is not None:
-                    cap_features = extract_cap_features_for_patient(
-                        cap_eeg_signal, cap_fs, cap_event, cap_duration, cap_eventtime, patient_id,
-                        logger=patient_logger
-                    )
-        except Exception as e:
-            if patient_logger:
-                patient_logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion übersprungen: {e}")
-
-
-
         
         # ==============================================================
         # SCHRITT 6: FEATURE-TABELLE ERSTELLEN (unchanged logic)
@@ -510,6 +510,8 @@ def process_single_patient(
         elif isinstance(patient_features, pd.DataFrame):
             for k, v in cap_features.items():
                 patient_features.at[0, k] = v
+
+        patient_features.at[0,'Delta_Power_Entropy'] = delta_entropy
 
         result["segment_features"] = segment_features
         result["patient_features"] = patient_features
