@@ -130,7 +130,7 @@ def get_output_statistics(predictions, rec_pred, CAP_start, CAP_stop, name):
     stats['ID'] = name
     # 2. SLDUR: Schlafdauer (len(predictions)+13)
     sldur = len(predictions) + 13
-    stats['SLDUR'] = sldur
+    stats['cap_SLDUR'] = sldur
 
     # 3. A-Phasen-Detektion
     pred_diff = np.diff((rec_pred > 0).astype(int))
@@ -150,16 +150,16 @@ def get_output_statistics(predictions, rec_pred, CAP_start, CAP_stop, name):
         A_type = np.array([], dtype=int)
     # 3. NRAPH: Anzahl A-Phasen
     nraph = len(A_start)
-    stats['NRAPH'] = nraph
+    stats['cap_NRAPH'] = nraph
     # 4. APHDUR: Gesamtdauer A-Phasen
     aphdur = int(np.sum(rec_pred > 0))
-    stats['APHDUR'] = aphdur
+    stats['cap_APHDUR'] = aphdur
     # 5. AVGAPHDUR: Durchschnittliche A-Phasen-Dauer
-    stats['AVGAPHDUR'] = aphdur / nraph if nraph > 0 else 0
+    stats['cap_AVGAPHDUR'] = aphdur / nraph if nraph > 0 else 0
     # 6. NRAPHPH: A-Phasen pro Stunde
-    stats['NRAPHPH'] = nraph / sldur * 3600 if sldur > 0 else 0
+    stats['cap_NRAPHPH'] = nraph / sldur * 3600 if sldur > 0 else 0
     # 7. RAPHSL: Anteil A-Phasen an Schlafdauer
-    stats['RAPHSL'] = aphdur / sldur if sldur > 0 else 0
+    stats['cap_RAPHSL'] = aphdur / sldur if sldur > 0 else 0
 
     # --- Typ-spezifische A-Phasen (A1, A2, A3) ---
     # A1
@@ -173,19 +173,19 @@ def get_output_statistics(predictions, rec_pred, CAP_start, CAP_stop, name):
             A1_stop = np.append(A1_stop, len(rec_pred)-1)
         nra1 = len(A1_start)
         a1dur = int(np.sum(pred_1 > 0))
-        stats['NRA1'] = nra1
-        stats['A1DUR'] = a1dur
-        stats['AVGA1DUR'] = a1dur / nra1 if nra1 > 0 else 0
-        stats['RA1APH'] = nra1 / nraph if nraph > 0 else 0
-        stats['RA1NRE'] = a1dur / sldur if sldur > 0 else 0
-        stats['A1IND'] = nra1 / sldur * 3600 if sldur > 0 else 0
+        stats['cap_NRA1'] = nra1
+        stats['cap_A1DUR'] = a1dur
+        stats['cap_AVGA1DUR'] = a1dur / nra1 if nra1 > 0 else 0
+        stats['cap_RA1APH'] = nra1 / nraph if nraph > 0 else 0
+        stats['cap_RA1NRE'] = a1dur / sldur if sldur > 0 else 0
+        stats['cap_A1IND'] = nra1 / sldur * 3600 if sldur > 0 else 0
     else:
-        stats['NRA1'] = 0
-        stats['A1DUR'] = 0
-        stats['AVGA1DUR'] = 0
-        stats['RA1APH'] = 0
-        stats['RA1NRE'] = 0
-        stats['A1IND'] = 0
+        stats['cap_NRA1'] = 0
+        stats['cap_A1DUR'] = 0
+        stats['cap_AVGA1DUR'] = 0
+        stats['cap_RA1APH'] = 0
+        stats['cap_RA1NRE'] = 0
+        stats['cap_A1IND'] = 0
 
     # A2
     pred_2 = (rec_pred == 2).astype(int)
@@ -198,19 +198,19 @@ def get_output_statistics(predictions, rec_pred, CAP_start, CAP_stop, name):
             A2_stop = np.append(A2_stop, len(rec_pred)-1)
         nra2 = len(A2_start)
         a2dur = int(np.sum(pred_2 > 0))
-        stats['NRA2'] = nra2
-        stats['A2DUR'] = a2dur
-        stats['AVGA2DUR'] = a2dur / nra2 if nra2 > 0 else 0
-        stats['RA2APH'] = nra2 / nraph if nraph > 0 else 0
-        stats['RA2NRE'] = a2dur / sldur if sldur > 0 else 0
-        stats['A2IND'] = nra2 / sldur * 3600 if sldur > 0 else 0
+        stats['cap_NRA2'] = nra2
+        stats['cap_A2DUR'] = a2dur
+        stats['cap_AVGA2DUR'] = a2dur / nra2 if nra2 > 0 else 0
+        stats['cap_RA2APH'] = nra2 / nraph if nraph > 0 else 0
+        stats['cap_RA2NRE'] = a2dur / sldur if sldur > 0 else 0
+        stats['cap_A2IND'] = nra2 / sldur * 3600 if sldur > 0 else 0
     else:
-        stats['NRA2'] = 0
-        stats['A2DUR'] = 0
-        stats['AVGA2DUR'] = 0
-        stats['RA2APH'] = 0
-        stats['RA2NRE'] = 0
-        stats['A2IND'] = 0
+        stats['cap_NRA2'] = 0
+        stats['cap_A2DUR'] = 0
+        stats['cap_AVGA2DUR'] = 0
+        stats['cap_RA2APH'] = 0
+        stats['cap_RA2NRE'] = 0
+        stats['cap_A2IND'] = 0
 
     # A3
     pred_3 = (rec_pred == 3).astype(int)
@@ -223,19 +223,19 @@ def get_output_statistics(predictions, rec_pred, CAP_start, CAP_stop, name):
             A3_stop = np.append(A3_stop, len(rec_pred)-1)
         nra3 = len(A3_start)
         a3dur = int(np.sum(pred_3 > 0))
-        stats['NRA3'] = nra3
-        stats['A3DUR'] = a3dur
-        stats['AVGA3DUR'] = a3dur / nra3 if nra3 > 0 else 0
-        stats['RA3APH'] = nra3 / nraph if nraph > 0 else 0
-        stats['RA3NRE'] = a3dur / sldur if sldur > 0 else 0
-        stats['A3IND'] = nra3 / sldur * 3600 if sldur > 0 else 0
+        stats['cap_NRA3'] = nra3
+        stats['cap_A3DUR'] = a3dur
+        stats['cap_AVGA3DUR'] = a3dur / nra3 if nra3 > 0 else 0
+        stats['cap_RA3APH'] = nra3 / nraph if nraph > 0 else 0
+        stats['cap_RA3NRE'] = a3dur / sldur if sldur > 0 else 0
+        stats['cap_A3IND'] = nra3 / sldur * 3600 if sldur > 0 else 0
     else:
-        stats['NRA3'] = 0
-        stats['A3DUR'] = 0
-        stats['AVGA3DUR'] = 0
-        stats['RA3APH'] = 0
-        stats['RA3NRE'] = 0
-        stats['A3IND'] = 0
+        stats['cap_NRA3'] = 0
+        stats['cap_A3DUR'] = 0
+        stats['cap_AVGA3DUR'] = 0
+        stats['cap_RA3APH'] = 0
+        stats['cap_RA3NRE'] = 0
+        stats['cap_A3IND'] = 0
 
     # --- CAP-Statistiken ---
     if len(CAP_start) > 0:
@@ -258,18 +258,18 @@ def get_output_statistics(predictions, rec_pred, CAP_start, CAP_stop, name):
                 cap_a_stop = cap_a_stop[:-1]
             cap_cycle_duration.extend(np.diff(cap_a_start1).tolist())
             b_phase_duration.extend((cap_a_start2 - cap_a_stop).tolist())
-        stats['NRCAP'] = nrcap
-        stats['CAPDUR'] = cap_duration
-        stats['RCAPSL'] = cap_duration / sldur * 100 if sldur > 0 else 0
-        stats['AVGCAPDUR'] = cap_duration / nrcap if nrcap > 0 else 0
-        stats['AVGCYCLEDUR'] = float(np.mean(cap_cycle_duration)) if cap_cycle_duration else 0
-        stats['AVGBPHADUR'] = float(np.mean(b_phase_duration)) if b_phase_duration else 0
+        stats['cap_NRCAP'] = nrcap
+        stats['cap_CAPDUR'] = cap_duration
+        stats['cap_RCAPSL'] = cap_duration / sldur * 100 if sldur > 0 else 0
+        stats['cap_AVGCAPDUR'] = cap_duration / nrcap if nrcap > 0 else 0
+        stats['cap_AVGCYCLEDUR'] = float(np.mean(cap_cycle_duration)) if cap_cycle_duration else 0
+        stats['cap_AVGBPHADUR'] = float(np.mean(b_phase_duration)) if b_phase_duration else 0
     else:
-        stats['NRCAP'] = 0
-        stats['CAPDUR'] = 0
-        stats['RCAPSL'] = 0
-        stats['AVGCAPDUR'] = 0
-        stats['AVGCYCLEDUR'] = 0
-        stats['AVGBPHADUR'] = 0
+        stats['cap_NRCAP'] = 0
+        stats['cap_CAPDUR'] = 0
+        stats['cap_RCAPSL'] = 0
+        stats['cap_AVGCAPDUR'] = 0
+        stats['cap_AVGCYCLEDUR'] = 0
+        stats['cap_AVGBPHADUR'] = 0
 
     return stats

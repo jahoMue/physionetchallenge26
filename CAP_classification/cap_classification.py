@@ -1,7 +1,7 @@
 import numpy as np
 import onnxruntime as ort
 from CAP_classification.post_processing import label_reconstruction, post_processing_multi_class, cap_sequences, get_output_statistics
-
+from config import CAP_MODEL_DIR
 
 def cap_classification(input_list, eeg, flags):
     """
@@ -11,7 +11,7 @@ def cap_classification(input_list, eeg, flags):
     lstm_predict_fn: Funktion, die ein Input-Array (seq_len, features) nimmt und Vorhersagen zurückgibt
     """
 
-    ort_session = ort.InferenceSession(r'C:\cap_lstm.onnx')
+    ort_session = ort.InferenceSession(CAP_MODEL_DIR)
 
     # Normalisierung (medianiqr)
     def medianiqr_norm(x):

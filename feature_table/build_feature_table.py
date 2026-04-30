@@ -527,6 +527,14 @@ def _select_key_features_for_comparison(
         "_coup_rate",
         "_coup_pac_mi",
         "_coup_rayleigh_z",
+
+        # CAP parameters
+        "cap_CAPR",
+        "cap_AVGCAPDUR",
+        "cap_AVGCYCLEDUR",
+        "cap_NCAPSEQ",
+        # Delta power entropy
+        "Delta_Power_Entropy",
         # === END NEW ===
     ]
     
@@ -846,6 +854,7 @@ def _process_demographics(df: pd.DataFrame, logger=None) -> pd.DataFrame:
 
 def build_cohort_feature_table(
     patient_segment_tables: Dict[str, pd.DataFrame],
+    patient_features_tables: Optional[Dict[str, pd.DataFrame]],
     patient_sleep_summaries: Optional[Dict[str, Dict]] = None,
     demographics_path: Path = DEMOGRAPHICS_FILE,
     output_dir: Path = FEATURE_DIR,
@@ -929,6 +938,25 @@ def build_cohort_feature_table(
         return segment_level, pd.DataFrame()
     
     patient_level = pd.concat(patient_tables, ignore_index=True)
+
+    # --- Merge CAP parameters and Delta Power Entropy from pre-computed patient features ---
+    if patient_features_tables:
+        cap_delta_rows = []
+        for pid, pf_df in patient_features_tables.items():
+            if pf_df is None or len(pf_df) == 0:
+                continue
+            cap_cols = [c for c in pf_df.columns if c.startswith("cap_") or c == "Delta_Power_Entropy"]
+            if cap_cols:
+                row = {"patient_id": pid}
+                for col in cap_cols:
+                    row[col] = pf_df.iloc[0][col]
+                cap_delta_rows.append(row)
+        if cap_delta_rows:
+            cap_delta_df = pd.DataFrame(cap_delta_rows)
+            patient_level = patient_level.merge(cap_delta_df, on="patient_id", how="left")
+            if logger:
+                merged_cap_cols = [c for c in patient_level.columns if c.startswith("cap_") or c == "Delta_Power_Entropy"]
+                logger.info(f"CAP + Delta features gemerged: {len(merged_cap_cols)} Spalten")
     
     if logger:
         n_patients = len(patient_level)
@@ -943,7 +971,14 @@ def build_cohort_feature_table(
     
     # --- Finale Bereinigung der Patient-Level Tabelle ---
     patient_level = _final_cleanup_patient_level(patient_level, logger)
-    
+
+    # --- Downcast float64 → float32 to halve memory ---
+    for col in patient_level.select_dtypes(include=['float64']).columns:
+        patient_level[col] = patient_level[col].astype(np.float32)
+
+    for col in segment_level.select_dtypes(include=['float64']).columns:
+        segment_level[col] = segment_level[col].astype(np.float32)
+        
     # --- Speichern ---
     if save:
         _save_feature_tables(segment_level, patient_level, output_dir, logger)
@@ -1122,6 +1157,8 @@ def _log_feature_table_summary(
         "Nacht-Drittel": ["third"],
         "Schlafzyklus": ["cycle"],
         "Meta": ["meta_", "n_", "pct_"],
+        "CAP": ["cap_"],
+        "Delta-Entropie": ["Delta_Power_Entropy"],
     }
     
     for group_name, prefixes in group_prefixes.items():
@@ -1320,6 +1357,20 @@ def get_feature_importance_groups() -> Dict[str, List[str]]:
         ],
         "temporal_dynamics": [
             "third_diff", "cycle_trend", "ctx_trend"
+        ],
+
+         # === CAP parameters ===
+        "cap_parameters": [
+            "cap_CAPR", "cap_AVGCAPDUR", "cap_AVGCYCLEDUR",
+            "cap_NCAPSEQ", "cap_CAPDUR", "cap_AVGBPHDUR",
+            "cap_NRAPH", "cap_APHDUR", "cap_AVGAPHDUR",
+            "cap_NRA1PH", "cap_NRA2PH", "cap_NRA3PH",
+            "cap_A1PHDUR", "cap_A2PHDUR", "cap_A3PHDUR",
+            "cap_SLDUR", "cap_RAPHSL",
+        ],
+        # === Delta power entropy ===
+        "delta_power_entropy": [
+            "Delta_Power_Entropy",
         ],
     }
 

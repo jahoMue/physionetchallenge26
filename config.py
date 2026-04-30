@@ -14,8 +14,10 @@ import numpy as np
 # Basis-Verzeichnisse
 PROJECT_DIR = Path(__file__).parent.resolve()
 
+CAP_MODEL_DIR = r'./CAP_classification/cap_lstm.onnx'
+
 # Training-Set Verzeichnis
-TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
+TRAINING_SET_DIR = Path(r"D:\Richard\Physionet26Data\training_set")
                     # Path(r"C:\Users\Biosig 1\Documents\Richard\Physionet26Data\training_set")
 
 # Unterverzeichnisse der Datenstruktur

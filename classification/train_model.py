@@ -188,7 +188,7 @@ def train_model(
         logger.info(f"Target-Verteilung: {dict(zip(*np.unique(y, return_counts=True)))}")
 
     imputer = SimpleImputer(strategy="median")
-    X_imputed = imputer.fit_transform(X)
+    X_imputed = imputer.fit_transform(X).astype(np.float32)
 
     selected_features = feature_names.copy()
     feature_selector = None
@@ -201,7 +201,7 @@ def train_model(
         )
 
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_imputed)
+    X_scaled = scaler.fit_transform(X_imputed).astype(np.float32)
 
     if logger:
         logger.info(f"Features nach Selection: {len(selected_features)}")
@@ -345,7 +345,7 @@ def prepare_training_data(
 
     info["n_features_original"] = len(final_features)
 
-    X = df[final_features].values.astype(np.float64)
+    X = df[final_features].values.astype(np.float32)
 
     if logger:
         logger.info(f"Features: {len(final_features)} "
@@ -437,7 +437,7 @@ def _combined_feature_selection(
     n_total = X.shape[1]
 
     imp = SimpleImputer(strategy="median")
-    X_imp = imp.fit_transform(X)
+    X_imp = imp.fit_transform(X).astype(np.float32)
 
     try:
         f_scores, f_pvalues = f_classif(X_imp, y)
@@ -487,7 +487,7 @@ def _model_based_feature_selection(
     logger=None
 ) -> Tuple[Any, np.ndarray]:
     imp = SimpleImputer(strategy="median")
-    X_imp = imp.fit_transform(X)
+    X_imp = imp.fit_transform(X).astype(np.float32)
 
     model = lgb.LGBMClassifier(
         n_estimators=200,
@@ -1453,9 +1453,9 @@ def train_multiple_models(
                 X, y, feature_names, _ = prepare_training_data(feature_table, logger)
                 if X is not None:
                     imputer = SimpleImputer(strategy="median")
-                    X_imp = imputer.fit_transform(X)
+                    X_imp = imputer.fit_transform(X).astype(np.float32)
                     scaler = StandardScaler()
-                    X_scaled = scaler.fit_transform(X_imp)
+                    X_scaled = scaler.fit_transform(X_imp).astype(np.float32)
 
                     tune_result = tune_hyperparameters(
                         X_scaled, y, model_type, n_tune_trials,
@@ -1611,9 +1611,9 @@ def predict(
         for f in missing_features:
             feature_table[f] = np.nan
 
-    X = feature_table[feature_names].values.astype(np.float64)
+    X = feature_table[feature_names].values.astype(np.float32)
 
-    X_imputed = imputer.transform(X)
+    X_imputed = imputer.transform(X).astype(np.float32)
 
     if feature_selector is not None:
         try:
@@ -1627,7 +1627,7 @@ def predict(
     else:
         X_selected = X_imputed
 
-    X_scaled = scaler.transform(X_selected)
+    X_scaled = scaler.transform(X_selected).astype(np.float32)
 
     try:
         predictions = model.predict(X_scaled)

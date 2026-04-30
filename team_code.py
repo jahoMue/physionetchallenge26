@@ -106,8 +106,7 @@ def train_model(data_folder, model_folder, verbose):
         train_model as classification_train_model,
     )
 
-    if verbose:
-        print("Finding the Challenge data...")
+    logger.info("Finding the Challenge data...")
 
     patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     patient_metadata_list = find_patients(patient_data_file)
@@ -116,10 +115,9 @@ def train_model(data_folder, model_folder, verbose):
     if num_records == 0:
         raise FileNotFoundError("No data were provided.")
 
-    if verbose:
-        print(f"Found {num_records} records. Starting preprocessing...")
+    logger.info(f"Found {num_records} records. Starting preprocessing...")
 
-    # --- 1. Run preprocessing pipeline (parallel) --------------------------
+    # --- 1. Run preprocessing pipeline (parallel, pool-recycling) -----------
     feature_dir = config.FEATURE_DIR
     feature_dir.mkdir(parents=True, exist_ok=True)
 
@@ -128,62 +126,70 @@ def train_model(data_folder, model_folder, verbose):
 
     total_start = time.time()
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for i in range(num_records):
-            record = patient_metadata_list[i]
-            patient_id_bids = record[HEADERS['bids_folder']]
-            site_id = record[HEADERS['site_id']]
-            session_id = record[HEADERS['session_id']]
+    # Process in batches, recycling the pool after each batch
+    # so that worker process memory is fully released between batches
+    batch_size = max_workers  # One subject per worker, then recycle
 
-            # Build the patient_id string our pipeline expects:
-            #   "site_id/sub-XXX_ses-N"
-            record_name = f"{patient_id_bids}_ses-{session_id}"
-            pipeline_patient_id = f"{site_id}/{record_name}"
+    for batch_start in range(0, num_records, batch_size):
+        batch_end = min(batch_start + batch_size, num_records)
 
-            patient_dir = config.PHYSIOLOGICAL_DATA_DIR / site_id
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for i in range(batch_start, batch_end):
+                record = patient_metadata_list[i]
+                patient_id_bids = record[HEADERS['bids_folder']]
+                site_id = record[HEADERS['site_id']]
+                session_id = record[HEADERS['session_id']]
 
-            if not patient_dir.exists():
-                if verbose:
-                    print(f"  ! Directory not found: {patient_dir}. Skipping.")
-                continue
+                record_name = f"{patient_id_bids}_ses-{session_id}"
+                pipeline_patient_id = f"{site_id}/{record_name}"
+                patient_dir = config.PHYSIOLOGICAL_DATA_DIR / site_id
 
-            future = executor.submit(
-                process_single_patient,
-                patient_id=pipeline_patient_id,
-                patient_dir=patient_dir,
-                record_name=record_name,
-                segment_length_sec=config.SEGMENT_LENGTH_SEC,
-                overlap_sec=config.SEGMENT_OVERLAP_SEC,
-                feature_output_dir=feature_dir,
-            )
-            futures[future] = pipeline_patient_id
+                if not patient_dir.exists():
+                    logger.warning(f"Directory not found: {patient_dir}. Skipping.")
+                    continue
 
-        for i, future in enumerate(as_completed(futures)):
-            pid = futures[future]
-            try:
-                result = future.result()
-                if result and result["success"]:
-                    successful_results[pid] = {
-                        "seg_features_path": result.get("seg_features_path"),
-                        "pat_features_path": result.get("pat_features_path"),
-                        "sleep_summary": result.get("sleep_summary"),
-                    }
-            except Exception as e:
-                if verbose:
-                    print(f"  !!! Error processing {pid}: {e}")
+                future = executor.submit(
+                    process_single_patient,
+                    patient_id=pipeline_patient_id,
+                    patient_dir=patient_dir,
+                    record_name=record_name,
+                    segment_length_sec=config.SEGMENT_LENGTH_SEC,
+                    overlap_sec=config.SEGMENT_OVERLAP_SEC,
+                    feature_output_dir=feature_dir,
+                )
+                futures[future] = pipeline_patient_id
 
-            if verbose and (i + 1) % 50 == 0:
-                elapsed = time.time() - total_start
-                print(f"  Progress: {i+1}/{len(futures)} "
-                      f"({elapsed:.0f}s elapsed)")
+            for future in as_completed(futures):
+                pid = futures[future]
+                try:
+                    result = future.result()
+                    if result and result["success"]:
+                        successful_results[pid] = {
+                            "seg_features_path": result.get("seg_features_path"),
+                            "pat_features_path": result.get("pat_features_path"),
+                            "sleep_summary": result.get("sleep_summary"),
+                        }
+                except Exception as e:
+                    logger.error(f"Error processing {pid}: {e}")
 
-    if verbose:
-        print(f"Preprocessing done: {len(successful_results)}/{num_records} "
-              f"successful in {time.time()-total_start:.0f}s")
+        # Pool is destroyed here — all worker processes are killed and RAM is freed
+        gc.collect()
+
+        elapsed = time.time() - total_start
+        logger.info(
+            f"Batch progress: {batch_end}/{num_records} patients processed "
+            f"({len(successful_results)} successful, {elapsed:.0f}s elapsed)"
+        )
+
+    logger.info(
+        f"Preprocessing done: {len(successful_results)}/{num_records} "
+        f"successful in {time.time() - total_start:.0f}s"
+    )
 
     # --- 2. Load features from disk & build cohort table -------------------
     patient_segment_tables = {}
+    patient_level_tables = {}
     patient_sleep_summaries = {}
 
     for pid, paths in successful_results.items():
@@ -192,24 +198,21 @@ def train_model(data_folder, model_folder, verbose):
             try:
                 patient_segment_tables[pid] = pd.read_parquet(seg_path)
             except Exception as e:
-                if verbose:
-                    print(f"  ! Failed to load {seg_path}: {e}")
+                logger.warning(f"Failed to load {seg_path}: {e}")
+
+        pat_path = paths.get("pat_features_path")
+        if pat_path and Path(pat_path).exists():
+            try:
+                patient_level_tables[pid] = pd.read_parquet(pat_path)
+            except Exception as e:
+                logger.warning(f"Failed to load {pat_path}: {e}")
 
         if paths.get("sleep_summary"):
             patient_sleep_summaries[pid] = paths["sleep_summary"]
 
-    del successful_results
-    gc.collect()
-
-    if not patient_segment_tables:
-        if verbose:
-            print("ERROR: No features extracted. Training a fallback model.")
-        # Save a trivial fallback model so load_model / run_model don't crash
-        _save_fallback_model(model_folder)
-        return
-
     segment_level, patient_level = build_cohort_feature_table(
         patient_segment_tables=patient_segment_tables,
+        patient_features_tables=patient_level_tables,
         patient_sleep_summaries=patient_sleep_summaries,
         demographics_path=config.DEMOGRAPHICS_FILE,
         output_dir=feature_dir,
@@ -221,21 +224,18 @@ def train_model(data_folder, model_folder, verbose):
     gc.collect()
 
     if patient_level is None or len(patient_level) == 0:
-        if verbose:
-            print("ERROR: Patient-level table is empty. Saving fallback model.")
+        logger.error("Patient-level table is empty. Saving fallback model.")
         _save_fallback_model(model_folder)
         return
 
-        # --- 3. Train the ML model ---------------------------------------------
-    if verbose:
-        print(f"Training model on {len(patient_level)} patients, "
-              f"{len(patient_level.columns)} features...")
+    # --- 3. Train the ML model ---------------------------------------------
+    logger.info(
+        f"Training model on {len(patient_level)} patients, "
+        f"{len(patient_level.columns)} features..."
+    )
 
-    # Import the multi-model training function (with tuning support)
     from classification.train_model import train_multiple_models
 
-    # Train all standard model types with hyperparameter optimization,
-    # mirroring: python main.py --step train --tune
     model_types = ["xgboost", "lightgbm", "random_forest", "ensemble"]
 
     all_results = train_multiple_models(
@@ -243,7 +243,7 @@ def train_model(data_folder, model_folder, verbose):
         model_types=model_types,
         handle_imbalance="class_weight",
         feature_selection=True,
-        tune=True,                  # <-- enables Optuna / RandomizedSearch tuning
+        tune=True,
         n_tune_trials=100,
         output_dir=config.MODEL_DIR,
         logger=logger if verbose else None,
@@ -260,36 +260,31 @@ def train_model(data_folder, model_folder, verbose):
                 best_model_type = model_type
 
     if best_model_type is None or best_model_type not in all_results:
-        if verbose:
-            print("ERROR: No model trained successfully. Saving fallback model.")
+        logger.error("No model trained successfully. Saving fallback model.")
         _save_fallback_model(model_folder)
         return
 
     model_result = all_results[best_model_type]
 
-    if verbose:
-        print(f"Best model: {best_model_type} (CV AUROC={best_auroc:.4f})")
+    logger.info(f"Best model: {best_model_type} (CV AUROC={best_auroc:.4f})")
 
     # --- 4. Save to model_folder -------------------------------------------
     save_model(model_folder, model_result)
 
-    if verbose:
-        cv = model_result.get("cv_results", {})
-        print(f"Training complete. "
-              f"CV AUROC={cv.get('auroc_mean', 'N/A')}")
-        print("Done.")
+    cv = model_result.get("cv_results", {})
+    logger.info(
+        f"Training complete. CV AUROC={cv.get('auroc_mean', 'N/A')}"
+    )
+    logger.info("Done.")
+
 
 
 
 # ---------------------------------------------------------------------------
-# 2.  LOAD MODEL  (called by the challenge's run_model.py)
+# 2.  LOAD MODEL
 # ---------------------------------------------------------------------------
 
 def load_model(model_folder, verbose):
-    """
-    Load everything saved by train_model / save_model.
-    Returns a dict that will be passed as the first arg to run_model().
-    """
     model_path = os.path.join(model_folder, 'model.sav')
 
     if not os.path.exists(model_path):
@@ -304,21 +299,16 @@ def load_model(model_folder, verbose):
         nf = len(model_dict.get("selected_features", []))
         print(f"Model loaded: type={mt}, features={nf}")
 
-    # Initialize prefetch state — actual prefetching happens on first run_model() call
-    # because we don't have data_folder yet at load_model() time.
-    model_dict["_prefetch_done"] = False
-    model_dict["_preprocess_futures"] = {}   # pipeline_patient_id -> future
-    model_dict["_preprocess_tmp_dirs"] = {}  # pipeline_patient_id -> tmp_dir
-    model_dict["_executor"] = None
-
+    # No prefetch pool — process each patient synchronously in run_model()
+    model_dict["_config_patched"] = False
     return model_dict
 
 
 # ---------------------------------------------------------------------------
-# PREFETCH WORKER: Runs in a child process
+# WORKER: runs ONE patient in a child process, then exits
 # ---------------------------------------------------------------------------
 
-def _preprocess_worker(
+def _preprocess_one_patient_worker(
     data_folder,
     tmp_model_dir,
     pipeline_patient_id,
@@ -329,16 +319,14 @@ def _preprocess_worker(
     feature_output_dir_str,
 ):
     """
-    Worker function that patches config in the child process and runs
-    process_single_patient. This is the same function that train_model
-    submits to its ProcessPoolExecutor.
+    Runs process_single_patient in a fresh child process.
+    The child exits when done → all memory (YASA, MNE, numpy arrays) is
+    fully reclaimed by the OS before the next patient starts.
     """
-    # Each worker process needs its own config patching
     _patch_config(data_folder, tmp_model_dir)
-
     from main import process_single_patient
 
-    result = process_single_patient(
+    return process_single_patient(
         patient_id=pipeline_patient_id,
         patient_dir=Path(patient_dir_str),
         record_name=record_name,
@@ -346,231 +334,142 @@ def _preprocess_worker(
         overlap_sec=overlap_sec,
         feature_output_dir=Path(feature_output_dir_str),
     )
-    return result
 
 
 # ---------------------------------------------------------------------------
-# PREFETCH: Submit ALL patients on first run_model() call
-# ---------------------------------------------------------------------------
-
-def _prefetch_all_preprocessing(model_dict, data_folder, verbose):
-    """
-    Submit preprocessing for ALL patients to a ProcessPoolExecutor.
-    Called once on the first run_model() invocation.
-
-    This mirrors the parallelization pattern in train_model:
-    all patients are submitted to the pool at once, and NUM_WORKERS
-    workers process them concurrently.
-    """
-    if model_dict.get("_prefetch_done", False):
-        return
-
-    # Patch config in the MAIN process so we can read paths correctly
-    import tempfile
-    master_tmp_dir = tempfile.mkdtemp(prefix="physionet_prefetch_master_")
-    _patch_config(data_folder, master_tmp_dir)
-
-    import config
-    from helper_code import find_patients, DEMOGRAPHICS_FILE, HEADERS
-
-    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-    patient_metadata_list = find_patients(patient_data_file)
-    num_records = len(patient_metadata_list)
-
-    if verbose:
-        print(f"Prefetching preprocessing for {num_records} patients "
-              f"with {config.NUM_WORKERS} workers...")
-
-    max_workers = min(config.NUM_WORKERS, num_records) if num_records > 0 else 1
-    executor = ProcessPoolExecutor(max_workers=max_workers)
-    model_dict["_executor"] = executor
-
-    submitted = 0
-
-    for i in range(num_records):
-        record = patient_metadata_list[i]
-        patient_id_bids = record[HEADERS['bids_folder']]
-        site_id = record[HEADERS['site_id']]
-        session_id = record[HEADERS['session_id']]
-
-        record_name = f"{patient_id_bids}_ses-{session_id}"
-        pipeline_patient_id = f"{site_id}/{record_name}"
-
-        # Build the patient_dir using the PATCHED config
-        patient_dir = config.PHYSIOLOGICAL_DATA_DIR / site_id
-
-        if not patient_dir.exists():
-            if verbose:
-                print(f"  ! Prefetch: Patient dir not found: {patient_dir}. Skipping.")
-            continue
-
-        # Each worker gets its own temp dir for config patching
-        tmp_model_dir = tempfile.mkdtemp(prefix=f"physionet_run_{i}_")
-        feature_output_dir = Path(tmp_model_dir) / "features"
-        feature_output_dir.mkdir(parents=True, exist_ok=True)
-
-        future = executor.submit(
-            _preprocess_worker,
-            data_folder=data_folder,
-            tmp_model_dir=tmp_model_dir,
-            pipeline_patient_id=pipeline_patient_id,
-            patient_dir_str=str(patient_dir),
-            record_name=record_name,
-            segment_length_sec=config.SEGMENT_LENGTH_SEC,
-            overlap_sec=config.SEGMENT_OVERLAP_SEC,
-            feature_output_dir_str=str(feature_output_dir),
-        )
-        model_dict["_preprocess_futures"][pipeline_patient_id] = future
-        model_dict["_preprocess_tmp_dirs"][pipeline_patient_id] = tmp_model_dir
-        submitted += 1
-
-    model_dict["_prefetch_done"] = True
-    model_dict["_master_tmp_dir"] = master_tmp_dir
-
-    if verbose:
-        print(f"Submitted {submitted} preprocessing jobs.")
-
-
-# ---------------------------------------------------------------------------
-# 3.  RUN MODEL  (called by the challenge's run_model.py, once per patient)
+# 3.  RUN MODEL  — one patient at a time, fresh worker each call
 # ---------------------------------------------------------------------------
 
 def run_model(model, record, data_folder, verbose):
     """
     Run the trained model on a single patient record.
 
-    On the first call, submits ALL patients' preprocessing to a shared
-    ProcessPoolExecutor (NUM_WORKERS=4 concurrent workers), matching
-    the parallelization pattern used in train_model. Subsequent calls
-    simply retrieve the already-completed (or in-progress) result.
-
-    Parameters
-    ----------
-    model : dict
-        The object returned by load_model().
-    record : dict
-        Contains BidsFolder, SiteID, SessionID.
-    data_folder : str
-        Root of the challenge data.
-    verbose : bool
-
-    Returns
-    -------
-    (binary_output, probability_output)
+    Processes the patient in a *single-use* ProcessPoolExecutor
+    (max_workers=1). The worker exits after each patient, fully freeing
+    memory and avoiding the BrokenProcessPool that occurs when too many
+    heavy preprocessing jobs are queued at once.
     """
     from helper_code import HEADERS
 
     patient_id_bids = record[HEADERS['bids_folder']]
-    site_id = record[HEADERS['site_id']]
-    session_id = record[HEADERS['session_id']]
+    site_id         = record[HEADERS['site_id']]
+    session_id      = record[HEADERS['session_id']]
 
     # ---- Fallback model ---------------------------------------------------
     if model.get("fallback", False):
         return 0, 0.5
 
-    # ---- On first call: submit ALL preprocessing jobs in parallel ---------
-    _prefetch_all_preprocessing(model, data_folder, verbose)
-
-    # Patch config in main process for feature loading below
+    # ---- Patch config in main process (once) ------------------------------
     import tempfile
     tmp_main = tempfile.mkdtemp(prefix="physionet_run_main_")
     _patch_config(data_folder, tmp_main)
 
+    import config
     logger = _setup_logger(verbose)
 
-    import config
-
     # ---- Build patient identifier -----------------------------------------
-    record_name = f"{patient_id_bids}_ses-{session_id}"
+    record_name         = f"{patient_id_bids}_ses-{session_id}"
     pipeline_patient_id = f"{site_id}/{record_name}"
+    patient_dir         = config.PHYSIOLOGICAL_DATA_DIR / site_id
 
-    # ---- Retrieve the preprocessing result --------------------------------
-    preprocess_futures = model.get("_preprocess_futures", {})
-    future = preprocess_futures.get(pipeline_patient_id)
-
-    if future is None:
+    if not patient_dir.exists():
         if verbose:
-            print(f"  ! No preprocessing future for {pipeline_patient_id}")
+            print(f"  ! Patient dir not found: {patient_dir}")
+        _cleanup_dir(tmp_main)
         return 0, 0.5
 
-    tmp_model_dir = model.get("_preprocess_tmp_dirs", {}).get(pipeline_patient_id)
+    # ---- Per-patient temp dir for the worker ------------------------------
+    tmp_worker_dir = tempfile.mkdtemp(prefix=f"physionet_run_worker_")
+    feature_output_dir = Path(tmp_worker_dir) / "features"
+    feature_output_dir.mkdir(parents=True, exist_ok=True)
 
+    result = None
     try:
-        # This blocks until THIS patient's preprocessing is done.
-        # But other patients are being preprocessed concurrently in the
-        # background by the other workers — just like train_model.
-        result = future.result()
+        # Single-use pool: one worker, one patient, then tear down.
+        # This mirrors the batch-recycling pattern in train_model().
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _preprocess_one_patient_worker,
+                data_folder=data_folder,
+                tmp_model_dir=tmp_worker_dir,
+                pipeline_patient_id=pipeline_patient_id,
+                patient_dir_str=str(patient_dir),
+                record_name=record_name,
+                segment_length_sec=config.SEGMENT_LENGTH_SEC,
+                overlap_sec=config.SEGMENT_OVERLAP_SEC,
+                feature_output_dir_str=str(feature_output_dir),
+            )
+            try:
+                result = future.result()
+            except Exception as e:
+                # Covers BrokenProcessPool and any in-worker exception [[8]]
+                if verbose:
+                    print(f"  ! Worker failed for {pipeline_patient_id}: "
+                          f"{type(e).__name__}: {e}")
+                    traceback.print_exc()
+                result = None
+        # Pool is destroyed here → all worker memory released
 
-        if result is None or not result["success"]:
+        gc.collect()
+
+        if result is None or not result.get("success"):
             if verbose:
-                print(f"  ! Pipeline failed for {pipeline_patient_id}")
+                print(f"  ! Pipeline unsuccessful for {pipeline_patient_id}")
             return 0, 0.5
 
-        # ---- Load the patient-level features from disk --------------------
+        # ---- Load patient-level features ----------------------------------
         pat_path = result.get("pat_features_path")
-        if pat_path is None or not Path(pat_path).exists():
-            # Try building patient-level from segment-level
-            seg_path = result.get("seg_features_path")
-            if seg_path and Path(seg_path).exists():
-                from feature_table.build_feature_table import (
-                    aggregate_to_patient_level, add_demographics,
-                )
-                seg_df = pd.read_parquet(seg_path)
-                sleep_summary = result.get("sleep_summary")
-                patient_features = aggregate_to_patient_level(
-                    seg_df, sleep_summary
-                )
-                patient_features = add_demographics(
-                    patient_features,
-                    demographics_path=config.DEMOGRAPHICS_FILE,
-                )
-            else:
-                if verbose:
-                    print(f"  ! No features for {pipeline_patient_id}")
-                return 0, 0.5
-        else:
+        seg_path = result.get("seg_features_path")
+
+        if pat_path and Path(pat_path).exists():
             patient_features = pd.read_parquet(pat_path)
-            # Add demographics for consistency
             from feature_table.build_feature_table import add_demographics
             patient_features = add_demographics(
                 patient_features,
                 demographics_path=config.DEMOGRAPHICS_FILE,
             )
+        elif seg_path and Path(seg_path).exists():
+            from feature_table.build_feature_table import (
+                aggregate_to_patient_level, add_demographics,
+            )
+            seg_df = pd.read_parquet(seg_path)
+            patient_features = aggregate_to_patient_level(
+                seg_df, result.get("sleep_summary")
+            )
+            patient_features = add_demographics(
+                patient_features,
+                demographics_path=config.DEMOGRAPHICS_FILE,
+            )
+        else:
+            if verbose:
+                print(f"  ! No features on disk for {pipeline_patient_id}")
+            return 0, 0.5
 
         if patient_features is None or len(patient_features) == 0:
             return 0, 0.5
 
-        # ---- Apply the trained model pipeline -----------------------------
-        binary_output, probability_output = _predict_single_patient(
-            model, patient_features, verbose
-        )
-
-        return binary_output, probability_output
+        # ---- Predict ------------------------------------------------------
+        return _predict_single_patient(model, patient_features, verbose)
 
     except Exception as e:
         if verbose:
-            print(f"  !!! run_model error for {pipeline_patient_id}: {e}")
+            print(f"  !!! run_model error for {pipeline_patient_id}: "
+                  f"{type(e).__name__}: {e}")
             traceback.print_exc()
         return 0, 0.5
 
     finally:
         gc.collect()
-        # Remove the consumed future to free memory
-        preprocess_futures.pop(pipeline_patient_id, None)
-        model.get("_preprocess_tmp_dirs", {}).pop(pipeline_patient_id, None)
-        # Clean up this patient's temp dir
-        if tmp_model_dir:
-            try:
-                import shutil
-                shutil.rmtree(tmp_model_dir, ignore_errors=True)
-            except Exception:
-                pass
-        # Clean up main process temp dir
-        try:
-            import shutil
-            shutil.rmtree(tmp_main, ignore_errors=True)
-        except Exception:
-            pass
+        _cleanup_dir(tmp_worker_dir)
+        _cleanup_dir(tmp_main)
+
+
+def _cleanup_dir(path):
+    try:
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _predict_single_patient(
@@ -593,7 +492,7 @@ def _predict_single_patient(
         if f not in patient_features.columns:
             patient_features[f] = np.nan
 
-    X = patient_features[feature_names].values.astype(np.float64)
+    X = patient_features[feature_names].values.astype(np.float32)
 
     # Impute
     X_imp = imputer.transform(X)

@@ -146,6 +146,7 @@ def extract_cap_features_for_patient(
     except Exception as e:
         if logger:
             logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion fehlgeschlagen für {patient_id}: {e}")
+        return cap_features
     return stats
 
 
@@ -348,6 +349,7 @@ def process_single_patient(
                              summary.get("obstructive_apnea_count", 0))
         
         # --- Delta Power Entropy ---
+        delta_entropy = np.nan
         try:        
             stages_raw = annotation_data["stages_raw"]
             delta_entropy, num_chan = compute_delta_power_entropy(
@@ -731,9 +733,11 @@ def run_preprocessing_pipeline(
     logger.info("Lade gespeicherte Features von Disk...")
     
     patient_segment_tables = {}
+    patient_level_tables = {}
     patient_sleep_summaries = {}
     
     for patient_id, paths in successful_results.items():
+
         # Load segment features
         seg_path = paths.get("seg_features_path")
         if seg_path and Path(seg_path).exists():
@@ -741,6 +745,14 @@ def run_preprocessing_pipeline(
                 patient_segment_tables[patient_id] = pd.read_parquet(seg_path)
             except Exception as e:
                 logger.error(f"Fehler beim Laden von {seg_path}: {e}")
+
+        # Load patient level features
+        pat_path = paths.get("pat_features_path")
+        if pat_path and Path(pat_path).exists():
+            try:
+                patient_level_tables[patient_id] = pd.read_parquet(pat_path)
+            except Exception as e:
+                logger.error(f"Fehler beim Laden von {pat_path}: {e}")
         
         # Collect sleep summaries
         if paths.get("sleep_summary"):
@@ -760,6 +772,7 @@ def run_preprocessing_pipeline(
     if patient_segment_tables:
         segment_level, patient_level = build_cohort_feature_table(
             patient_segment_tables=patient_segment_tables,
+            patient_features_tables=patient_level_tables,
             patient_sleep_summaries=patient_sleep_summaries,
             demographics_path=DEMOGRAPHICS_FILE,
             output_dir=FEATURE_DIR,
