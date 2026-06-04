@@ -108,6 +108,93 @@ class ModelSelector:
     def fit_transform(self, X, y=None):
         return self.transform(X)
 
+def _prior_probability_shift(
+    p: np.ndarray,
+    train_prevalence: float,
+    target_prevalence: Optional[float],
+    eps: float = 1e-7,
+) -> np.ndarray:
+    """
+    Adjust predicted probabilities from the training prior to the expected
+    deployment/test prior.
+
+    odds_target = odds_train *
+        [pi_target / (1 - pi_target)] / [pi_train / (1 - pi_train)]
+    """
+    if target_prevalence is None:
+        return p
+
+    train_prevalence = float(np.clip(train_prevalence, eps, 1.0 - eps))
+    target_prevalence = float(np.clip(target_prevalence, eps, 1.0 - eps))
+
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, eps, 1.0 - eps)
+
+    odds = p / (1.0 - p)
+
+    train_odds_prior = train_prevalence / (1.0 - train_prevalence)
+    target_odds_prior = target_prevalence / (1.0 - target_prevalence)
+
+    correction = target_odds_prior / train_odds_prior
+    adjusted_odds = odds * correction
+
+    return adjusted_odds / (1.0 + adjusted_odds)
+
+
+def _fit_preprocessor(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    feature_names: List[str],
+    feature_selection: bool = True,
+    n_features_select: Optional[int] = None,
+    logger=None,
+):
+    """
+    Fit imputer, feature selector, and scaler ONLY on the training fold.
+    This avoids leakage into validation folds.
+    """
+    imputer = SimpleImputer(strategy="median")
+    X_imp = imputer.fit_transform(X_train).astype(np.float32)
+
+    feature_selector = None
+    selected_features = feature_names.copy()
+
+    if feature_selection:
+        X_sel, selected_features, feature_selector = select_features(
+            X_imp,
+            y_train,
+            feature_names,
+            n_features=n_features_select,
+            logger=logger,
+        )
+    else:
+        X_sel = X_imp
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_sel).astype(np.float32)
+
+    return X_scaled, imputer, feature_selector, scaler, selected_features
+
+
+def _transform_preprocessor(
+    X: np.ndarray,
+    imputer: SimpleImputer,
+    feature_selector: Optional[Any],
+    scaler: StandardScaler,
+) -> np.ndarray:
+    """
+    Apply already-fitted preprocessing to validation/test data.
+    """
+    X_imp = imputer.transform(X).astype(np.float32)
+
+    if feature_selector is not None:
+        X_sel = feature_selector.transform(X_imp)
+    else:
+        X_sel = X_imp
+
+    X_scaled = scaler.transform(X_sel).astype(np.float32)
+
+    return X_scaled
 
 class PrevalenceAdjustedKFold:
     """
@@ -187,21 +274,74 @@ def train_model(
                      f"{X.shape[1]} Features")
         logger.info(f"Target-Verteilung: {dict(zip(*np.unique(y, return_counts=True)))}")
 
-    imputer = SimpleImputer(strategy="median")
-    X_imputed = imputer.fit_transform(X).astype(np.float32)
+    train_prevalence = float(np.mean(y))
 
-    selected_features = feature_names.copy()
-    feature_selector = None
+    if logger:
+        logger.info(f"Trainingsdaten: {X.shape[0]} Patienten, {X.shape[1]} Features")
+        logger.info(f"Target-Verteilung: {dict(zip(*np.unique(y, return_counts=True)))}")
+        logger.info(f"Trainingsprävalenz: {train_prevalence:.3f}")
+        logger.info(f"Erwartete Testprävalenz: {expected_test_prevalence:.3f}")
 
-    if feature_selection:
-        X_imputed, selected_features, feature_selector = select_features(
-            X_imputed, y, feature_names,
-            n_features=n_features_select,
-            logger=logger
-        )
+    # ------------------------------------------------------------------
+    # Leakage-safe CV:
+    # imputer, selector, and scaler are fit separately inside each fold.
+    # ------------------------------------------------------------------
+    cv_results = _cross_validate_model_leakage_free(
+        model_type=model_type,
+        X=X,
+        y=y,
+        feature_names=feature_names,
+        feature_selection=feature_selection,
+        handle_imbalance=handle_imbalance,
+        expected_test_prevalence=expected_test_prevalence,
+        n_features_select=n_features_select,
+        logger=logger,
+    )
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_imputed).astype(np.float32)
+    # ------------------------------------------------------------------
+    # Final preprocessing on all available training patients
+    # ------------------------------------------------------------------
+    X_processed, imputer, feature_selector, scaler, selected_features = _fit_preprocessor(
+        X_train=X,
+        y_train=y,
+        feature_names=feature_names,
+        feature_selection=feature_selection,
+        n_features_select=n_features_select,
+        logger=logger,
+    )
+
+    if logger:
+        logger.info(f"Features nach Selection: {len(selected_features)}")
+
+    # Important:
+    # Do not use expected_test_prevalence as class weight.
+    # Use it only later for probability prior correction.
+    model = _create_model(
+        model_type=model_type,
+        handle_imbalance=handle_imbalance,
+        n_features=X_processed.shape[1],
+        y=y,
+        logger=logger,
+        expected_test_prevalence=None,
+    )
+
+    if handle_imbalance == "smote":
+        smote = SMOTE(random_state=RANDOM_SEED)
+        X_resampled, y_resampled = smote.fit_resample(X_processed, y)
+    elif handle_imbalance == "adasyn":
+        adasyn = ADASYN(random_state=RANDOM_SEED)
+        X_resampled, y_resampled = adasyn.fit_resample(X_processed, y)
+    elif handle_imbalance == "smote_tomek":
+        smt = SMOTETomek(random_state=RANDOM_SEED)
+        X_resampled, y_resampled = smt.fit_resample(X_processed, y)
+    else:
+        X_resampled, y_resampled = X_processed, y
+
+    model.fit(X_resampled, y_resampled)
+
+    if logger:
+        logger.info("Finales Modell auf allen Daten trainiert.")
+
 
     if logger:
         logger.info(f"Features nach Selection: {len(selected_features)}")
@@ -248,10 +388,15 @@ def train_model(
         "n_features_selected": len(selected_features),
         "n_patients": X.shape[0],
         "target_distribution": dict(zip(*np.unique(y, return_counts=True))),
+        "training_prevalence": train_prevalence,
+        "expected_test_prevalence": expected_test_prevalence,
+        "probability_prior_adjustment": True,
+        "decision_threshold": 0.5,
         "cv_folds": CV_FOLDS,
         "random_seed": RANDOM_SEED,
         "timestamp": datetime.now().isoformat(),
     }
+
 
     result = {
         "model": model,
@@ -747,6 +892,201 @@ def _create_stacking_ensemble(
 # ==============================================================================
 # CROSS-VALIDATION
 # ==============================================================================
+def _cross_validate_model_leakage_free(
+    model_type: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: List[str],
+    feature_selection: bool,
+    handle_imbalance: str,
+    expected_test_prevalence: Optional[float] = 0.10,
+    n_features_select: Optional[int] = None,
+    logger=None,
+) -> Dict:
+    """
+    Cross-validation without preprocessing leakage.
+
+    For every fold:
+      1. Fit imputer on training fold only.
+      2. Fit feature selector on training fold only.
+      3. Fit scaler on training fold only.
+      4. Train model on processed training fold.
+      5. Evaluate on processed validation fold.
+    """
+    if expected_test_prevalence is not None:
+        cv = PrevalenceAdjustedKFold(
+            n_splits=CV_FOLDS,
+            expected_prevalence=expected_test_prevalence,
+            random_state=RANDOM_SEED,
+        )
+        if logger:
+            logger.info(
+                f"Leakage-safe CV: {CV_FOLDS}-Fold, "
+                f"validation prevalence adjusted to "
+                f"{expected_test_prevalence * 100:.1f}%"
+            )
+    else:
+        cv = StratifiedKFold(
+            n_splits=CV_FOLDS,
+            shuffle=True,
+            random_state=RANDOM_SEED,
+        )
+        if logger:
+            logger.info(f"Leakage-safe CV: {CV_FOLDS}-Fold Stratified")
+
+    metrics = {
+        "auroc": [],
+        "average_precision": [],
+        "f1": [],
+        "balanced_accuracy": [],
+        "accuracy": [],
+        "auroc_train": [],
+        "f1_train": [],
+    }
+
+    for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        X_train_raw, X_val_raw = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
+            if logger:
+                logger.warning(
+                    f"Fold {fold_idx + 1}: skipped because train or "
+                    f"validation has only one class."
+                )
+            continue
+
+        # Fit preprocessing on training fold only.
+        X_train, imputer, selector, scaler, selected_features = _fit_preprocessor(
+            X_train=X_train_raw,
+            y_train=y_train,
+            feature_names=feature_names,
+            feature_selection=feature_selection,
+            n_features_select=n_features_select,
+            logger=None,
+        )
+
+        X_val = _transform_preprocessor(
+            X=X_val_raw,
+            imputer=imputer,
+            feature_selector=selector,
+            scaler=scaler,
+        )
+
+        # Create fresh model for this fold.
+        fold_model = _create_model(
+            model_type=model_type,
+            handle_imbalance=handle_imbalance,
+            n_features=X_train.shape[1],
+            y=y_train,
+            logger=None,
+            expected_test_prevalence=None,
+        )
+
+        # Optional resampling inside training fold only.
+        if handle_imbalance == "smote":
+            try:
+                resampler = SMOTE(random_state=RANDOM_SEED)
+                X_fit, y_fit = resampler.fit_resample(X_train, y_train)
+            except Exception:
+                X_fit, y_fit = X_train, y_train
+        elif handle_imbalance == "adasyn":
+            try:
+                resampler = ADASYN(random_state=RANDOM_SEED)
+                X_fit, y_fit = resampler.fit_resample(X_train, y_train)
+            except Exception:
+                X_fit, y_fit = X_train, y_train
+        elif handle_imbalance == "smote_tomek":
+            try:
+                resampler = SMOTETomek(random_state=RANDOM_SEED)
+                X_fit, y_fit = resampler.fit_resample(X_train, y_train)
+            except Exception:
+                X_fit, y_fit = X_train, y_train
+        else:
+            X_fit, y_fit = X_train, y_train
+
+        try:
+            fold_model.fit(X_fit, y_fit)
+
+            # Raw model probabilities.
+            p_val_raw = fold_model.predict_proba(X_val)[:, 1]
+            p_train_raw = fold_model.predict_proba(X_train)[:, 1]
+
+            # Prior-adjusted probabilities for expected deployment prevalence.
+            train_prev = float(np.mean(y_train))
+            p_val = _prior_probability_shift(
+                p_val_raw,
+                train_prevalence=train_prev,
+                target_prevalence=expected_test_prevalence,
+            )
+            p_train = _prior_probability_shift(
+                p_train_raw,
+                train_prevalence=train_prev,
+                target_prevalence=expected_test_prevalence,
+            )
+
+            y_val_pred = (p_val >= 0.5).astype(int)
+            y_train_pred = (p_train >= 0.5).astype(int)
+
+            metrics["auroc"].append(roc_auc_score(y_val, p_val))
+            metrics["average_precision"].append(average_precision_score(y_val, p_val))
+            metrics["f1"].append(f1_score(y_val, y_val_pred, zero_division=0))
+            metrics["balanced_accuracy"].append(
+                balanced_accuracy_score(y_val, y_val_pred)
+            )
+            metrics["accuracy"].append(accuracy_score(y_val, y_val_pred))
+
+            metrics["auroc_train"].append(roc_auc_score(y_train, p_train))
+            metrics["f1_train"].append(
+                f1_score(y_train, y_train_pred, zero_division=0)
+            )
+
+            if logger:
+                logger.info(
+                    f"Fold {fold_idx + 1}/{CV_FOLDS}: "
+                    f"AUROC={metrics['auroc'][-1]:.4f}, "
+                    f"AUPRC={metrics['average_precision'][-1]:.4f}, "
+                    f"F1={metrics['f1'][-1]:.4f}, "
+                    f"features={len(selected_features)}"
+                )
+
+        except Exception as e:
+            if logger:
+                logger.warning(
+                    f"Fold {fold_idx + 1}: training/evaluation failed: {e}"
+                )
+            continue
+
+    cv_results = {}
+
+    for metric_name, scores in metrics.items():
+        if len(scores) == 0:
+            continue
+
+        cv_results[f"{metric_name}_mean"] = float(np.mean(scores))
+        cv_results[f"{metric_name}_std"] = float(np.std(scores))
+        cv_results[f"{metric_name}_scores"] = [float(s) for s in scores]
+
+    if "auroc_mean" in cv_results and "auroc_train_mean" in cv_results:
+        gap = cv_results["auroc_train_mean"] - cv_results["auroc_mean"]
+        cv_results["overfit_gap_auroc"] = float(gap)
+
+        if logger:
+            if gap > 0.15:
+                logger.warning(
+                    f"Possible overfitting: train AUROC - val AUROC = {gap:.4f}"
+                )
+            else:
+                logger.info(f"Overfitting gap AUROC: {gap:.4f}")
+
+    if logger:
+        logger.info("Leakage-safe CV results:")
+        for key, value in cv_results.items():
+            if key.endswith("_mean"):
+                std = cv_results.get(key.replace("_mean", "_std"), 0.0)
+                logger.info(f"  {key}: {value:.4f} ± {std:.4f}")
+
+    return cv_results
 
 def _cross_validate_model(
     model: Any,
