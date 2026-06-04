@@ -15,9 +15,12 @@ import numpy as np
 PROJECT_DIR = Path(__file__).parent.resolve()
 
 CAP_MODEL_DIR = r'./CAP_classification/cap_lstm.onnx'
+ORP_LUT_DIR = r'./feature_extraction/LookUpTable.txt'
+ORP_SYMBOLVALUES_DIR = r'./feature_extraction/SymbolValues.txt'
+
 
 # Training-Set Verzeichnis
-TRAINING_SET_DIR = Path(r"D:\Richard\Physionet26Data\training_set")
+TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
                     # Path(r"C:\Users\Biosig 1\Documents\Richard\Physionet26Data\training_set")
 
 # Unterverzeichnisse der Datenstruktur

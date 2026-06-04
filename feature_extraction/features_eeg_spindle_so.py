@@ -242,7 +242,7 @@ def _detect_spindles(data: np.ndarray, fs: float, logger=None):
         },
         multi_only=False,
         remove_outliers=True,
-        verbose=False,
+        verbose='critical',
     )
 
     if sp is None:

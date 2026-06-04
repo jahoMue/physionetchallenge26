@@ -352,15 +352,23 @@ def process_single_patient(
         delta_entropy = np.nan
         try:        
             stages_raw = annotation_data["stages_raw"]
-            delta_entropy, num_chan = compute_delta_power_entropy(
+            events_raw = annotation_data.get("events_raw")
+            (
+            delta_entropy, num_chan, mean_orp, orp_per_window, artifact_fraction,
+            orp_nrem, orp_std_nrem, orp_rem, orp_wake, orp_apeak, orp_a9, csi
+            ) = compute_delta_power_entropy(
                 eeg_preprocessed=eeg_preprocessed,
                 sfreq=eeg_fs,
                 stages_raw=stages_raw,
-                logger=logger  # Optional
+                events_raw=events_raw,
+                logger=logger,  # Optional
             )
             patient_logger.info(
             f"Delta-power entropy (sleep period only) from {num_chan} channel(s): {delta_entropy:.4f} bits"
             )
+            if not np.isnan(mean_orp):
+                patient_logger.info(f"Mean ORP (sleep period): {mean_orp:.4f}")
+
         except Exception as e:
             if patient_logger:
                 patient_logger.warning(f"[Sleep-Depth Integration] Skipped Calculation of Advanced Sleep Depth Parameters: {e}")
@@ -513,7 +521,16 @@ def process_single_patient(
             for k, v in cap_features.items():
                 patient_features.at[0, k] = v
 
-        patient_features.at[0,'Delta_Power_Entropy'] = delta_entropy
+        patient_features.at[0, 'Delta_Power_Entropy'] = delta_entropy
+        patient_features.at[0, 'ORP_Mean'] = mean_orp
+        patient_features.at[0, 'Artifact_Fraction'] = artifact_fraction
+        patient_features.at[0, 'ORP_NREM'] = orp_nrem
+        patient_features.at[0, 'ORP_std_NREM'] = orp_std_nrem
+        patient_features.at[0, 'ORP_REM'] = orp_rem
+        patient_features.at[0, 'ORP_Wake'] = orp_wake
+        patient_features.at[0, 'ORP_APeak'] = orp_apeak
+        patient_features.at[0, 'ORP_A9'] = orp_a9
+        patient_features.at[0, 'CSI'] = csi
 
         result["segment_features"] = segment_features
         result["patient_features"] = patient_features
