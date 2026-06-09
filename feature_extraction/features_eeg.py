@@ -14,6 +14,8 @@ Schlafspezifische Features:
 - Schlafspindel-Aktivität (Sigma-Band)
 - Alpha/Theta Ratio (Wachheits-Marker)
 - Delta/Beta Ratio (Schlaftiefe-Marker)
+- Delta Power Entropie
+- Odds Ratio Product Parameter
 
 Zeitdomäne / Komplexität:
 - Hjorth-Parameter (Activity, Mobility, Complexity)
@@ -32,6 +34,8 @@ Signalqualität (SQI >= Schwellenwert) berechnet.
 """
 import numpy as np
 import pandas as pd
+import mne
+import matplotlib.pyplot as plt
 from scipy import signal as scipy_signal
 from scipy.stats import skew, kurtosis
 from scipy.ndimage import gaussian_filter1d
@@ -41,6 +45,8 @@ from typing import Dict, List, Optional, Tuple
 from config import (
     EEG_FREQUENCY_BANDS, EEG_SQI_THRESHOLD,
     SEGMENT_LENGTH_SEC, EEG_HOMOLOG_PAIRS,
+    ORP_LUT_DIR, ORP_SYMBOLVALUES_DIR,
+    EEG_AMPLITUDE_MAX_UV, EEG_AMPLITUDE_MIN_UV,
     SIGNAL_DTYPE,
 )
 
@@ -961,163 +967,316 @@ def _compute_temporal_features(
 # ==============================================================================
 
 def compute_delta_power_entropy(
-    eeg_preprocessed: Dict[str, Dict],
+    eeg_preprocessed: dict,
     sfreq: float,
     stages_raw: pd.DataFrame,
-    logger: Optional[object] = None,
+    events_raw: pd.DataFrame,
+    logger: object = None,
     window_sec: float = 5.0,
     delta_band: tuple = (0.5, 4.5),
-    multitaper_bandwidth: float = 2.0  # Recommended for 5s windows
-) -> float:
+    multitaper_bandwidth: float = 2.0
+): 
     """
-    Compute the average delta power entropy (spectral entropy of the smoothed delta density function)
-    across all preprocessed EEG derivations using multitaper PSD estimation.
-
-    Args:
-        eeg_preprocessed (Dict[str, Dict]): Dict mapping channel_name to dict with key 'eeg_cleaned' (np.ndarray).
-        sfreq (float): Sampling frequency in Hz.
-        stages_raw (pd.DataFrame): DataFrame with columns ['start_sec', 'end_sec', 'stage_numeric'].
-            Stage encoding: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake, 9=Unavailable.
-        logger (object, optional): Logger for error messages.
-        window_sec (float): Window length in seconds (default: 5).
-        delta_band (tuple): Delta band (low, high) in Hz (default: (0.5, 4.5)).
-        multitaper_bandwidth (float): Bandwidth parameter for multitaper (Hz).
-
+    Compute delta power entropy and ORP with window-level artifact masking.
     Returns:
-        float: Mean delta power entropy across all EEG derivations, number of channels used.
+        mean_entropy, n_channels, mean_orp, orp_per_window, artifact_fraction
     """
-    import numpy as np
-    import mne
-    from scipy.ndimage import gaussian_filter1d
-    from scipy.fft import fft
 
-    channel_names = ["F3", "F4", "C4", "C3"]
-    try:
-        # --- 1. Sleep onset/offset detection ---
-        WAKE_CODE, UNAVAILABLE_CODE = 5, 9
-        sleep_epochs = stages_raw[~stages_raw["stage_numeric"].isin([WAKE_CODE, UNAVAILABLE_CODE])]
+    # --- Extract Arousal DataFrame ---
+    arousal_df = None
+    if events_raw is not None and len(events_raw) > 0:
+        arousal_df = events_raw[events_raw["event_type"] == "arousal"].copy()
+        if len(arousal_df) == 0:
+            arousal_df = None
 
-        if sleep_epochs.empty:
+
+    # --- Load ORP LUT and Symbol Borders ---
+    lut_values = None
+    symbol_thresholds = None
+    orp_enabled = False
+    if ORP_LUT_DIR and ORP_SYMBOLVALUES_DIR:
+        try:
+            with open(ORP_LUT_DIR, "r") as f:
+                lut_lines = f.readlines()
+            lut_orp_values = lut_lines[1].strip().split(",")
+            lut_values = np.array([float(val) for val in lut_orp_values])
+            with open(ORP_SYMBOLVALUES_DIR, "r") as f:
+                symbol_lines = [l.strip() for l in f if l.strip()]
+            if symbol_lines[0].lower().startswith("delta"):
+                symbol_lines = symbol_lines[1:]
+            symbol_matrix = np.array([[float(x) for x in line.split(",")] for line in symbol_lines[:9]])
+            symbol_thresholds = {
+                "delta": symbol_matrix[:, 0],
+                "theta": symbol_matrix[:, 1],
+                "alpha_sigma": symbol_matrix[:, 2],
+                "beta": symbol_matrix[:, 3],
+            }
+            orp_enabled = True
+        except Exception as e:
             if logger:
-                logger.warning("No non-Wake/Unavailable epochs found – returning nan.")
-            return np.nan, 0
+                logger.warning(f"ORP LUT/symbolization loading failed: {e}")
+            lut_values = None
+            symbol_thresholds = None
+            orp_enabled = False
 
-        onset_sec  = float(sleep_epochs["start_sec"].iloc[0])
-        offset_sec = float(sleep_epochs["end_sec"].iloc[-1])
+    # --- Sleep period detection ---
+    WAKE_CODE, UNAVAILABLE_CODE, N1_CODE = 5, 9, 3
+    sleep_epochs = stages_raw[~stages_raw["stage_numeric"].isin([WAKE_CODE, UNAVAILABLE_CODE])]
+    if sleep_epochs.empty:
+        if logger: logger.warning("No non-Wake/Unavailable epochs found – returning nan.")
+        return np.nan, 0, np.nan, np.full((0,), np.nan), np.nan
 
-        if offset_sec <= onset_sec:
-            if logger:
-                logger.warning("Sleep offset ≤ onset – returning nan.")
-            return np.nan, 0
+    onset_sec = float(sleep_epochs["start_sec"].iloc[0])
+    offset_sec = float(sleep_epochs["end_sec"].iloc[-1])
+    if offset_sec <= onset_sec:
+        if logger: logger.warning("Sleep offset ≤ onset – returning nan.")
+        return np.nan, 0, np.nan, np.full((0,), np.nan), np.nan
 
-        # --- 2. Prepare sample indices for sleep period ---
-        onset_sample  = int(np.round(onset_sec  * sfreq))
-        offset_sample = int(np.round(offset_sec * sfreq))
-        win_samples = int(window_sec * sfreq)
-        n_sleep_samples = offset_sample - onset_sample
-        n_windows = n_sleep_samples // win_samples
+    onset_sample = int(np.round(onset_sec * sfreq))
+    offset_sample = int(np.round(offset_sec * sfreq))
+    win_samples = int(window_sec * sfreq)
+    n_sleep_samples = offset_sample - onset_sample
+    n_windows = n_sleep_samples // win_samples
+    if n_windows == 0:
+        if logger: logger.warning("Sleep period too short for a single window – returning nan.")
+        return np.nan, 0, np.nan, np.full((0,), np.nan), np.nan
 
-        if n_windows == 0:
-            if logger:
-                logger.warning("Sleep period too short for a single window – returning nan.")
-            return np.nan, 0
+    window_centers_sec = np.array([
+        onset_sec + (w * win_samples + win_samples / 2) / sfreq
+        for w in range(n_windows)
+    ])
+    stage_starts = stages_raw["start_sec"].values
+    stage_indices = np.searchsorted(stage_starts, window_centers_sec, side="right") - 1
+    stage_indices = np.clip(stage_indices, 0, len(stages_raw) - 1)
+    window_stages = stages_raw["stage_numeric"].values[stage_indices]
 
-        # --- 3. Window times and stage mapping ---
-        window_centers_sec = np.array([
-            onset_sec + (w * win_samples + win_samples / 2) / sfreq
-            for w in range(n_windows)
-        ])
+    # --- Artifact Masking: Peak-to-Peak Amplitude ---
+    channel_names = ["F3", "F4", "C3", "C4"]
+    artifact_masks = []
+    for channel_name in channel_names:
+        ch_data = eeg_preprocessed.get(channel_name, None)
+        if ch_data is None or "eeg_cleaned" not in ch_data or ch_data["eeg_cleaned"] is None:
+            continue
+        full_signal = ch_data["eeg_cleaned"]
+        if len(full_signal) < offset_sample:
+            continue
+        ch_signal = full_signal[onset_sample:offset_sample]
+        # Segment into windows
+        ch_windows = ch_signal[:n_windows * win_samples].reshape(n_windows, win_samples)
+        ptp = ch_windows.ptp(axis=1)  # in µV
+        # Mask: True = clean, False = artifact
+        mask = (ptp < EEG_AMPLITUDE_MAX_UV) & (ptp > EEG_AMPLITUDE_MIN_UV)
+        artifact_masks.append(mask)
+    if not artifact_masks:
+        if logger: logger.warning("No valid channels for artifact masking – returning nan.")
+        return np.nan, 0, np.nan, np.full((n_windows,), np.nan), np.nan
+    # Combine masks: window is clean if clean in at least one channel
+    artifact_mask = np.any(np.stack(artifact_masks, axis=0), axis=0)
+    artifact_fraction = 1.0 - np.mean(artifact_mask)
 
-        stage_starts = stages_raw["start_sec"].values
-        stage_indices = np.searchsorted(stage_starts, window_centers_sec, side="right") - 1
-        stage_indices = np.clip(stage_indices, 0, len(stages_raw) - 1)
-        window_stages = stages_raw["stage_numeric"].values[stage_indices]
+    # --- Delta Power Entropy Calculation (with masking) ---
+    entropies = []
+    used_channels = []
+    for channel_name in channel_names:
+        ch_data = eeg_preprocessed.get(channel_name, None)
 
-        # --- 4–8. Per-channel entropy calculation ---
-        N1_CODE = 3
-        fmin, fmax = delta_band
-        entropies = []
-        used_channels = []
+        if ch_data is None or "eeg_cleaned" not in ch_data or ch_data["eeg_cleaned"] is None:
+            continue
+        full_signal = ch_data["eeg_cleaned"]
+        if len(full_signal) < offset_sample:
+            continue
+        ch_signal = full_signal[onset_sample:offset_sample]
+        if len(ch_signal) < n_windows * win_samples:
+            continue
 
-        for channel_name, ch_data in eeg_preprocessed.items():
-            if (
-                channel_name not in channel_names or
-                ch_data is None or
-                "eeg_cleaned" not in ch_data or
-                ch_data["eeg_cleaned"] is None
-            ):
+        ch_windows = ch_signal[:n_windows * win_samples].reshape(n_windows, win_samples)
+        delta_powers = []
+        for w in range(n_windows):
+            if not artifact_mask[w] or window_stages[w] in [WAKE_CODE, N1_CODE]:
+                delta_powers.append(0.0)
                 continue
+            segment = ch_windows[w]
+            psd, freqs = mne.time_frequency.psd_array_multitaper(
+                segment, sfreq=sfreq, fmin=delta_band[0], fmax=delta_band[1],
+                bandwidth=multitaper_bandwidth, adaptive=True, low_bias=True,
+                normalization='full', output='power', verbose=False
+            )
+            delta_power = np.sum(psd)
+            delta_powers.append(delta_power)
 
+        delta_powers = np.array(delta_powers)
+
+        if np.sum(delta_powers) == 0.0:
+            continue
+        smoothed = gaussian_filter1d(delta_powers, sigma=10)
+        total = np.sum(smoothed)
+        if total == 0.0:
+            continue
+
+        delta = smoothed / total
+        delta_fft = fft(delta)
+        delta_len = len(delta)
+        delta_fft = np.abs(delta_fft[0:delta_len//2])
+        delta_fft_nonzero = delta_fft[delta_fft > 0]
+        entropy = -np.sum(delta_fft_nonzero * np.log2(delta_fft_nonzero))
+        entropies.append(entropy)
+        used_channels.append(channel_name)
+
+    n_channels = len(entropies)
+    mean_entropy = float(np.mean(entropies)) if n_channels > 0 else np.nan
+
+
+    # --- ORP Calculation (with masking) ---
+    mean_orp = np.nan
+    orp_per_window = np.full((n_windows,), np.nan)
+    if orp_enabled and n_channels > 0:
+        band_defs = {
+            "delta": (0.3, 2.3),
+            "theta": (2.7, 6.3),
+            "alpha_sigma": (7.3, 14.0),
+            "beta": (14.3, 30.0),
+        }
+        band_names = ["delta", "theta", "alpha_sigma", "beta"]
+        channel_orp_matrix = []
+
+        for channel_name in used_channels:
+            ch_data = eeg_preprocessed[channel_name]
             full_signal = ch_data["eeg_cleaned"]
-            if len(full_signal) < offset_sample:
-                if logger:
-                    logger.warning(f"Channel {channel_name}: Signal too short for sleep period – skipped.")
-                continue
-
             ch_signal = full_signal[onset_sample:offset_sample]
-            if len(ch_signal) < n_windows * win_samples:
-                if logger:
-                    logger.warning(f"Channel {channel_name}: Not enough data for all windows – skipped.")
-                continue
+            ch_windows = ch_signal[:n_windows * win_samples].reshape(n_windows, win_samples)
+            band_powers = {b: np.zeros(n_windows) for b in band_names}
 
-            delta_powers = []
             for w in range(n_windows):
-                segment = ch_signal[w * win_samples : (w + 1) * win_samples]
-                # Multitaper PSD (MNE)
+                if not artifact_mask[w]:
+                    for b in band_names:
+                        band_powers[b][w] = np.nan
+                    continue
+                segment = ch_windows[w]
                 psd, freqs = mne.time_frequency.psd_array_multitaper(
-                    segment,
-                    sfreq=sfreq,
-                    fmin=fmin,
-                    fmax=fmax,
-                    bandwidth=multitaper_bandwidth,
-                    adaptive=True,
-                    low_bias=True,
-                    normalization='full',
-                    output='power',
-                    verbose=False
+                    segment, sfreq=sfreq, fmin=0.3, fmax=30.0,
+                    bandwidth=multitaper_bandwidth, adaptive=True, low_bias=True,
+                    normalization='full', output='power', verbose=False
                 )
-                delta_power = np.sum(psd)
+                for b in band_names:
+                    bmin, bmax = band_defs[b]
+                    mask = (freqs >= bmin) & (freqs <= bmax)
+                    band_powers[b][w] = np.sum(psd[mask]) if np.any(mask) else np.nan
 
-                # Mask Wake/N1
-                if window_stages[w] in [WAKE_CODE, N1_CODE]:
-                    delta_power = 0.0
-                delta_powers.append(delta_power)
-            delta_powers = np.array(delta_powers)
-            if np.sum(delta_powers) == 0.0:
-                if logger:
-                    logger.warning(f"Channel {channel_name}: all windows masked – skipped.")
-                continue
+            # Z-normalize using only artifact-free windows
+            band_z = []
+            for b in band_names:
+                arr = band_powers[b]
+                clean = artifact_mask & ~np.isnan(arr)
+                if np.sum(clean) < 2:
+                    z = np.full_like(arr, np.nan)
+                else:
+                    mean = np.mean(arr[clean])
+                    std = np.std(arr[clean])
+                    z = (arr - mean) / std if std > 0 else np.zeros_like(arr)
+                    z[~clean] = np.nan
+                band_z.append(z)
+            band_z = np.stack(band_z, axis=1)  # (n_windows, 4)
 
-            # Smoothing
-            smoothed = gaussian_filter1d(delta_powers, sigma=10)
-            total = np.sum(smoothed)
-            if total == 0.0:
-                continue
-            delta = smoothed / total
+            # Symbolize and lookup ORP
+            symbols = np.zeros_like(band_z, dtype=int)
+            for i, b in enumerate(band_names):
+                thresholds = symbol_thresholds[b]
+                # np.searchsorted returns 0..9 for 9 thresholds
+                symbols[:, i] = np.searchsorted(thresholds, band_z[:, i])
+                symbols[:, i] = np.clip(symbols[:, i], 0, 9)
+                symbols[np.isnan(band_z[:, i]), i] = 0  # dummy symbol for NaN
+            word_indices = (
+                symbols[:, 0] * 1000 +
+                symbols[:, 1] * 100 +
+                symbols[:, 2] * 10 +
+                symbols[:, 3]
+            )
 
-            delta_fft = fft(delta)
-            delta_len = len(delta)
-            delta_fft = np.abs(delta_fft[0:delta_len//2])
+            # Set ORP to NaN for artifact windows
+            orp_vals = lut_values[word_indices]
+            orp_vals[~artifact_mask] = np.nan
+            channel_orp_matrix.append(orp_vals)
 
-            # Spectral entropy (Shannon entropy)
-            delta_fft_nonzero = delta_fft[delta_fft > 0]
-            entropy = -np.sum(delta_fft_nonzero * np.log2(delta_fft_nonzero))
-            entropies.append(entropy)
-            used_channels.append(channel_name)
+        channel_orp_matrix = np.stack(channel_orp_matrix, axis=0)  # (n_channels, n_windows)
+        orp_per_window = np.nanmean(channel_orp_matrix, axis=0)
+        mean_orp = float(np.nanmean(orp_per_window)) if np.any(~np.isnan(orp_per_window)) else np.nan
 
-        if len(entropies) == 0:
-            if logger:
-                logger.warning("No valid channel entropies computed – returning nan.")
-            return np.nan, 0
 
-        mean_entropy = float(np.mean(entropies))
-        return mean_entropy, len(entropies)
+    # --- Advanced ORP Features ---
+    if orp_enabled and n_channels > 0:
+        orp_nrem, orp_std_nrem, orp_rem, orp_wake = _compute_orp_stage_features(orp_per_window, window_stages, artifact_mask)
+        orp_apeak, orp_a9 = _compute_orp_arousal_features(
+            orp_per_window, onset_sec, window_sec, arousal_df, artifact_mask
+        )
+        csi = _compute_csi(orp_per_window, window_stages, artifact_mask, window_sec=window_sec)
+    else:
+        orp_nrem = orp_std_nrem = orp_rem = orp_wake = orp_apeak = orp_a9 = csi = np.nan
 
-    except Exception as exc:
-        if logger:
-            logger.error(f"compute_delta_power_entropy failed: {exc}", exc_info=True)
-        return np.nan, 0
+    return (
+        mean_entropy, n_channels, mean_orp, orp_per_window, artifact_fraction,
+        orp_nrem, orp_std_nrem, orp_rem, orp_wake, orp_apeak, orp_a9, csi
+    )
     
+
+def _compute_orp_stage_features(orp_per_window, window_stages, artifact_mask):
+    """Compute mean ORP for NREM, REM, and Wake stages."""
+    orp_nrem = np.nan
+    orp_std_nrem = np.nan
+    orp_rem = np.nan
+    orp_wake = np.nan
+    if orp_per_window is not None and window_stages is not None and artifact_mask is not None:
+        # NREM: N2 (2) and N3 (1)
+        nrem_mask = ((window_stages == 1) | (window_stages == 2)) & artifact_mask
+        rem_mask = (window_stages == 4) & artifact_mask
+        wake_mask = (window_stages == 5) & artifact_mask
+        orp_nrem = np.nanmean(orp_per_window[nrem_mask]) if np.any(nrem_mask) else np.nan
+        orp_std_nrem = np.nanstd(orp_per_window[nrem_mask]) if np.any(nrem_mask) else np.nan
+        orp_rem = np.nanmean(orp_per_window[rem_mask]) if np.any(rem_mask) else np.nan
+        orp_wake = np.nanmean(orp_per_window[wake_mask]) if np.any(wake_mask) else np.nan
+    return orp_nrem, orp_std_nrem, orp_rem, orp_wake
+
+
+def _compute_orp_arousal_features(
+    orp_per_window, onset_sec, window_sec, arousal_df, artifact_mask
+):
+    """Compute ORP-APeak and ORP-A9 using arousal_df (from events_raw)."""
+    if arousal_df is None or len(arousal_df) == 0 or orp_per_window is None:
+        return np.nan, np.nan
+    n_windows = len(orp_per_window)
+    window_starts = onset_sec + np.arange(n_windows) * window_sec
+    window_ends = window_starts + window_sec
+
+    apeak_list = []
+    a9_list = []
+    for _, row in arousal_df.iterrows():
+        ar_start = row['start_sec']
+        ar_end = row['end_sec']
+        # ORP-APeak: max ORP in windows overlapping arousal
+        overlap = (window_starts < ar_end) & (window_ends > ar_start) & artifact_mask
+        if np.any(overlap):
+            apeak = np.nanmax(orp_per_window[overlap])
+            apeak_list.append(apeak)
+        # ORP-A9: mean ORP in 9s after arousal end (windows whose start in [ar_end, ar_end+9])
+        a9_mask = (window_starts >= ar_end) & (window_starts < ar_end + 9.0) & artifact_mask
+        if np.any(a9_mask):
+            a9 = np.nanmean(orp_per_window[a9_mask])
+            a9_list.append(a9)
+    orp_apeak = np.nanmean(apeak_list) if len(apeak_list) > 0 else np.nan
+    orp_a9 = np.nanmean(a9_list) if len(a9_list) > 0 else np.nan
+    return orp_apeak, orp_a9
+
+
+def _compute_csi(orp_per_window, window_stages, artifact_mask, window_sec=5.0):
+    """Compute Cumulative Sleep Index (CSI)."""
+    # Sleep = NREM (1,2,3) or REM (4)
+    sleep_mask = ((window_stages == 1) | (window_stages == 2) | (window_stages == 3) | (window_stages == 4)) & artifact_mask
+    if np.any(sleep_mask):
+        tst_min = np.sum(sleep_mask) * window_sec / 60.0
+        mean_orp_sleep = np.nanmean(orp_per_window[sleep_mask])
+        csi = tst_min * (2.5 - mean_orp_sleep)
+        return csi
+    else:
+        return np.nan
 # ==============================================================================
 # ASYMMETRIE-FEATURES (INTERHEMISPHÄRISCH)
 # ==============================================================================
