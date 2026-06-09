@@ -26,3 +26,6 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Leaderboard
+leaderboard*

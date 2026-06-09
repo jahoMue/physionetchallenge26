@@ -44,6 +44,89 @@ from config import (
     SIGNAL_DTYPE,
 )
 
+# ==============================================================================
+# PHYSIONET 2026 ANNOTATION ENCODINGS
+# ==============================================================================
+
+# Challenge sleep-stage numeric encoding:
+#   0 = Unknown / not scored
+#   1 = N3
+#   2 = N2
+#   3 = N1
+#   4 = REM
+#   5 = Wake
+#   9 = Unavailable
+#
+# This must stay consistent with config.SLEEP_STAGE_ENCODING and
+# preprocessing/preprocess_annotations.py.
+CHALLENGE_NUMERIC_STAGE_MAP = {
+    0: "Unknown",
+    1: "N3",
+    2: "N2",
+    3: "N1",
+    4: "REM",
+    5: "W",
+    9: "Unknown",
+}
+
+
+def _stage_label_to_annotation_description(stage_label: str) -> str:
+    """
+    Convert canonical stage labels to MNE/AASM-like annotation descriptions.
+
+    Downstream preprocess_annotations.py already understands descriptions like:
+      "Sleep stage W", "Sleep stage N1", "Sleep stage N2",
+      "Sleep stage N3", "Sleep stage R".
+    """
+    if stage_label is None:
+        return "Unknown"
+
+    stage_label = str(stage_label).strip()
+
+    if stage_label == "W":
+        return "Sleep stage W"
+    if stage_label == "N1":
+        return "Sleep stage N1"
+    if stage_label == "N2":
+        return "Sleep stage N2"
+    if stage_label == "N3":
+        return "Sleep stage N3"
+    if stage_label == "REM":
+        return "Sleep stage R"
+
+    return "Unknown"
+
+
+def _map_numeric_to_stage(value) -> str:
+    """
+    Map numeric sleep-stage values to standardized annotation descriptions
+    using the PhysioNet Challenge 2026 encoding.
+
+    Challenge encoding:
+      0 = Unknown
+      1 = N3
+      2 = N2
+      3 = N1
+      4 = REM
+      5 = Wake
+      9 = Unavailable / Unknown
+
+    Returns
+    -------
+    str
+        A text annotation such as "Sleep stage N3", "Sleep stage R",
+        "Sleep stage W", or "Unknown".
+    """
+    try:
+        if pd.isna(value):
+            return "Unknown"
+
+        numeric_val = int(round(float(value)))
+    except Exception:
+        return "Unknown"
+
+    stage_label = CHALLENGE_NUMERIC_STAGE_MAP.get(numeric_val, "Unknown")
+    return _stage_label_to_annotation_description(stage_label)
 
 # ==============================================================================
 # DEMOGRAPHICS
@@ -448,10 +531,18 @@ def _parse_stage_channel(
     probability encoding. We round to nearest integer and map to 
     standard sleep stage labels.
     
-    Common encodings:
-    - 0=Wake, 1=N1, 2=N2, 3=N3, 5=REM (AASM)
-    - 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM
-    - 0=Wake, 1=S1, 2=S2, 3=S3, 4=S4, 5=REM (R&K)
+        PhysioNet Challenge 2026 encoding:
+    - 0 = Unknown / not scored
+    - 1 = N3
+    - 2 = N2
+    - 3 = N1
+    - 4 = REM
+    - 5 = Wake
+    - 9 = Unavailable
+
+    The function outputs AASM-like text descriptions such as
+    "Sleep stage N3" and "Sleep stage R", which are then parsed by
+    preprocess_annotations.py into canonical labels.
     """
     epoch_sec = 30  # Standard sleep epoch
     epoch_samples = int(epoch_sec * fs)
@@ -470,14 +561,18 @@ def _parse_stage_channel(
         end_sample = start_sample + epoch_samples
         epoch_data = signal[start_sample:end_sample]
         
-        # Get the dominant value in this epoch
-        # Round to nearest integer since values may have float noise
-        rounded = np.round(epoch_data).astype(int)
-        values, counts = np.unique(rounded, return_counts=True)
-        dominant_value = values[np.argmax(counts)]
-        
-        # Map to stage label
-        stage_label = _map_numeric_to_stage(dominant_value)
+        epoch_data = epoch_data[np.isfinite(epoch_data)]
+
+        if len(epoch_data) == 0:
+            stage_label = "Unknown"
+        else:
+            rounded = np.round(epoch_data).astype(int)
+            values, counts = np.unique(rounded, return_counts=True)
+            dominant_value = values[np.argmax(counts)]
+
+            # Map using PhysioNet 2026 encoding.
+            stage_label = _map_numeric_to_stage(dominant_value)
+
         
         records.append({
             "onset": float(epoch_idx * epoch_sec),
@@ -646,53 +741,7 @@ def _parse_multiclass_event_channel(
         return pd.DataFrame(records)
     return None
 
-def _map_numeric_to_stage(value: int) -> str:
-    """
-    Maps numeric values to sleep stage labels.
-    Handles multiple common encoding schemes.
-    """
-    # Try multiple encodings
-    # Encoding 1: AASM with REM=5
-    aasm_5 = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        5: "Sleep stage R",
-    }
-    
-    # Encoding 2: AASM with REM=4
-    aasm_4 = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage R",
-    }
-    
-    # Encoding 3: R&K
-    rk = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage N3",  # S4 -> N3
-        5: "Sleep stage R",
-    }
-    
-    # Try AASM with REM=5 first (most common in modern datasets)
-    if value in aasm_5:
-        return aasm_5[value]
-    
-    # Then AASM with REM=4
-    if value in aasm_4:
-        return aasm_4[value]
-    
-    # Movement/artifact
-    if value in [6, 7, 8, 9]:
-        return "Sleep stage W"  # Treat as wake
-    
-    return "Unknown"
+
 def _extract_annotations_from_pyedflib(f, signal_labels: list) -> Optional[pd.DataFrame]:
     """
     Extracts annotations from signal data using pyedflib.
@@ -755,44 +804,6 @@ def _extract_annotations_from_pyedflib(f, signal_labels: list) -> Optional[pd.Da
         return None
     except Exception:
         return None
-
-
-def _map_numeric_to_stage(value: float) -> str:
-    """
-    Maps numeric values to sleep stage labels.
-    Handles multiple common encoding schemes.
-    """
-    # Round to nearest integer
-    val = int(round(value))
-    
-    # AASM standard encoding (most common)
-    # 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM, 5=Unknown/Movement
-    aasm_map = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage R",
-        5: "Sleep stage W",  # Movement/Unknown -> Wake
-    }
-    
-    # R&K encoding
-    # 0=Wake, 1=S1, 2=S2, 3=S3, 4=S4, 5=REM
-    rk_map = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage N3",  # S4 -> N3
-        5: "Sleep stage R",
-    }
-    
-    # Try AASM first (most common in modern datasets)
-    if val in aasm_map:
-        return aasm_map[val]
-    
-    return "Unknown"
-
 
 
 # ==============================================================================

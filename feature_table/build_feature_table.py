@@ -34,6 +34,274 @@ from config import (
 # HAUPT-FUNKTION: FEATURE-TABELLE FÜR EINEN PATIENTEN
 # ==============================================================================
 
+# ==============================================================================
+# FEATURE TABLE BUILD CONSTANTS
+# ==============================================================================
+
+# Keep categorical segment columns as strings. They are not used directly as ML
+# features because classification.prepare_training_data() excludes object/category
+# columns, but they are needed here for stage-specific aggregation.
+CATEGORICAL_SEGMENT_COLUMNS = {
+    "dominant_stage",
+    "ann_dominant_stage",
+    "cycle_phase",
+    "ann_cycle_phase",
+}
+
+# EEG strategy columns are also categorical, e.g. "single", "none", "averaged".
+CATEGORICAL_SUFFIXES = (
+    "_strategy",
+    "_cycle_phase",
+)
+
+STAGE_NUMERIC_TO_LABEL = {
+    0: "Unknown",
+    1: "N3",
+    2: "N2",
+    3: "N1",
+    4: "REM",
+    5: "W",
+    9: "Unknown",
+}
+
+STAGE_LABELS = ["W", "N1", "N2", "N3", "REM", "Unknown"]
+
+# Set to False to reduce dimensionality and overfitting risk.
+# If True, _aggregate_features() adds one *_valid_pct feature per variable.
+ADD_PER_FEATURE_VALID_PCT = False
+
+
+def _is_categorical_segment_column(col: str) -> bool:
+    """
+    Return True for segment-level columns that must be kept as strings.
+    """
+    if col in CATEGORICAL_SEGMENT_COLUMNS:
+        return True
+    return any(col.endswith(suffix) for suffix in CATEGORICAL_SUFFIXES)
+
+
+def _format_session_id(value) -> str:
+    """
+    Normalize SessionID values for merge keys.
+
+    Handles 1, 1.0, "1", "ses-1" -> "1".
+    """
+    if pd.isna(value):
+        return ""
+
+    s = str(value).strip()
+
+    if s.lower().startswith("ses-"):
+        s = s[4:]
+
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+
+    return s
+
+
+def _standardize_binary_series(series: pd.Series) -> pd.Series:
+    """
+    Robustly convert TRUE/FALSE, yes/no, 1/0, and bool labels to 0/1 floats.
+    Unknown values become NaN.
+    """
+    true_values = {"TRUE", "1", "1.0", "T", "Y", "YES"}
+    false_values = {"FALSE", "0", "0.0", "F", "N", "NO"}
+
+    def convert_one(x):
+        if pd.isna(x):
+            return np.nan
+
+        if isinstance(x, (bool, np.bool_)):
+            return float(int(x))
+
+        s = str(x).strip().upper()
+
+        if s in true_values:
+            return 1.0
+        if s in false_values:
+            return 0.0
+
+        try:
+            f = float(s)
+            if f == 1.0:
+                return 1.0
+            if f == 0.0:
+                return 0.0
+        except Exception:
+            pass
+
+        return np.nan
+
+    return series.apply(convert_one).astype(float)
+
+
+def _align_column_to_segments(
+    source_df: pd.DataFrame,
+    col: str,
+    n_segments: int,
+    as_categorical: bool = False,
+):
+    """
+    Align a source feature column to segment_idx=0..n_segments-1.
+
+    This is safer than assuming that source_df rows are already perfectly ordered.
+    If segment_idx is unavailable, falls back to row order with padding.
+    """
+    if source_df is None or col not in source_df.columns:
+        if as_categorical:
+            return np.full(n_segments, np.nan, dtype=object)
+        return np.full(n_segments, np.nan, dtype=float)
+
+    if "segment_idx" in source_df.columns:
+        tmp = source_df[["segment_idx", col]].copy()
+        tmp["segment_idx"] = pd.to_numeric(tmp["segment_idx"], errors="coerce")
+        tmp = tmp.dropna(subset=["segment_idx"])
+        tmp["segment_idx"] = tmp["segment_idx"].astype(int)
+        tmp = tmp.drop_duplicates(subset=["segment_idx"], keep="first")
+        aligned = tmp.set_index("segment_idx").reindex(range(n_segments))[col]
+    else:
+        values = source_df[col].values
+        if len(values) >= n_segments:
+            aligned = pd.Series(values[:n_segments])
+        else:
+            if as_categorical:
+                padded = np.full(n_segments, np.nan, dtype=object)
+            else:
+                padded = np.full(n_segments, np.nan, dtype=float)
+            padded[:len(values)] = values
+            aligned = pd.Series(padded)
+
+    if as_categorical:
+        return aligned.astype(object).values
+
+    return pd.to_numeric(aligned, errors="coerce").values
+
+
+def _ensure_stage_label_column(
+    segment_features: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Ensure that a categorical stage-label column exists for stage-specific
+    aggregation.
+
+    Preferred labels:
+      ann_dominant_stage / dominant_stage
+
+    Fallback numeric labels:
+      ann_dominant_stage_numeric / dominant_stage_numeric
+    """
+    df = segment_features.copy()
+
+    for candidate in ["ann_dominant_stage", "dominant_stage"]:
+        if candidate in df.columns:
+            vals = df[candidate].dropna().astype(str)
+            if vals.isin(["W", "N1", "N2", "N3", "REM", "Unknown"]).any():
+                return df, candidate
+
+    for candidate in ["ann_dominant_stage_numeric", "dominant_stage_numeric"]:
+        if candidate in df.columns:
+            numeric = pd.to_numeric(df[candidate], errors="coerce")
+            label_col = "__stage_label_for_aggregation"
+            df[label_col] = numeric.map(
+                lambda x: STAGE_NUMERIC_TO_LABEL.get(int(x), "Unknown")
+                if pd.notna(x) else "Unknown"
+            )
+            return df, label_col
+
+    return df, None
+
+
+def _compute_stage_distribution_features(
+    segment_features: pd.DataFrame,
+    stage_col: Optional[str],
+) -> Dict:
+    """
+    Compact patient-level sleep-stage segment distribution.
+    These features are much safer than relying only on stage-specific
+    high-dimensional aggregations.
+    """
+    features = {}
+
+    n_total = len(segment_features)
+    if n_total == 0 or stage_col is None or stage_col not in segment_features.columns:
+        for stage in STAGE_LABELS:
+            key = stage.lower().replace("rem", "rem")
+            features[f"stage_{key}_segment_pct"] = np.nan
+            features[f"stage_{key}_segment_count"] = 0
+        features["n_scored_stage_segments"] = 0
+        return features
+
+    stages = segment_features[stage_col].fillna("Unknown").astype(str)
+
+    for stage in STAGE_LABELS:
+        safe_stage = stage.lower()
+        count = int((stages == stage).sum())
+        features[f"stage_{safe_stage}_segment_count"] = count
+        features[f"stage_{safe_stage}_segment_pct"] = (
+            float(count / n_total * 100.0) if n_total > 0 else np.nan
+        )
+
+    scored_mask = stages.isin(["W", "N1", "N2", "N3", "REM"])
+    features["n_scored_stage_segments"] = int(scored_mask.sum())
+
+    sleep_mask = stages.isin(["N1", "N2", "N3", "REM"])
+    features["stage_sleep_segment_pct"] = (
+        float(sleep_mask.mean() * 100.0) if n_total > 0 else np.nan
+    )
+
+    nrem_mask = stages.isin(["N1", "N2", "N3"])
+    features["stage_nrem_segment_pct"] = (
+        float(nrem_mask.mean() * 100.0) if n_total > 0 else np.nan
+    )
+
+    return features
+
+
+def _compute_missingness_summary(
+    segment_features: pd.DataFrame,
+    numeric_cols: List[str],
+) -> Dict:
+    """
+    Add compact missingness/availability summaries instead of one valid_pct
+    per feature. This reduces dimensionality and overfitting risk.
+    """
+    features = {}
+
+    if not numeric_cols:
+        return features
+
+    numeric_df = segment_features[numeric_cols]
+    features["missingness_numeric_mean_pct"] = float(
+        numeric_df.isna().mean().mean() * 100.0
+    )
+    features["missingness_numeric_median_pct"] = float(
+        numeric_df.isna().mean().median() * 100.0
+    )
+
+    groups = {
+        "ecg": ["ecg_", "hr_", "hrv_", "rr_", "rsa_"],
+        "eeg": ["eeg_"],
+        "ann": ["ann_"],
+        "meta": ["meta_"],
+    }
+
+    for group_name, prefixes in groups.items():
+        group_cols = [
+            c for c in numeric_cols
+            if any(c.startswith(p) for p in prefixes)
+        ]
+        if group_cols:
+            features[f"missingness_{group_name}_mean_pct"] = float(
+                segment_features[group_cols].isna().mean().mean() * 100.0
+            )
+
+    return features
+
 def build_patient_feature_table(
     patient_id: str,
     ecg_features: Optional[pd.DataFrame],
@@ -89,79 +357,74 @@ def build_patient_feature_table(
     # Sammle neue Features in einem Dictionary, um DataFrame-Fragmentation zu vermeiden
     new_features = {}
     
-    # --- Segment-Metadaten hinzufügen ---
+        # --- Segment-Metadaten hinzufügen ---
     if segment_metadata is not None and len(segment_metadata) > 0:
         meta_cols = [
             "start_sec", "end_sec", "duration_sec", "is_complete",
             "ecg_sqi", "ecg_quality_ok", "ecg_n_rpeaks",
             "any_signal_quality_ok"
         ]
+
         # EEG-Qualitätsspalten dynamisch hinzufügen
         for col in segment_metadata.columns:
-            if col.startswith("eeg_") and (col.endswith("_sqi") or col.endswith("_quality_ok")):
+            if col.startswith("eeg_") and (
+                col.endswith("_sqi") or col.endswith("_quality_ok")
+            ):
                 meta_cols.append(col)
-        
+
         for col in meta_cols:
             if col in segment_metadata.columns:
-                values = segment_metadata[col].values
-                # Versuche Konvertierung zu numerisch, um 'none' etc. abzufangen
-                try:
-                    values = pd.to_numeric(values, errors='coerce')
-                except Exception:
-                    pass
-                
-                if len(values) >= n_segments:
-                    new_features[f"meta_{col}"] = values[:n_segments]
-                else:
-                    padded = np.full(n_segments, np.nan)
-                    padded[:len(values)] = values
-                    new_features[f"meta_{col}"] = padded
-    
+                new_features[f"meta_{col}"] = _align_column_to_segments(
+                    segment_metadata,
+                    col,
+                    n_segments,
+                    as_categorical=False,
+                )
+
     # --- ECG-Features hinzufügen ---
     if ecg_features is not None and len(ecg_features) > 0:
         ecg_cols = [c for c in ecg_features.columns if c != "segment_idx"]
+
         for col in ecg_cols:
-            # Konvertiere zu numerisch, Strings wie 'none' werden NaN
-            values = pd.to_numeric(ecg_features[col], errors='coerce').values
-            if len(values) >= n_segments:
-                new_features[col] = values[:n_segments]
-            else:
-                padded = np.full(n_segments, np.nan)
-                padded[:len(values)] = values
-                new_features[col] = padded
-        
+            new_features[col] = _align_column_to_segments(
+                ecg_features,
+                col,
+                n_segments,
+                as_categorical=False,
+            )
+
         if logger:
             logger.info(f"  ECG-Features: {len(ecg_cols)} Spalten")
-    
+
     # --- EEG-Features hinzufügen ---
     if eeg_features is not None and len(eeg_features) > 0:
         eeg_cols = [c for c in eeg_features.columns if c != "segment_idx"]
+
         for col in eeg_cols:
-            # Konvertiere zu numerisch, Strings wie 'none' werden NaN
-            values = pd.to_numeric(eeg_features[col], errors='coerce').values
-            if len(values) >= n_segments:
-                new_features[col] = values[:n_segments]
-            else:
-                padded = np.full(n_segments, np.nan)
-                padded[:len(values)] = values
-                new_features[col] = padded
-        
+            as_cat = _is_categorical_segment_column(col)
+            new_features[col] = _align_column_to_segments(
+                eeg_features,
+                col,
+                n_segments,
+                as_categorical=as_cat,
+            )
+
         if logger:
             logger.info(f"  EEG-Features: {len(eeg_cols)} Spalten")
-    
+
     # --- Annotation-Features hinzufügen ---
     if annotation_features is not None and len(annotation_features) > 0:
         ann_cols = [c for c in annotation_features.columns if c != "segment_idx"]
+
         for col in ann_cols:
-            # Konvertiere zu numerisch, Strings wie 'none' werden NaN
-            values = pd.to_numeric(annotation_features[col], errors='coerce').values
-            if len(values) >= n_segments:
-                new_features[col] = values[:n_segments]
-            else:
-                padded = np.full(n_segments, np.nan)
-                padded[:len(values)] = values
-                new_features[col] = padded
-        
+            as_cat = _is_categorical_segment_column(col)
+            new_features[col] = _align_column_to_segments(
+                annotation_features,
+                col,
+                n_segments,
+                as_categorical=as_cat,
+            )
+
         if logger:
             logger.info(f"  Annotation-Features: {len(ann_cols)} Spalten")
             
@@ -224,6 +487,11 @@ def aggregate_to_patient_level(
     
     patient_id = segment_features["patient_id"].iloc[0]
     
+    # Preserve/derive categorical sleep-stage labels for stage-specific
+    # aggregation before identifying numeric columns.
+    segment_features, stage_col = _ensure_stage_label_column(segment_features)
+
+
     if logger:
         logger.info(f"Aggregiere Features für Patient {patient_id}: "
                      f"{len(segment_features)} Segmente")
@@ -245,16 +513,17 @@ def aggregate_to_patient_level(
         _aggregate_features(segment_features, numeric_cols, prefix="all")
     )
     
+        # --- Compact sleep-stage distribution features ---
+    patient_features.update(
+        _compute_stage_distribution_features(segment_features, stage_col)
+    )
+
     # --- Schlafphasen-spezifische Aggregation ---
-    stage_col = None
-    for candidate in ["ann_dominant_stage", "dominant_stage"]:
-        if candidate in segment_features.columns:
-            stage_col = candidate
-            break
-    
     if stage_col is not None:
+        stages = segment_features[stage_col].fillna("Unknown").astype(str)
+
         # NREM (N1 + N2 + N3)
-        nrem_mask = segment_features[stage_col].isin(["N1", "N2", "N3"])
+        nrem_mask = stages.isin(["N1", "N2", "N3"])
         if nrem_mask.sum() > 0:
             nrem_data = segment_features[nrem_mask]
             patient_features.update(
@@ -263,9 +532,9 @@ def aggregate_to_patient_level(
             patient_features["n_nrem_segments"] = int(nrem_mask.sum())
         else:
             patient_features["n_nrem_segments"] = 0
-        
+
         # REM
-        rem_mask = segment_features[stage_col] == "REM"
+        rem_mask = stages == "REM"
         if rem_mask.sum() > 0:
             rem_data = segment_features[rem_mask]
             patient_features.update(
@@ -274,9 +543,9 @@ def aggregate_to_patient_level(
             patient_features["n_rem_segments"] = int(rem_mask.sum())
         else:
             patient_features["n_rem_segments"] = 0
-        
-        # N3 (Deep Sleep – besonders relevant für Cognitive Impairment)
-        n3_mask = segment_features[stage_col] == "N3"
+
+        # N3 / Deep Sleep
+        n3_mask = stages == "N3"
         if n3_mask.sum() > 0:
             n3_data = segment_features[n3_mask]
             patient_features.update(
@@ -285,9 +554,9 @@ def aggregate_to_patient_level(
             patient_features["n_n3_segments"] = int(n3_mask.sum())
         else:
             patient_features["n_n3_segments"] = 0
-        
-        # N2 (für Schlafspindel-Analyse)
-        n2_mask = segment_features[stage_col] == "N2"
+
+        # N2
+        n2_mask = stages == "N2"
         if n2_mask.sum() > 0:
             n2_data = segment_features[n2_mask]
             patient_features.update(
@@ -296,10 +565,17 @@ def aggregate_to_patient_level(
             patient_features["n_n2_segments"] = int(n2_mask.sum())
         else:
             patient_features["n_n2_segments"] = 0
-        
+
         # Wake
-        wake_mask = segment_features[stage_col] == "W"
+        wake_mask = stages == "W"
         patient_features["n_wake_segments"] = int(wake_mask.sum())
+    else:
+        patient_features["n_nrem_segments"] = 0
+        patient_features["n_rem_segments"] = 0
+        patient_features["n_n3_segments"] = 0
+        patient_features["n_n2_segments"] = 0
+        patient_features["n_wake_segments"] = 0
+
     
     # --- Schlafarchitektur-Features (bereits global) ---
     if sleep_summary is not None:
@@ -328,6 +604,12 @@ def aggregate_to_patient_level(
                 segment_features[quality_col].mean() * 100
             )
     
+    # Compact missingness summaries instead of one valid_pct per feature.
+    patient_features.update(
+        _compute_missingness_summary(segment_features, numeric_cols)
+    )
+
+
     # Erstelle DataFrame (eine Zeile)
     patient_df = pd.DataFrame([patient_features])
     
@@ -387,12 +669,15 @@ def _aggregate_features(
                 aggregated[f"{prefix}_{short_col}_p25"]
             )
         
-        # Anteil gültiger Werte
-        total_in_df = len(df[col])
-        n_valid = len(values)
-        aggregated[f"{prefix}_{short_col}_valid_pct"] = (
-            float(n_valid / total_in_df * 100) if total_in_df > 0 else 0
-        )
+        # Optional per-feature availability.
+        # Disabled by default to reduce dimensionality and overfitting risk.
+        if ADD_PER_FEATURE_VALID_PCT:
+            total_in_df = len(df[col])
+            n_valid = len(values)
+            aggregated[f"{prefix}_{short_col}_valid_pct"] = (
+                float(n_valid / total_in_df * 100) if total_in_df > 0 else 0
+            )
+
     
     return aggregated
 
@@ -640,63 +925,43 @@ def _clean_feature_table(
     logger=None
 ) -> pd.DataFrame:
     """
-    Bereinigt die Feature-Tabelle:
-    - Entfernt konstante Spalten
-    - Entfernt Spalten mit zu vielen NaN-Werten
-    - Ersetzt Inf-Werte
-    - Konvertiert Boolean zu Int
+    Light per-patient segment-table cleanup.
+
+    Important:
+    Do NOT remove constant or high-NaN columns at the individual-patient level.
+    A feature can be constant within one patient but informative across patients.
+    Dropping columns per patient creates artificial missingness after cohort
+    concatenation.
+
+    Cohort-level cleanup is performed later by _final_cleanup_patient_level(),
+    and training-time filtering is also performed by prepare_training_data().
     """
     original_cols = len(df.columns)
-    
-    # --- Inf-Werte ersetzen ---
+
+    df = df.copy()
+
+    # --- Replace Inf values in numeric columns ---
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     for col in numeric_cols:
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-    
-    # --- Boolean zu Int ---
-    bool_cols = df.select_dtypes(include=['bool']).columns
+
+    # --- Boolean to Int ---
+    bool_cols = df.select_dtypes(include=["bool"]).columns
     for col in bool_cols:
         df[col] = df[col].astype(int)
-    
-    # --- Konstante Spalten entfernen ---
-    # (Spalten wo alle Werte gleich sind – kein Informationsgehalt)
-    cols_to_drop = []
-    for col in df.columns:
-        if col in ["patient_id", "segment_idx"]:
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            if df[col].nunique(dropna=True) <= 1:
-                cols_to_drop.append(col)
-    
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
-        if logger:
-            logger.debug(f"  Entfernt: {len(cols_to_drop)} konstante Spalten")
-    
-    # --- Spalten mit >90% NaN entfernen ---
-    nan_threshold = 0.9
-    high_nan_cols = []
-    for col in df.columns:
-        if col in ["patient_id", "segment_idx"]:
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            nan_ratio = df[col].isna().mean()
-            if nan_ratio > nan_threshold:
-                high_nan_cols.append(col)
-    
-    if high_nan_cols:
-        df = df.drop(columns=high_nan_cols)
-        if logger:
-            logger.debug(f"  Entfernt: {len(high_nan_cols)} Spalten mit "
-                         f">{nan_threshold*100:.0f}% NaN")
-    
+
+    # --- Avoid duplicate columns ---
+    df = df.loc[:, ~df.columns.duplicated()]
+
     if logger:
         final_cols = len(df.columns)
-        removed = original_cols - final_cols
-        logger.info(f"  Feature-Bereinigung: {original_cols} -> {final_cols} "
-                     f"Spalten ({removed} entfernt)")
-    
+        logger.info(
+            f"  Feature-Bereinigung: {original_cols} -> {final_cols} "
+            f"Spalten; keine per-patient Spalten entfernt"
+        )
+
     return df
+
 
 
 # ==============================================================================
@@ -727,20 +992,34 @@ def add_demographics(
         # → Baue den gleichen Key in demographics:
         #   "{SiteID}/{BidsFolder}_ses-{SessionID}"
 
-        if "BidsFolder" in demographics.columns and "SiteID" in demographics.columns:
-            demographics["_merge_key"] = (
-                demographics["SiteID"].astype(str) + "/" +
-                demographics["BidsFolder"].astype(str) + "_ses-" +
-                demographics["SessionID"].astype(str)
+        if (
+            "BidsFolder" in demographics.columns
+            and "SiteID" in demographics.columns
+            and "SessionID" in demographics.columns
+        ):
+            demographics = demographics.copy()
+
+            demographics["_session_key"] = demographics["SessionID"].apply(
+                _format_session_id
             )
-            feature_table["_merge_key"] = feature_table["patient_id"].astype(str)
+
+            demographics["_merge_key"] = (
+                demographics["SiteID"].astype(str).str.strip() + "/" +
+                demographics["BidsFolder"].astype(str).str.strip() + "_ses-" +
+                demographics["_session_key"].astype(str)
+            )
+
+            feature_table["_merge_key"] = feature_table["patient_id"].astype(str).str.strip()
 
             merged = feature_table.merge(
                 demographics,
                 on="_merge_key",
                 how="left"
             )
-            merged = merged.drop(columns=["_merge_key"])
+
+            drop_cols = [c for c in ["_merge_key", "_session_key"] if c in merged.columns]
+            merged = merged.drop(columns=drop_cols)
+
         else:
             # Fallback: Versuche über BDSPPatientID
             import re
@@ -839,8 +1118,8 @@ def _process_demographics(df: pd.DataFrame, logger=None) -> pd.DataFrame:
     
     # --- Target Variable ---
     if TARGET_COLUMN in df.columns:
-        df["target"] = pd.to_numeric(df[TARGET_COLUMN], errors="coerce")
-    
+        df["target"] = _standardize_binary_series(df[TARGET_COLUMN])
+
     # --- SiteID (als kategorisch) ---
     if "SiteID" in df.columns:
         df["demo_site_id"] = pd.Categorical(df["SiteID"]).codes
@@ -1019,8 +1298,8 @@ def _final_cleanup_patient_level(
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
     
-    # --- Spalten mit >80% NaN entfernen ---
-    nan_threshold = 0.8
+    # --- Spalten mit >95% NaN entfernen ---
+    nan_threshold = 0.95
     high_nan_cols = []
     for col in df.columns:
         if col in ["patient_id", "target", "demo_time_to_event"]:

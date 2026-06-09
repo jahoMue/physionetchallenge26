@@ -669,22 +669,22 @@ def _create_model(
     expected_test_prevalence: Optional[float] = 0.10
 ) -> Any:
     class_counts = np.bincount(y.astype(int))
+
     if len(class_counts) >= 2 and class_counts.min() > 0:
-        if expected_test_prevalence is not None:
-            # Adjust weights to match the expected test set prevalence (Prior Probability Shift)
-            target_pos_ratio = expected_test_prevalence / (1.0 - expected_test_prevalence)
-            actual_pos_ratio = class_counts[1] / class_counts[0]
-            scale_pos_weight = target_pos_ratio / actual_pos_ratio
-        else:
-            # Standard balancing
-            scale_pos_weight = class_counts[0] / class_counts[1]
+        # Use observed training imbalance only.
+        # Do NOT inject expected test prevalence here.
+        scale_pos_weight = class_counts[0] / class_counts[1]
     else:
         scale_pos_weight = 1.0
 
     use_class_weight = handle_imbalance == "class_weight"
-    
-    # Create class_weight dictionary for models that support it (RF, LogReg)
-    class_weight_dict = {0: 1.0, 1: scale_pos_weight} if use_class_weight else None
+
+    class_weight_dict = (
+        {0: 1.0, 1: scale_pos_weight}
+        if use_class_weight
+        else None
+    )
+
 
 
     if model_type == "xgboost":
@@ -772,7 +772,11 @@ def _create_model(
     if logger:
         logger.info(f"Modell erstellt: {model_type}")
         if use_class_weight:
-            logger.info(f"  Class Weight / Scale Pos Weight: {scale_pos_weight:.2f}")
+            logger.info(
+                f"  Training class weight / scale_pos_weight: "
+                f"{scale_pos_weight:.3f}"
+            )
+
 
     return model
 
@@ -1970,12 +1974,29 @@ def predict(
     X_scaled = scaler.transform(X_selected).astype(np.float32)
 
     try:
-        predictions = model.predict(X_scaled)
-        probabilities = model.predict_proba(X_scaled)[:, 1]
+        raw_probabilities = model.predict_proba(X_scaled)[:, 1]
+
+        config = model_result.get("training_config", {})
+        train_prev = config.get("training_prevalence", None)
+        target_prev = config.get("expected_test_prevalence", None)
+        threshold = float(config.get("decision_threshold", 0.5))
+
+        if train_prev is not None and target_prev is not None:
+            probabilities = _prior_probability_shift(
+                raw_probabilities,
+                train_prevalence=float(train_prev),
+                target_prevalence=float(target_prev),
+            )
+        else:
+            probabilities = raw_probabilities
+
+        predictions = (probabilities >= threshold).astype(int)
+
     except Exception as e:
         if logger:
             logger.error(f"Vorhersage fehlgeschlagen: {e}")
         return pd.DataFrame()
+
 
     result_df = pd.DataFrame({
         "prediction": predictions.astype(int),

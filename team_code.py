@@ -78,6 +78,174 @@ def _setup_logger(verbose: bool):
                     format="{time:HH:mm:ss} | {level:<7} | {message}")
     return logger
 
+def _prior_probability_shift(
+    p: np.ndarray,
+    train_prevalence: float,
+    target_prevalence: Optional[float],
+    eps: float = 1e-7,
+) -> np.ndarray:
+    """
+    Adjust predicted probabilities from the training prior to the expected
+    deployment/test prior.
+
+    odds_target = odds_model *
+        [pi_target / (1 - pi_target)] / [pi_train / (1 - pi_train)]
+    """
+    if target_prevalence is None:
+        return p
+
+    train_prevalence = float(np.clip(train_prevalence, eps, 1.0 - eps))
+    target_prevalence = float(np.clip(target_prevalence, eps, 1.0 - eps))
+
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, eps, 1.0 - eps)
+
+    odds = p / (1.0 - p)
+
+    train_prior_odds = train_prevalence / (1.0 - train_prevalence)
+    target_prior_odds = target_prevalence / (1.0 - target_prevalence)
+
+    correction = target_prior_odds / train_prior_odds
+    adjusted_odds = odds * correction
+
+    return adjusted_odds / (1.0 + adjusted_odds)
+
+
+def _safe_predict_proba_positive(ml_model, X_scaled: np.ndarray) -> np.ndarray:
+    """
+    Return P(class=1) robustly, including for degenerate/dummy models.
+    """
+    if not hasattr(ml_model, "predict_proba"):
+        pred = ml_model.predict(X_scaled)
+        return np.asarray(pred, dtype=float)
+
+    proba = ml_model.predict_proba(X_scaled)
+
+    if proba.ndim == 1:
+        return proba.astype(float)
+
+    if proba.shape[1] == 1:
+        classes = getattr(ml_model, "classes_", np.array([0]))
+        only_class = int(classes[0]) if len(classes) > 0 else 0
+        if only_class == 1:
+            return proba[:, 0].astype(float)
+        return np.zeros(proba.shape[0], dtype=float)
+
+    classes = getattr(ml_model, "classes_", np.array([0, 1]))
+    if 1 in classes:
+        pos_idx = int(np.where(classes == 1)[0][0])
+    else:
+        pos_idx = 1
+
+    return proba[:, pos_idx].astype(float)
+
+
+def _predict_feature_table(
+    model_dict: dict,
+    feature_table: pd.DataFrame,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Apply the exact saved preprocessing chain:
+
+        raw feature table
+        -> column alignment
+        -> imputer
+        -> feature selector
+        -> scaler
+        -> model probabilities
+        -> prior-probability correction
+        -> binary threshold
+
+    This function is used for both:
+      1. internal holdout evaluation during training
+      2. challenge inference in run_model()
+    """
+    if model_dict.get("fallback", False):
+        patient_ids = (
+            feature_table["patient_id"].values
+            if "patient_id" in feature_table.columns
+            else np.arange(len(feature_table))
+        )
+        return pd.DataFrame({
+            "patient_id": patient_ids,
+            "prediction": np.zeros(len(feature_table), dtype=int),
+            "probability": np.full(len(feature_table), 0.10, dtype=float),
+        })
+
+    ml_model = model_dict["model"]
+    scaler = model_dict["scaler"]
+    imputer = model_dict["imputer"]
+    feature_selector = model_dict.get("feature_selector")
+    feature_names = model_dict["feature_names"]
+    selected_features = model_dict.get("selected_features", feature_names)
+
+    df = feature_table.copy()
+
+    patient_ids = (
+        df["patient_id"].values
+        if "patient_id" in df.columns
+        else np.arange(len(df))
+    )
+
+    # Ensure all expected training features exist.
+    missing_features = [f for f in feature_names if f not in df.columns]
+    if missing_features and verbose:
+        print(
+            f"  ! Missing features at prediction: "
+            f"{len(missing_features)}/{len(feature_names)}"
+        )
+
+    for f in missing_features:
+        df[f] = np.nan
+
+    # Match training feature order exactly.
+    X = df[feature_names].values.astype(np.float32)
+
+    # Saved preprocessing.
+    X_imp = imputer.transform(X).astype(np.float32)
+
+    if feature_selector is not None:
+        try:
+            X_sel = feature_selector.transform(X_imp)
+        except Exception:
+            sel_idx = [
+                feature_names.index(f)
+                for f in selected_features
+                if f in feature_names
+            ]
+            X_sel = X_imp[:, sel_idx]
+    else:
+        X_sel = X_imp
+
+    X_scaled = scaler.transform(X_sel).astype(np.float32)
+
+    # Raw model probability.
+    raw_probabilities = _safe_predict_proba_positive(ml_model, X_scaled)
+
+    # Prior correction using training metadata if available.
+    config = model_dict.get("training_config", {})
+    train_prev = config.get("training_prevalence", None)
+    target_prev = config.get("expected_test_prevalence", None)
+    threshold = float(config.get("decision_threshold", 0.5))
+
+    if train_prev is not None and target_prev is not None:
+        probabilities = _prior_probability_shift(
+            raw_probabilities,
+            train_prevalence=float(train_prev),
+            target_prevalence=float(target_prev),
+        )
+    else:
+        probabilities = raw_probabilities
+
+    probabilities = np.clip(probabilities, 0.0, 1.0)
+    predictions = (probabilities >= threshold).astype(int)
+
+    return pd.DataFrame({
+        "patient_id": patient_ids,
+        "prediction": predictions.astype(int),
+        "probability": probabilities.astype(float),
+    })
 
 # ---------------------------------------------------------------------------
 # 1.  TRAIN MODEL  (called by the challenge's train_model.py)
@@ -229,49 +397,157 @@ def train_model(data_folder, model_folder, verbose):
         return
 
     # --- 3. Train the ML model ---------------------------------------------
+    from sklearn.model_selection import train_test_split
+    from classification.train_model import train_model as classification_train_model
+
     logger.info(
         f"Training model on {len(patient_level)} patients, "
         f"{len(patient_level.columns)} features..."
     )
 
-    from classification.train_model import train_multiple_models
-
-    model_types = ["xgboost", "lightgbm", "random_forest", "ensemble"]
-
-    all_results = train_multiple_models(
-        feature_table=patient_level,
-        model_types=model_types,
-        handle_imbalance="class_weight",
-        feature_selection=True,
-        tune=True,
-        n_tune_trials=100,
-        output_dir=config.MODEL_DIR,
-        logger=logger if verbose else None,
+    # --- 3a. Reserve a 20% held-out internal validation set ---
+    # This gives us ONE truly unbiased AUROC estimate that has never
+    # been seen by feature selection, hyperparameters, or model fitting.
+    target_col = next(
+        (c for c in ["target", config.TARGET_COLUMN, "Cognitive_Impairment"]
+        if c in patient_level.columns), None
     )
-
-    # Select the best model by CV AUROC
-    best_model_type = None
-    best_auroc = -1.0
-    for model_type, result in all_results.items():
-        if isinstance(result, dict) and "cv_results" in result:
-            auroc = result["cv_results"].get("auroc_mean", 0)
-            if auroc > best_auroc:
-                best_auroc = auroc
-                best_model_type = model_type
-
-    if best_model_type is None or best_model_type not in all_results:
-        logger.error("No model trained successfully. Saving fallback model.")
+    if target_col is None:
+        logger.error("No target column. Saving fallback.")
         _save_fallback_model(model_folder)
         return
 
-    model_result = all_results[best_model_type]
+    valid_mask = patient_level[target_col].notna()
+    patient_level_valid = patient_level.loc[valid_mask].reset_index(drop=True)
 
-    logger.info(f"Best model: {best_model_type} (CV AUROC={best_auroc:.4f})")
+    train_df, holdout_df = train_test_split(
+        patient_level_valid,
+        test_size=0.20,
+        stratify=patient_level_valid[target_col].astype(int),
+        random_state=config.RANDOM_SEED,
+    )
+    logger.info(
+        f"Internal split: train={len(train_df)} (prev={train_df[target_col].mean():.3f}), "
+        f"holdout={len(holdout_df)} (prev={holdout_df[target_col].mean():.3f})"
+    )
+
+    # --- 3b. Train (CV runs inside, all preprocessing inside pipeline) ---
+    model_result = classification_train_model(
+        feature_table=train_df,
+        output_dir=config.MODEL_DIR,
+        expected_test_prevalence=0.10,
+        logger=logger if verbose else None,
+    )
+
+
+    if not model_result:
+        logger.error("Training failed. Saving fallback.")
+        _save_fallback_model(model_folder)
+        return
+
+        # --- 3c. Honest evaluation on the untouched 20% holdout ---
+    # Important:
+    # Use the exact same preprocessing + probability correction as inference.
+    # Do NOT call model.predict_proba() directly on raw holdout features.
+    from sklearn.metrics import (
+        roc_auc_score,
+        average_precision_score,
+        accuracy_score,
+        f1_score,
+        balanced_accuracy_score,
+    )
+
+    y_hold = holdout_df[target_col].astype(int).values
+
+    if len(np.unique(y_hold)) == 2:
+        holdout_pred_df = _predict_feature_table(
+            model_dict=model_result,
+            feature_table=holdout_df,
+            verbose=verbose,
+        )
+
+        proba_hold = holdout_pred_df["probability"].values.astype(float)
+        binary_hold = holdout_pred_df["prediction"].values.astype(int)
+
+        holdout_auroc = roc_auc_score(y_hold, proba_hold)
+        holdout_auprc = average_precision_score(y_hold, proba_hold)
+        holdout_accuracy = accuracy_score(y_hold, binary_hold)
+        holdout_f1 = f1_score(y_hold, binary_hold, zero_division=0)
+        holdout_bal_acc = balanced_accuracy_score(y_hold, binary_hold)
+
+        cv_auroc = model_result.get("cv_results", {}).get("auroc_mean", np.nan)
+        gap = (
+            float(cv_auroc) - float(holdout_auroc)
+            if np.isfinite(cv_auroc)
+            else np.nan
+        )
+
+        logger.info("=" * 60)
+        logger.info("HONEST HOLDOUT EVALUATION (20% never-seen)")
+        logger.info(f"  CV AUROC:       {cv_auroc:.4f}" if np.isfinite(cv_auroc) else "  CV AUROC:       N/A")
+        logger.info(f"  Holdout AUROC:  {holdout_auroc:.4f}")
+        logger.info(f"  Holdout AUPRC:  {holdout_auprc:.4f}")
+        logger.info(f"  Holdout Acc:    {holdout_accuracy:.4f}")
+        logger.info(f"  Holdout F1:     {holdout_f1:.4f}")
+        logger.info(f"  Holdout BalAcc: {holdout_bal_acc:.4f}")
+
+        if np.isfinite(gap):
+            logger.info(
+                f"  CV-Holdout gap: {gap:+.4f}  "
+                f"{'⚠ overfitting' if gap > 0.05 else '✓ healthy'}"
+            )
+        logger.info("=" * 60)
+
+        model_result.setdefault("cv_results", {}).update({
+            "holdout_auroc": float(holdout_auroc),
+            "holdout_auprc": float(holdout_auprc),
+            "holdout_accuracy": float(holdout_accuracy),
+            "holdout_f1": float(holdout_f1),
+            "holdout_balanced_accuracy": float(holdout_bal_acc),
+            "cv_holdout_gap": float(gap) if np.isfinite(gap) else np.nan,
+        })
+    else:
+        logger.warning(
+            "Holdout evaluation skipped because holdout set contains "
+            "only one class."
+        )
+
+
+    # --- 3d. Optional: refit on 100% of training data for final submission ---
+        # Trade-off: more data vs. having an honest estimate. With ~600 patients,
+    # refitting can still help, while the holdout estimate above remains the
+    # unbiased diagnostic number.
+    logger.info("Refitting final model on 100% of training data...")
+    final_result = classification_train_model(
+        feature_table=patient_level_valid,
+        output_dir=config.MODEL_DIR,
+        expected_test_prevalence=0.10,
+        logger=logger if verbose else None,
+    )
+
+    if final_result:
+        # Preserve honest holdout diagnostics from the pre-refit model.
+        holdout_keys = [
+            "holdout_auroc",
+            "holdout_auprc",
+            "holdout_accuracy",
+            "holdout_f1",
+            "holdout_balanced_accuracy",
+            "cv_holdout_gap",
+        ]
+        final_result.setdefault("cv_results", {}).update({
+            k: model_result.get("cv_results", {}).get(k)
+            for k in holdout_keys
+            if k in model_result.get("cv_results", {})
+        })
+        model_result = final_result
+
 
     # --- 4. Save to model_folder -------------------------------------------
     save_model(model_folder, model_result)
 
     cv = model_result.get("cv_results", {})
+
     logger.info(
         f"Training complete. CV AUROC={cv.get('auroc_mean', 'N/A')}"
     )
@@ -357,7 +633,8 @@ def run_model(model, record, data_folder, verbose):
 
     # ---- Fallback model ---------------------------------------------------
     if model.get("fallback", False):
-        return 0, 0.5
+        return 0, 0.10
+
 
     # ---- Patch config in main process (once) ------------------------------
     import tempfile
@@ -376,7 +653,7 @@ def run_model(model, record, data_folder, verbose):
         if verbose:
             print(f"  ! Patient dir not found: {patient_dir}")
         _cleanup_dir(tmp_main)
-        return 0, 0.5
+        return 0, 0.1
 
     # ---- Per-patient temp dir for the worker ------------------------------
     tmp_worker_dir = tempfile.mkdtemp(prefix=f"physionet_run_worker_")
@@ -415,7 +692,7 @@ def run_model(model, record, data_folder, verbose):
         if result is None or not result.get("success"):
             if verbose:
                 print(f"  ! Pipeline unsuccessful for {pipeline_patient_id}")
-            return 0, 0.5
+            return 0, 0.1
 
         # ---- Load patient-level features ----------------------------------
         pat_path = result.get("pat_features_path")
@@ -443,10 +720,10 @@ def run_model(model, record, data_folder, verbose):
         else:
             if verbose:
                 print(f"  ! No features on disk for {pipeline_patient_id}")
-            return 0, 0.5
-
+            return 0, 0.1
+        
         if patient_features is None or len(patient_features) == 0:
-            return 0, 0.5
+            return 0, 0.1
 
         # ---- Predict ------------------------------------------------------
         return _predict_single_patient(model, patient_features, verbose)
@@ -456,7 +733,7 @@ def run_model(model, record, data_folder, verbose):
             print(f"  !!! run_model error for {pipeline_patient_id}: "
                   f"{type(e).__name__}: {e}")
             traceback.print_exc()
-        return 0, 0.5
+        return 0, 0.1
 
     finally:
         gc.collect()
@@ -478,44 +755,29 @@ def _predict_single_patient(
     verbose: bool
 ) -> Tuple[int, float]:
     """
-    Apply imputer → feature selector → scaler → model.predict on one patient.
+    Predict one patient using the same preprocessing and prior correction
+    used for holdout evaluation.
     """
-    ml_model = model_dict["model"]
-    scaler = model_dict["scaler"]
-    imputer = model_dict["imputer"]
-    feature_selector = model_dict.get("feature_selector")
-    feature_names = model_dict["feature_names"]
-    selected_features = model_dict["selected_features"]
+    pred_df = _predict_feature_table(
+        model_dict=model_dict,
+        feature_table=patient_features,
+        verbose=verbose,
+    )
 
-    # Ensure all expected features exist (fill missing with NaN)
-    for f in feature_names:
-        if f not in patient_features.columns:
-            patient_features[f] = np.nan
+    if pred_df is None or len(pred_df) == 0:
+        return 0, 0.10
 
-    X = patient_features[feature_names].values.astype(np.float32)
+    binary_output = int(pred_df["prediction"].iloc[0])
+    probability_output = float(pred_df["probability"].iloc[0])
 
-    # Impute
-    X_imp = imputer.transform(X)
+    if not np.isfinite(probability_output):
+        probability_output = 0.10
+        binary_output = 0
 
-    # Feature selection
-    if feature_selector is not None:
-        try:
-            X_sel = feature_selector.transform(X_imp)
-        except Exception:
-            sel_idx = [feature_names.index(f) for f in selected_features
-                       if f in feature_names]
-            X_sel = X_imp[:, sel_idx]
-    else:
-        X_sel = X_imp
-
-    # Scale
-    X_scaled = scaler.transform(X_sel)
-
-    # Predict
-    binary_output = int(ml_model.predict(X_scaled)[0])
-    probability_output = float(ml_model.predict_proba(X_scaled)[0][1])
+    probability_output = float(np.clip(probability_output, 0.0, 1.0))
 
     return binary_output, probability_output
+
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +797,9 @@ def save_model(model_folder, model_dict):
     keys_to_save = [
         "model", "scaler", "imputer", "feature_selector",
         "feature_names", "selected_features",
-        "training_config", "cv_results",
+        "training_config", "cv_results", "fallback",
     ]
+
     for k in keys_to_save:
         if k in model_dict:
             to_save[k] = model_dict[k]
