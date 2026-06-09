@@ -945,7 +945,7 @@ def build_cohort_feature_table(
         for pid, pf_df in patient_features_tables.items():
             if pf_df is None or len(pf_df) == 0:
                 continue
-            cap_cols = [c for c in pf_df.columns if c.startswith("cap_") or c == "Delta_Power_Entropy"]
+            cap_cols = [c for c in pf_df.columns if c.startswith("cap_") or c.startswith("ORP_") or c == "CSI" or c == "Delta_Power_Entropy"]
             if cap_cols:
                 row = {"patient_id": pid}
                 for col in cap_cols:
@@ -955,7 +955,7 @@ def build_cohort_feature_table(
             cap_delta_df = pd.DataFrame(cap_delta_rows)
             patient_level = patient_level.merge(cap_delta_df, on="patient_id", how="left")
             if logger:
-                merged_cap_cols = [c for c in patient_level.columns if c.startswith("cap_") or c == "Delta_Power_Entropy"]
+                merged_cap_cols = [c for c in patient_level.columns if c.startswith("cap_") or c.startswith("ORP_") or c == "CSI" or c == "Delta_Power_Entropy"]
                 logger.info(f"CAP + Delta features gemerged: {len(merged_cap_cols)} Spalten")
     
     if logger:
