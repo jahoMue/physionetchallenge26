@@ -343,6 +343,8 @@ def _map_annotation_to_stage(annotation: str) -> Optional[str]:
     str or None
         "W", "N1", "N2", "N3", "REM", oder None wenn kein Stadium erkannt.
     """
+    ann = str(annotation).lower().strip().replace(" ", "").replace("_", "").replace("-", "")
+
     # Explicitly ignore unknown/unavailable/not-scored labels.
     if ann in {
         "", "unknown", "unavailable", "notavailable", "notscored",
@@ -352,12 +354,11 @@ def _map_annotation_to_stage(annotation: str) -> Optional[str]:
     }:
         return None
 
-    
-    # First try numeric encoding (handles cases where numeric values
-    # are passed as strings)
+    # First try numeric encoding.
     numeric_result = _map_numeric_to_stage(ann)
     if numeric_result is not None:
         return numeric_result
+
     
     # Direkte Mappings
     direct_map = {

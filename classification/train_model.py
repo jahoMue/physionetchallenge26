@@ -140,6 +140,144 @@ def _prior_probability_shift(
 
     return adjusted_odds / (1.0 + adjusted_odds)
 
+AGE_COLUMN_CANDIDATES = ["Age", "age", "demo_age"]
+
+
+def _official_age_prevalence_from_arrays(
+    age,
+    reference_ages: np.ndarray,
+    reference_labels: np.ndarray,
+    fallback: Optional[float] = None,
+    gap: float = 2.0,
+) -> Optional[float]:
+    """
+    Official-style age-specific prevalence:
+
+        labels within abs(age - reference_age) <= gap
+        prevalence = max(sum(labels), 0.5) / n
+    """
+    try:
+        age = float(age)
+    except Exception:
+        return fallback
+
+    if not np.isfinite(age):
+        return fallback
+
+    reference_ages = np.asarray(reference_ages, dtype=float)
+    reference_labels = np.asarray(reference_labels, dtype=float)
+
+    if (
+        len(reference_ages) == 0
+        or len(reference_labels) == 0
+        or len(reference_ages) != len(reference_labels)
+    ):
+        return fallback
+
+    mask = np.isfinite(reference_ages) & (np.abs(reference_ages - age) <= gap)
+    n = int(mask.sum())
+
+    if n == 0:
+        return fallback
+
+    positives = float(np.nansum(reference_labels[mask]))
+    prevalence = max(positives, 0.5) / n
+
+    return float(np.clip(prevalence, 1e-6, 1.0 - 1e-6))
+
+
+def _age_prior_shift_and_thresholds_for_reward(
+    raw_probabilities: np.ndarray,
+    eval_ages: np.ndarray,
+    reference_ages: np.ndarray,
+    reference_labels: np.ndarray,
+    train_prevalence: float,
+    fallback_prevalence: Optional[float],
+    gap: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply row-wise prior correction to age-specific prevalence and return
+    official-reward decision thresholds.
+    """
+    raw_probabilities = np.asarray(raw_probabilities, dtype=float)
+    eval_ages = np.asarray(eval_ages, dtype=float)
+
+    probabilities = raw_probabilities.copy()
+    thresholds = np.full(len(raw_probabilities), 0.5, dtype=float)
+
+    for i in range(len(raw_probabilities)):
+        age_i = eval_ages[i] if i < len(eval_ages) else np.nan
+
+        p_age = _official_age_prevalence_from_arrays(
+            age=age_i,
+            reference_ages=reference_ages,
+            reference_labels=reference_labels,
+            fallback=fallback_prevalence,
+            gap=gap,
+        )
+
+        if p_age is None:
+            p_age = 0.5
+
+        p_age = float(np.clip(p_age, 1e-6, 1.0 - 1e-6))
+        thresholds[i] = p_age
+
+        probabilities[i] = _prior_probability_shift(
+            np.asarray([raw_probabilities[i]], dtype=float),
+            train_prevalence=float(train_prevalence),
+            target_prevalence=p_age,
+        )[0]
+
+    return probabilities, thresholds
+
+
+def _official_style_reward_from_prevalence_thresholds(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    prevalence_thresholds: np.ndarray,
+) -> float:
+    """
+    Compute official-style reward given y, binary predictions, and the
+    age-specific prevalence values used as thresholds.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    prevalence_thresholds = np.asarray(prevalence_thresholds, dtype=float)
+
+    rewards = []
+
+    for i in range(len(y_true)):
+        p = prevalence_thresholds[i] if i < len(prevalence_thresholds) else np.nan
+
+        if not np.isfinite(p):
+            continue
+
+        p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+
+        if y_true[i] == 1 and y_pred[i] == 1:
+            reward = 1.0 / p - 1.0
+        elif y_true[i] == 0 and y_pred[i] == 0:
+            reward = 1.0 / (1.0 - p) - 1.0
+        else:
+            reward = -1.0
+
+        rewards.append(reward)
+
+    if len(rewards) == 0:
+        return np.nan
+
+    return float(np.mean(rewards))
+
+
+def _extract_age_values_from_prepared_df(df: pd.DataFrame) -> np.ndarray:
+    """
+    Extract age values aligned to the prepared training dataframe.
+    """
+    for col in AGE_COLUMN_CANDIDATES:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+
+    return np.full(len(df), np.nan, dtype=float)
 
 def _fit_preprocessor(
     X_train: np.ndarray,
@@ -247,17 +385,35 @@ def train_model(
     model_type: str = "ensemble",
     feature_selection: bool = True,
     handle_imbalance: str = "class_weight",
-    expected_test_prevalence: float = 0.10,
+    expected_test_prevalence: Optional[float] = None,
     n_features_select: Optional[int] = None,
     output_dir: Path = MODEL_DIR,
     logger=None
 ) -> Dict:
+    """
+    Train a patient-level cognitive impairment model.
+
+    Changes versus the previous version:
+      - removes the duplicated obsolete training block that referenced X_scaled;
+      - keeps leakage-safe CV;
+      - treats expected_test_prevalence as optional;
+      - if provided, uses it only for probability prior correction, not as a
+        class-weight target;
+      - returns a complete model dictionary compatible with team_code.py.
+    """
     if logger:
         logger.info("=" * 60)
         logger.info("MODELL-TRAINING")
         logger.info(f"Modelltyp: {model_type}")
         logger.info(f"Feature Selection: {feature_selection}")
         logger.info(f"Imbalance-Handling: {handle_imbalance}")
+        if expected_test_prevalence is not None:
+            logger.info(
+                f"Expected/test prevalence for calibration: "
+                f"{expected_test_prevalence:.4f}"
+            )
+        else:
+            logger.info("Expected/test prevalence for calibration: None")
         logger.info("=" * 60)
 
     X, y, feature_names, preparation_info = prepare_training_data(
@@ -269,23 +425,35 @@ def train_model(
             logger.error("Datenaufbereitung fehlgeschlagen!")
         return {}
 
-    if logger:
-        logger.info(f"Trainingsdaten: {X.shape[0]} Patienten, "
-                     f"{X.shape[1]} Features")
-        logger.info(f"Target-Verteilung: {dict(zip(*np.unique(y, return_counts=True)))}")
+    unique_classes = np.unique(y)
+    if len(unique_classes) < 2:
+        if logger:
+            logger.error(
+                f"Training requires two classes, found only: {unique_classes}"
+            )
+        return {}
 
     train_prevalence = float(np.mean(y))
 
     if logger:
-        logger.info(f"Trainingsdaten: {X.shape[0]} Patienten, {X.shape[1]} Features")
-        logger.info(f"Target-Verteilung: {dict(zip(*np.unique(y, return_counts=True)))}")
-        logger.info(f"Trainingsprävalenz: {train_prevalence:.3f}")
-        logger.info(f"Erwartete Testprävalenz: {expected_test_prevalence:.3f}")
+        logger.info(
+            f"Trainingsdaten: {X.shape[0]} Patienten, {X.shape[1]} Features"
+        )
+        logger.info(
+            f"Target-Verteilung: "
+            f"{dict(zip(*np.unique(y, return_counts=True)))}"
+        )
+        logger.info(f"Trainingsprävalenz: {train_prevalence:.4f}")
 
     # ------------------------------------------------------------------
     # Leakage-safe CV:
     # imputer, selector, and scaler are fit separately inside each fold.
     # ------------------------------------------------------------------
+    age_values = np.asarray(
+        preparation_info.get("age_values", [np.nan] * len(y)),
+        dtype=float,
+    )
+
     cv_results = _cross_validate_model_leakage_free(
         model_type=model_type,
         X=X,
@@ -295,19 +463,23 @@ def train_model(
         handle_imbalance=handle_imbalance,
         expected_test_prevalence=expected_test_prevalence,
         n_features_select=n_features_select,
+        ages=age_values,
         logger=logger,
     )
 
+
     # ------------------------------------------------------------------
-    # Final preprocessing on all available training patients
+    # Final preprocessing on all available training patients.
     # ------------------------------------------------------------------
-    X_processed, imputer, feature_selector, scaler, selected_features = _fit_preprocessor(
-        X_train=X,
-        y_train=y,
-        feature_names=feature_names,
-        feature_selection=feature_selection,
-        n_features_select=n_features_select,
-        logger=logger,
+    X_processed, imputer, feature_selector, scaler, selected_features = (
+        _fit_preprocessor(
+            X_train=X,
+            y_train=y,
+            feature_names=feature_names,
+            feature_selection=feature_selection,
+            n_features_select=n_features_select,
+            logger=logger,
+        )
     )
 
     if logger:
@@ -315,7 +487,7 @@ def train_model(
 
     # Important:
     # Do not use expected_test_prevalence as class weight.
-    # Use it only later for probability prior correction.
+    # Class weights are based on observed training imbalance only.
     model = _create_model(
         model_type=model_type,
         handle_imbalance=handle_imbalance,
@@ -325,15 +497,34 @@ def train_model(
         expected_test_prevalence=None,
     )
 
+    # Optional resampling on final processed training data.
     if handle_imbalance == "smote":
-        smote = SMOTE(random_state=RANDOM_SEED)
-        X_resampled, y_resampled = smote.fit_resample(X_processed, y)
+        try:
+            smote = SMOTE(random_state=RANDOM_SEED)
+            X_resampled, y_resampled = smote.fit_resample(X_processed, y)
+        except Exception as e:
+            if logger:
+                logger.warning(f"SMOTE failed, using original data: {e}")
+            X_resampled, y_resampled = X_processed, y
+
     elif handle_imbalance == "adasyn":
-        adasyn = ADASYN(random_state=RANDOM_SEED)
-        X_resampled, y_resampled = adasyn.fit_resample(X_processed, y)
+        try:
+            adasyn = ADASYN(random_state=RANDOM_SEED)
+            X_resampled, y_resampled = adasyn.fit_resample(X_processed, y)
+        except Exception as e:
+            if logger:
+                logger.warning(f"ADASYN failed, using original data: {e}")
+            X_resampled, y_resampled = X_processed, y
+
     elif handle_imbalance == "smote_tomek":
-        smt = SMOTETomek(random_state=RANDOM_SEED)
-        X_resampled, y_resampled = smt.fit_resample(X_processed, y)
+        try:
+            smt = SMOTETomek(random_state=RANDOM_SEED)
+            X_resampled, y_resampled = smt.fit_resample(X_processed, y)
+        except Exception as e:
+            if logger:
+                logger.warning(f"SMOTETomek failed, using original data: {e}")
+            X_resampled, y_resampled = X_processed, y
+
     else:
         X_resampled, y_resampled = X_processed, y
 
@@ -342,42 +533,10 @@ def train_model(
     if logger:
         logger.info("Finales Modell auf allen Daten trainiert.")
 
-
-    if logger:
-        logger.info(f"Features nach Selection: {len(selected_features)}")
-
-    model = _create_model(
-        model_type=model_type,
-        handle_imbalance=handle_imbalance,
-        n_features=X_scaled.shape[1],
-        y=y,
-        logger=logger,
-        expected_test_prevalence=expected_test_prevalence
-    )
-
-    cv_results = _cross_validate_model(
-        model, X_scaled, y, handle_imbalance, logger, expected_test_prevalence
-    )
-
-    if handle_imbalance == "smote":
-        smote = SMOTE(random_state=RANDOM_SEED)
-        X_resampled, y_resampled = smote.fit_resample(X_scaled, y)
-    elif handle_imbalance == "adasyn":
-        adasyn = ADASYN(random_state=RANDOM_SEED)
-        X_resampled, y_resampled = adasyn.fit_resample(X_scaled, y)
-    elif handle_imbalance == "smote_tomek":
-        smt = SMOTETomek(random_state=RANDOM_SEED)
-        X_resampled, y_resampled = smt.fit_resample(X_scaled, y)
-    else:
-        X_resampled, y_resampled = X_scaled, y
-
-    model.fit(X_resampled, y_resampled)
-
-    if logger:
-        logger.info("Finales Modell auf allen Daten trainiert.")
-
     feature_importance = _get_feature_importance(
-        model, selected_features, logger
+        model,
+        selected_features,
+        logger,
     )
 
     training_config = {
@@ -386,17 +545,30 @@ def train_model(
         "handle_imbalance": handle_imbalance,
         "n_features_original": len(feature_names),
         "n_features_selected": len(selected_features),
-        "n_patients": X.shape[0],
-        "target_distribution": dict(zip(*np.unique(y, return_counts=True))),
-        "training_prevalence": train_prevalence,
-        "expected_test_prevalence": expected_test_prevalence,
-        "probability_prior_adjustment": True,
+        "n_patients": int(X.shape[0]),
+        "target_distribution": {
+            str(k): int(v) for k, v in zip(*np.unique(y, return_counts=True))
+        },
+        "training_prevalence": float(train_prevalence),
+        "expected_test_prevalence": (
+            float(expected_test_prevalence)
+            if expected_test_prevalence is not None
+            else None
+        ),
+        "expected_test_prevalence_source": (
+            "provided_by_team_code"
+            if expected_test_prevalence is not None
+            else "none"
+        ),
+        "probability_prior_adjustment": expected_test_prevalence is not None,
         "decision_threshold": 0.5,
         "cv_folds": CV_FOLDS,
         "random_seed": RANDOM_SEED,
         "timestamp": datetime.now().isoformat(),
-    }
+        "primary_cv_metric": "reward_mean",
+        "secondary_cv_metric": "auroc_mean",
 
+    }
 
     result = {
         "model": model,
@@ -414,6 +586,7 @@ def train_model(
     _save_model(result, output_dir, model_type, logger)
 
     return result
+
 
 
 # ==============================================================================
@@ -447,6 +620,17 @@ def prepare_training_data(
 
     df = df.dropna(subset=[target_col])
     y = df[target_col].values.astype(int)
+    age_values = _extract_age_values_from_prepared_df(df)
+    info["age_values"] = [
+        float(x) if np.isfinite(x) else np.nan
+        for x in age_values
+    ]
+    age_values = _extract_age_values_from_prepared_df(df)
+    info["age_values"] = [
+        float(x) if np.isfinite(x) else np.nan
+        for x in age_values
+    ]
+
     info["n_patients_with_target"] = len(df)
     info["removed_patients"] = info["n_patients_original"] - len(df)
 
@@ -905,8 +1089,10 @@ def _cross_validate_model_leakage_free(
     handle_imbalance: str,
     expected_test_prevalence: Optional[float] = 0.10,
     n_features_select: Optional[int] = None,
+    ages: Optional[np.ndarray] = None,
     logger=None,
 ) -> Dict:
+
     """
     Cross-validation without preprocessing leakage.
 
@@ -917,36 +1103,27 @@ def _cross_validate_model_leakage_free(
       4. Train model on processed training fold.
       5. Evaluate on processed validation fold.
     """
-    if expected_test_prevalence is not None:
-        cv = PrevalenceAdjustedKFold(
-            n_splits=CV_FOLDS,
-            expected_prevalence=expected_test_prevalence,
-            random_state=RANDOM_SEED,
-        )
-        if logger:
-            logger.info(
-                f"Leakage-safe CV: {CV_FOLDS}-Fold, "
-                f"validation prevalence adjusted to "
-                f"{expected_test_prevalence * 100:.1f}%"
-            )
-    else:
-        cv = StratifiedKFold(
-            n_splits=CV_FOLDS,
-            shuffle=True,
-            random_state=RANDOM_SEED,
-        )
-        if logger:
-            logger.info(f"Leakage-safe CV: {CV_FOLDS}-Fold Stratified")
+    cv = StratifiedKFold(
+        n_splits=CV_FOLDS,
+        shuffle=True,
+        random_state=RANDOM_SEED,
+    )
+    if logger:
+        logger.info(f"Leakage-safe CV: {CV_FOLDS}-Fold Stratified")
+
 
     metrics = {
+        "reward": [],
         "auroc": [],
         "average_precision": [],
         "f1": [],
         "balanced_accuracy": [],
         "accuracy": [],
+        "reward_train": [],
         "auroc_train": [],
         "f1_train": [],
     }
+
 
     for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
         X_train_raw, X_val_raw = X[train_idx], X[val_idx]
@@ -1016,21 +1193,57 @@ def _cross_validate_model_leakage_free(
             p_val_raw = fold_model.predict_proba(X_val)[:, 1]
             p_train_raw = fold_model.predict_proba(X_train)[:, 1]
 
-            # Prior-adjusted probabilities for expected deployment prevalence.
             train_prev = float(np.mean(y_train))
-            p_val = _prior_probability_shift(
-                p_val_raw,
-                train_prevalence=train_prev,
-                target_prevalence=expected_test_prevalence,
-            )
-            p_train = _prior_probability_shift(
-                p_train_raw,
-                train_prevalence=train_prev,
-                target_prevalence=expected_test_prevalence,
-            )
 
-            y_val_pred = (p_val >= 0.5).astype(int)
-            y_train_pred = (p_train >= 0.5).astype(int)
+            # Reward-aware prior correction and thresholds.
+            if ages is not None and len(ages) == len(y):
+                ages_train = np.asarray(ages[train_idx], dtype=float)
+                ages_val = np.asarray(ages[val_idx], dtype=float)
+
+                p_val, thresholds_val = _age_prior_shift_and_thresholds_for_reward(
+                    raw_probabilities=p_val_raw,
+                    eval_ages=ages_val,
+                    reference_ages=ages_train,
+                    reference_labels=y_train,
+                    train_prevalence=train_prev,
+                    fallback_prevalence=expected_test_prevalence,
+                    gap=2.0,
+                )
+
+                p_train, thresholds_train = _age_prior_shift_and_thresholds_for_reward(
+                    raw_probabilities=p_train_raw,
+                    eval_ages=ages_train,
+                    reference_ages=ages_train,
+                    reference_labels=y_train,
+                    train_prevalence=train_prev,
+                    fallback_prevalence=expected_test_prevalence,
+                    gap=2.0,
+                )
+
+            else:
+                p_val = _prior_probability_shift(
+                    p_val_raw,
+                    train_prevalence=train_prev,
+                    target_prevalence=expected_test_prevalence,
+                )
+                p_train = _prior_probability_shift(
+                    p_train_raw,
+                    train_prevalence=train_prev,
+                    target_prevalence=expected_test_prevalence,
+                )
+
+                threshold = (
+                    float(expected_test_prevalence)
+                    if expected_test_prevalence is not None
+                    else 0.5
+                )
+
+                thresholds_val = np.full(len(p_val), threshold, dtype=float)
+                thresholds_train = np.full(len(p_train), threshold, dtype=float)
+
+            y_val_pred = (p_val >= thresholds_val).astype(int)
+            y_train_pred = (p_train >= thresholds_train).astype(int)
+
 
             metrics["auroc"].append(roc_auc_score(y_val, p_val))
             metrics["average_precision"].append(average_precision_score(y_val, p_val))
@@ -1040,19 +1253,35 @@ def _cross_validate_model_leakage_free(
             )
             metrics["accuracy"].append(accuracy_score(y_val, y_val_pred))
 
+            metrics["reward"].append(
+                _official_style_reward_from_prevalence_thresholds(
+                    y_true=y_val,
+                    y_pred=y_val_pred,
+                    prevalence_thresholds=thresholds_val,
+                )
+            )
+
             metrics["auroc_train"].append(roc_auc_score(y_train, p_train))
             metrics["f1_train"].append(
                 f1_score(y_train, y_train_pred, zero_division=0)
             )
+            metrics["reward_train"].append(
+                _official_style_reward_from_prevalence_thresholds(
+                    y_true=y_train,
+                    y_pred=y_train_pred,
+                    prevalence_thresholds=thresholds_train,
+                )
+            )
 
-            if logger:
-                logger.info(
+            logger.info(
                     f"Fold {fold_idx + 1}/{CV_FOLDS}: "
+                    f"Reward={metrics['reward'][-1]:.4f}, "
                     f"AUROC={metrics['auroc'][-1]:.4f}, "
                     f"AUPRC={metrics['average_precision'][-1]:.4f}, "
                     f"F1={metrics['f1'][-1]:.4f}, "
                     f"features={len(selected_features)}"
                 )
+
 
         except Exception as e:
             if logger:
@@ -1074,6 +1303,20 @@ def _cross_validate_model_leakage_free(
     if "auroc_mean" in cv_results and "auroc_train_mean" in cv_results:
         gap = cv_results["auroc_train_mean"] - cv_results["auroc_mean"]
         cv_results["overfit_gap_auroc"] = float(gap)
+
+    if "reward_mean" in cv_results and "reward_train_mean" in cv_results:
+        reward_gap = cv_results["reward_train_mean"] - cv_results["reward_mean"]
+        cv_results["overfit_gap_reward"] = float(reward_gap)
+
+        if logger:
+            if reward_gap > 0.15:
+                logger.warning(
+                    f"Possible reward overfitting: "
+                    f"train reward - val reward = {reward_gap:.4f}"
+                )
+            else:
+                logger.info(f"Overfitting gap reward: {reward_gap:.4f}")
+
 
         if logger:
             if gap > 0.15:
@@ -1754,7 +1997,7 @@ def train_multiple_models(
     model_types: Optional[List[str]] = None,
     handle_imbalance: str = "class_weight",
     feature_selection: bool = True,
-    expected_test_prevalence: float = 0.10,
+    expected_test_prevalence: Optional[float] = None,
     tune: bool = True,
     n_tune_trials: int = 100,
     output_dir: Path = MODEL_DIR,
@@ -1837,6 +2080,8 @@ def _log_model_comparison(results: Dict[str, Dict], logger):
 
         row = {
             "model": model_type,
+            "reward": cv.get("reward_mean", np.nan),
+            "reward_std": cv.get("reward_std", np.nan),
             "auroc": cv.get("auroc_mean", np.nan),
             "auroc_std": cv.get("auroc_std", np.nan),
             "f1": cv.get("f1_mean", np.nan),
@@ -1845,15 +2090,28 @@ def _log_model_comparison(results: Dict[str, Dict], logger):
             "bal_acc_std": cv.get("balanced_accuracy_std", np.nan),
             "avg_prec": cv.get("average_precision_mean", np.nan),
             "overfit_gap": cv.get("overfit_gap_auroc", np.nan),
+            "overfit_gap_reward": cv.get("overfit_gap_reward", np.nan),
             "n_features": len(result.get("selected_features", [])),
         }
+
         comparison_rows.append(row)
 
     if not comparison_rows:
         logger.warning("Keine Modelle zum Vergleichen vorhanden.")
         return
 
-    comparison_rows.sort(key=lambda x: x.get("auroc", 0), reverse=True)
+    comparison_rows.sort(
+        key=lambda x: (
+            x.get("reward", -np.inf)
+            if not np.isnan(x.get("reward", np.nan))
+            else -np.inf,
+            x.get("auroc", -np.inf)
+            if not np.isnan(x.get("auroc", np.nan))
+            else -np.inf,
+        ),
+        reverse=True,
+    )
+
 
     logger.info(f"\n{'Modell':<25} {'AUROC':>12} {'F1':>12} "
                 f"{'Bal.Acc':>12} {'Avg.Prec':>12} {'Overfit':>10} {'#Feat':>8}")

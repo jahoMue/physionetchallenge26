@@ -2,81 +2,568 @@
 
 """
 team_code.py
-=============
-Bridge between the PhysioNet Challenge 2026 interface (train_model.py / run_model.py)
-and our custom pipeline (main.py and submodules).
+============
 
-Required functions (signatures MUST NOT change):
+Bridge between the PhysioNet Challenge 2026 interface
+(train_model.py / run_model.py) and our custom pipeline.
+
+Required Challenge functions; signatures MUST NOT change:
     train_model(data_folder, model_folder, verbose)
     load_model(model_folder, verbose)
     run_model(model, record, data_folder, verbose)
+
+Optional helper:
     save_model(model_folder, model_dict)
+
+This version is adapted for the updated official PhysioNet 2026 code base:
+  - train_model.py still calls train_model(data_folder, model_folder, verbose)
+  - run_model.py loads the model once and calls run_model(...) per patient
+  - run_model.py now asserts that the binary output is boolean-like or NaN
+    and that the probability output is numeric
+  - labels are expected in demographics.csv as Cognitive_Impairment, which
+    may have been produced by the official create_labels.py script
 """
 
+import gc
 import os
 import sys
-import gc
 import time
-import traceback
-import numpy as np
-import pandas as pd
-import joblib
 import json
+import shutil
+import tempfile
+import traceback
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
+import joblib
+import numpy as np
+import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
 # ---------------------------------------------------------------------------
-# 0.  HELPER: Monkey-patch config paths BEFORE any pipeline module is imported
+# Constants used without importing helper_code globally.
+# helper_code is safe to import globally, but keeping these literals here makes
+# early path/label handling independent of challenge helper changes.
+# ---------------------------------------------------------------------------
+
+DEMOGRAPHICS_BASENAME = "demographics.csv"
+LABEL_COLUMN = "Cognitive_Impairment"
+TIME_TO_EVENT_COLUMN = "Time_to_Event"
+
+
+# ---------------------------------------------------------------------------
+# 0. Logging
+# ---------------------------------------------------------------------------
+
+class _SimpleLogger:
+    """Fallback logger if loguru is unavailable."""
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+
+    def _print(self, level: str, msg: str):
+        if self.verbose:
+            print(f"{level:<7} | {msg}")
+
+    def info(self, msg: str):
+        self._print("INFO", msg)
+
+    def warning(self, msg: str):
+        self._print("WARNING", msg)
+
+    def error(self, msg: str):
+        self._print("ERROR", msg)
+
+    def debug(self, msg: str):
+        self._print("DEBUG", msg)
+
+
+def _setup_logger(verbose: bool):
+    """
+    Configure loguru when available. Otherwise, use a minimal stdout logger.
+    """
+    try:
+        from loguru import logger
+        logger.remove()
+        if verbose:
+            logger.add(
+                sys.stdout,
+                level="INFO",
+                format="{time:HH:mm:ss} | {level:<7} | {message}",
+            )
+        return logger
+    except Exception:
+        return _SimpleLogger(verbose=verbose)
+
+
+# ---------------------------------------------------------------------------
+# 1. Config patching
 # ---------------------------------------------------------------------------
 
 def _patch_config(data_folder: str, model_folder: str):
     """
-    Override config.py path variables so that every downstream module
-    sees the challenge-provided folders instead of the hardcoded ones.
+    Override config.py path variables so that downstream pipeline modules use
+    the Challenge-provided folders instead of hardcoded local paths.
+
+    This function must run before importing custom pipeline modules that read
+    config.py at import time.
     """
     import config
 
     data_path = Path(data_folder).resolve()
     model_path = Path(model_folder).resolve()
 
-    # Training-set root
+    # Training/test data root.
     config.TRAINING_SET_DIR = data_path
 
-    # Sub-directories that mirror the challenge layout
+    # Challenge subdirectories.
     config.PHYSIOLOGICAL_DATA_DIR = data_path / "physiological_data"
     config.ALGORITHMIC_ANNOTATIONS_DIR = data_path / "algorithmic_annotations"
     config.HUMAN_ANNOTATIONS_DIR = data_path / "human_annotations"
     config.DATA_DIR = config.PHYSIOLOGICAL_DATA_DIR
 
-    # Demographics
-    config.DEMOGRAPHICS_FILE = data_path / "demographics.csv"
+    # Demographics file.
+    config.DEMOGRAPHICS_FILE = data_path / DEMOGRAPHICS_BASENAME
 
-    # Output directories → all go under model_folder so they are persisted
+    # Persist all custom-pipeline outputs in model_folder during training.
+    # During inference, callers pass a temporary folder here.
     config.OUTPUT_DIR = model_path
     config.FEATURE_DIR = model_path / "features"
     config.MODEL_DIR = model_path / "models"
     config.LOG_DIR = model_path / "logs"
     config.PLOT_DIR = model_path / "plots"
 
-    for d in [model_path, config.FEATURE_DIR, config.MODEL_DIR,
-              config.LOG_DIR, config.PLOT_DIR]:
+    for d in [
+        model_path,
+        config.FEATURE_DIR,
+        config.MODEL_DIR,
+        config.LOG_DIR,
+        config.PLOT_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Disable plotting in challenge environment
+    # Disable plotting in the Challenge environment.
     config.PLOT_ENABLED = False
 
+    # Robust defaults if these are absent in config.py.
+    if not hasattr(config, "NUM_WORKERS"):
+        config.NUM_WORKERS = max(1, min(os.cpu_count() or 1, 4))
+    if not hasattr(config, "SEGMENT_LENGTH_SEC"):
+        config.SEGMENT_LENGTH_SEC = 30
+    if not hasattr(config, "SEGMENT_OVERLAP_SEC"):
+        config.SEGMENT_OVERLAP_SEC = 0
+    if not hasattr(config, "RANDOM_SEED"):
+        config.RANDOM_SEED = 56
+    if not hasattr(config, "TARGET_COLUMN"):
+        config.TARGET_COLUMN = LABEL_COLUMN
 
-def _setup_logger(verbose: bool):
+
+# ---------------------------------------------------------------------------
+# 2. Label handling for updated official create_labels.py compatibility
+# ---------------------------------------------------------------------------
+
+def _sanitize_label_value(x):
     """
-    Configure loguru: stdout sink when verbose, otherwise suppress.
+    Convert common boolean/numeric/string label representations to 0/1.
+    Return NaN if the value cannot be interpreted.
     """
-    from loguru import logger
-    logger.remove()  # remove default stderr sink
-    if verbose:
-        logger.add(sys.stdout, level="INFO",
-                    format="{time:HH:mm:ss} | {level:<7} | {message}")
-    return logger
+    if x is None:
+        return np.nan
+
+    try:
+        if pd.isna(x):
+            return np.nan
+    except Exception:
+        pass
+
+    if isinstance(x, (bool, np.bool_)):
+        return int(x)
+
+    if isinstance(x, (int, np.integer)):
+        if int(x) in (0, 1):
+            return int(x)
+
+    if isinstance(x, (float, np.floating)):
+        if np.isfinite(float(x)) and float(x) in (0.0, 1.0):
+            return int(float(x))
+
+    s = str(x).strip().casefold()
+    if s in ("true", "t", "yes", "y", "1", "1.0"):
+        return 1
+    if s in ("false", "f", "no", "n", "0", "0.0"):
+        return 0
+
+    return np.nan
+
+
+def _maybe_create_labelled_demographics(
+    data_folder: str,
+    model_folder: str,
+    logger,
+) -> Path:
+    """
+    Use data_folder/demographics.csv if it already contains Cognitive_Impairment.
+
+    If labels are missing but an ICD file is available, try to call the official
+    create_labels.py function and store the labelled demographics inside
+    model_folder. This is optional robustness; official training data should
+    already include the labels.
+    """
+    demographics_path = Path(data_folder) / DEMOGRAPHICS_BASENAME
+
+    if not demographics_path.exists():
+        raise FileNotFoundError(f"Missing demographics file: {demographics_path}")
+
+    try:
+        demo_head = pd.read_csv(demographics_path, nrows=5)
+        if LABEL_COLUMN in demo_head.columns:
+            return demographics_path
+    except Exception as e:
+        logger.warning(f"Could not inspect demographics labels: {e}")
+        return demographics_path
+
+    # Try common ICD filename locations.
+    candidates = [
+        Path(data_folder) / "icd_codes_CI.csv",
+        Path(data_folder) / "ICD_codes_CI.csv",
+        Path(data_folder) / "icd_codes_ci.csv",
+        Path(data_folder).parent / "icd_codes_CI.csv",
+        Path(data_folder).parent / "ICD_codes_CI.csv",
+    ]
+    icd_path = next((p for p in candidates if p.exists()), None)
+
+    if icd_path is None:
+        logger.warning(
+            f"{LABEL_COLUMN} is not present in {demographics_path}, and no "
+            "ICD file was found. Training will continue, but model training "
+            "will fall back if labels cannot be found later."
+        )
+        return demographics_path
+
+    labelled_path = Path(model_folder) / "demographics_with_CI.csv"
+    try:
+        from create_labels import create_labels
+
+        logger.info(
+            f"{LABEL_COLUMN} missing from demographics.csv. Creating labels "
+            f"with official create_labels.py using {icd_path}..."
+        )
+        create_labels(
+            str(demographics_path),
+            str(icd_path),
+            str(labelled_path),
+        )
+        return labelled_path
+    except Exception as e:
+        logger.warning(f"Could not create labels with create_labels.py: {e}")
+        return demographics_path
+
+
+def _coerce_target_column(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    """
+    Return a copy of df with target_col converted to numeric 0/1/NaN.
+    """
+    out = df.copy()
+    out[target_col] = out[target_col].apply(_sanitize_label_value)
+    return out
+
+# ---------------------------------------------------------------------------
+# 2b. Official age-specific prevalence handling
+# ---------------------------------------------------------------------------
+
+AGE_COLUMN_CANDIDATES = ["Age", "age", "demo_age"]
+
+
+def _extract_age_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    """
+    Return numeric age Series from common age columns.
+    """
+    for col in AGE_COLUMN_CANDIDATES:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+    return None
+
+
+def _compute_prevalence_reference(
+    demographics_path: Path,
+    target_col: str = LABEL_COLUMN,
+    logger=None,
+) -> Dict:
+    """
+    Store labelled training ages and labels as the prevalence reference.
+
+    This mirrors the official evaluator, which computes prevalence for each
+    evaluated age from prevalence-reference patients within +/-2 years.
+    """
+    info = {
+        "global_prevalence": None,
+        "prevalence_reference_ages": [],
+        "prevalence_reference_labels": [],
+        "prevalence_age_gap": 2,
+        "age_prevalence_enabled": False,
+    }
+
+    try:
+        df = pd.read_csv(demographics_path)
+    except Exception as e:
+        if logger:
+            logger.warning(f"Could not read prevalence demographics: {e}")
+        return info
+
+    if target_col not in df.columns:
+        if logger:
+            logger.warning(
+                f"{target_col} not found in demographics; "
+                "cannot compute prevalence reference."
+            )
+        return info
+
+    ages = _extract_age_series(df)
+    if ages is None:
+        if logger:
+            logger.warning("Age column not found; cannot compute age prevalence.")
+        return info
+
+    labels = df[target_col].apply(_sanitize_label_value)
+
+    valid = labels.notna() & ages.notna()
+    if int(valid.sum()) == 0:
+        if logger:
+            logger.warning("No valid age/label pairs for prevalence reference.")
+        return info
+
+    ref_labels = labels.loc[valid].astype(int).to_numpy()
+    ref_ages = ages.loc[valid].astype(float).to_numpy()
+
+    info["global_prevalence"] = float(
+        np.clip(np.mean(ref_labels), 1e-6, 1.0 - 1e-6)
+    )
+    info["prevalence_reference_ages"] = [float(x) for x in ref_ages]
+    info["prevalence_reference_labels"] = [int(x) for x in ref_labels]
+    info["age_prevalence_enabled"] = True
+
+    if logger:
+        logger.info(
+            f"Prevalence reference: n={len(ref_labels)}, "
+            f"global={info['global_prevalence']:.4f}, "
+            f"age gap=±{info['prevalence_age_gap']} years"
+        )
+
+    return info
+
+
+def _official_age_prevalence_from_config(
+    age,
+    training_config: Dict,
+    fallback: Optional[float] = None,
+) -> Optional[float]:
+    """
+    Compute age-specific prevalence using the same rule as official
+    evaluate_model.compute_prevalence():
+
+        labels within abs(age - prevalence_age) <= gap
+        p = max(sum(labels), 0.5) / n
+    """
+    if fallback is None:
+        fallback = training_config.get("expected_test_prevalence", None)
+
+    try:
+        age = float(age)
+    except Exception:
+        return fallback
+
+    if not np.isfinite(age):
+        return fallback
+
+    ref_ages = np.asarray(
+        training_config.get("prevalence_reference_ages", []),
+        dtype=float,
+    )
+    ref_labels = np.asarray(
+        training_config.get("prevalence_reference_labels", []),
+        dtype=float,
+    )
+    gap = float(training_config.get("prevalence_age_gap", 2))
+
+    if len(ref_ages) == 0 or len(ref_labels) == 0 or len(ref_ages) != len(ref_labels):
+        return fallback
+
+    mask = np.isfinite(ref_ages) & (np.abs(ref_ages - age) <= gap)
+    n = int(mask.sum())
+
+    if n == 0:
+        return fallback
+
+    positives = float(np.nansum(ref_labels[mask]))
+    prevalence = max(positives, 0.5) / n
+
+    return float(np.clip(prevalence, 1e-6, 1.0 - 1e-6))
+
+
+def _rowwise_age_prior_shift_and_thresholds(
+    raw_probabilities: np.ndarray,
+    feature_table: pd.DataFrame,
+    training_config: Dict,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply age-specific prior correction and return age-specific decision
+    thresholds.
+
+    For the official reward, if q is the calibrated risk and p is the
+    age-specific prevalence, the expected reward is maximized by predicting
+    positive when q >= p.
+    """
+    raw_probabilities = np.asarray(raw_probabilities, dtype=float)
+
+    train_prev = training_config.get("training_prevalence", None)
+    global_prev = training_config.get("expected_test_prevalence", None)
+
+    ages = _extract_age_series(feature_table)
+
+    if ages is None:
+        if train_prev is not None and global_prev is not None:
+            probabilities = _prior_probability_shift(
+                raw_probabilities,
+                train_prevalence=float(train_prev),
+                target_prevalence=float(global_prev),
+            )
+            thresholds = np.full(
+                len(probabilities),
+                float(np.clip(global_prev, 1e-6, 1.0 - 1e-6)),
+                dtype=float,
+            )
+            return probabilities, thresholds
+
+        return raw_probabilities, np.full(
+            len(raw_probabilities),
+            float(training_config.get("decision_threshold", 0.5)),
+            dtype=float,
+        )
+
+    probabilities = raw_probabilities.copy()
+    thresholds = np.full(len(probabilities), 0.5, dtype=float)
+
+    for i in range(len(probabilities)):
+        age_i = ages.iloc[i] if i < len(ages) else np.nan
+
+        p_age = _official_age_prevalence_from_config(
+            age_i,
+            training_config=training_config,
+            fallback=global_prev,
+        )
+
+        if p_age is None:
+            p_age = float(training_config.get("decision_threshold", 0.5))
+
+        p_age = float(np.clip(p_age, 1e-6, 1.0 - 1e-6))
+        thresholds[i] = p_age
+
+        if train_prev is not None:
+            probabilities[i] = _prior_probability_shift(
+                np.asarray([raw_probabilities[i]], dtype=float),
+                train_prevalence=float(train_prev),
+                target_prevalence=p_age,
+            )[0]
+
+    return probabilities, thresholds
+
+def _attach_prevalence_info_to_model(
+    model_result: Optional[dict],
+    prevalence_info: Dict,
+    expected_global_prevalence: float,
+) -> Optional[dict]:
+    """
+    Attach official-style prevalence metadata to a model dictionary.
+
+    This is needed both for:
+      - the internal holdout model, so holdout evaluation uses the same
+        age-specific reward-aware thresholding as inference; and
+      - the final model saved for Challenge inference.
+    """
+    if model_result is None:
+        return model_result
+
+    model_result.setdefault("training_config", {})
+    tc = model_result["training_config"]
+
+    tc["expected_test_prevalence"] = float(expected_global_prevalence)
+    tc["expected_test_prevalence_source"] = (
+        "training_demographics_global_prevalence"
+    )
+    tc["age_prevalence_enabled"] = bool(
+        prevalence_info.get("age_prevalence_enabled", False)
+    )
+    tc["prevalence_reference_ages"] = prevalence_info.get(
+        "prevalence_reference_ages", []
+    )
+    tc["prevalence_reference_labels"] = prevalence_info.get(
+        "prevalence_reference_labels", []
+    )
+    tc["prevalence_age_gap"] = int(
+        prevalence_info.get("prevalence_age_gap", 2)
+    )
+    tc["decision_threshold_strategy"] = "age_specific_official_prevalence"
+
+    return model_result
+def _compute_official_style_reward(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    feature_table: pd.DataFrame,
+    training_config: Dict,
+) -> float:
+    """
+    Compute the official-style age-specific reward for internal validation.
+
+    For each patient:
+      p_age = prevalence among reference patients within +/- prevalence_age_gap
+      TP reward = 1 / p_age - 1
+      FP reward = -1
+      FN reward = -1
+      TN reward = 1 / (1 - p_age) - 1
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+
+    ages = _extract_age_series(feature_table)
+    if ages is None:
+        return np.nan
+
+    rewards = []
+
+    global_prev = training_config.get("expected_test_prevalence", None)
+
+    for i in range(len(y_true)):
+        age_i = ages.iloc[i] if i < len(ages) else np.nan
+
+        p = _official_age_prevalence_from_config(
+            age_i,
+            training_config=training_config,
+            fallback=global_prev,
+        )
+
+        if p is None or not np.isfinite(float(p)):
+            continue
+
+        p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+
+        if y_true[i] == 1 and y_pred[i] == 1:
+            reward = 1.0 / p - 1.0
+        elif y_true[i] == 0 and y_pred[i] == 0:
+            reward = 1.0 / (1.0 - p) - 1.0
+        else:
+            reward = -1.0
+
+        rewards.append(reward)
+
+    if len(rewards) == 0:
+        return np.nan
+
+    return float(np.mean(rewards))
+
+# ---------------------------------------------------------------------------
+# 3. Probability and prediction helpers
+# ---------------------------------------------------------------------------
 
 def _prior_probability_shift(
     p: np.ndarray,
@@ -85,7 +572,7 @@ def _prior_probability_shift(
     eps: float = 1e-7,
 ) -> np.ndarray:
     """
-    Adjust predicted probabilities from the training prior to the expected
+    Adjust predicted probabilities from the training prior to an expected
     deployment/test prior.
 
     odds_target = odds_model *
@@ -113,13 +600,14 @@ def _prior_probability_shift(
 
 def _safe_predict_proba_positive(ml_model, X_scaled: np.ndarray) -> np.ndarray:
     """
-    Return P(class=1) robustly, including for degenerate/dummy models.
+    Return P(class=1) robustly, including degenerate/dummy models.
     """
     if not hasattr(ml_model, "predict_proba"):
         pred = ml_model.predict(X_scaled)
         return np.asarray(pred, dtype=float)
 
     proba = ml_model.predict_proba(X_scaled)
+    proba = np.asarray(proba)
 
     if proba.ndim == 1:
         return proba.astype(float)
@@ -132,6 +620,8 @@ def _safe_predict_proba_positive(ml_model, X_scaled: np.ndarray) -> np.ndarray:
         return np.zeros(proba.shape[0], dtype=float)
 
     classes = getattr(ml_model, "classes_", np.array([0, 1]))
+    classes = np.asarray(classes)
+
     if 1 in classes:
         pos_idx = int(np.where(classes == 1)[0][0])
     else:
@@ -146,7 +636,7 @@ def _predict_feature_table(
     verbose: bool = False,
 ) -> pd.DataFrame:
     """
-    Apply the exact saved preprocessing chain:
+    Apply the saved preprocessing chain:
 
         raw feature table
         -> column alignment
@@ -154,12 +644,10 @@ def _predict_feature_table(
         -> feature selector
         -> scaler
         -> model probabilities
-        -> prior-probability correction
+        -> optional prior-probability correction
         -> binary threshold
 
-    This function is used for both:
-      1. internal holdout evaluation during training
-      2. challenge inference in run_model()
+    Used for both internal holdout evaluation and Challenge inference.
     """
     if model_dict.get("fallback", False):
         patient_ids = (
@@ -167,25 +655,45 @@ def _predict_feature_table(
             if "patient_id" in feature_table.columns
             else np.arange(len(feature_table))
         )
-        return pd.DataFrame({
-            "patient_id": patient_ids,
-            "prediction": np.zeros(len(feature_table), dtype=int),
-            "probability": np.full(len(feature_table), 0.10, dtype=float),
-        })
+        return pd.DataFrame(
+            {
+                "patient_id": patient_ids,
+                "prediction": np.zeros(len(feature_table), dtype=int),
+                "probability": np.full(len(feature_table), 0.10, dtype=float),
+            }
+        )
+
+    required_keys = ["model", "scaler", "imputer", "feature_names"]
+    if any(k not in model_dict for k in required_keys):
+        if verbose:
+            print(
+                "  ! Loaded model does not contain the expected custom "
+                "pipeline keys. Using fallback prediction."
+            )
+        patient_ids = (
+            feature_table["patient_id"].values
+            if "patient_id" in feature_table.columns
+            else np.arange(len(feature_table))
+        )
+        return pd.DataFrame(
+            {
+                "patient_id": patient_ids,
+                "prediction": np.zeros(len(feature_table), dtype=int),
+                "probability": np.full(len(feature_table), 0.10, dtype=float),
+            }
+        )
 
     ml_model = model_dict["model"]
     scaler = model_dict["scaler"]
     imputer = model_dict["imputer"]
     feature_selector = model_dict.get("feature_selector")
-    feature_names = model_dict["feature_names"]
+    feature_names = list(model_dict["feature_names"])
     selected_features = model_dict.get("selected_features", feature_names)
 
     df = feature_table.copy()
 
     patient_ids = (
-        df["patient_id"].values
-        if "patient_id" in df.columns
-        else np.arange(len(df))
+        df["patient_id"].values if "patient_id" in df.columns else np.arange(len(df))
     )
 
     # Ensure all expected training features exist.
@@ -223,56 +731,105 @@ def _predict_feature_table(
     # Raw model probability.
     raw_probabilities = _safe_predict_proba_positive(ml_model, X_scaled)
 
-    # Prior correction using training metadata if available.
-    config = model_dict.get("training_config", {})
-    train_prev = config.get("training_prevalence", None)
-    target_prev = config.get("expected_test_prevalence", None)
-    threshold = float(config.get("decision_threshold", 0.5))
+    # Prior correction and binary decision.
+    # Prefer the official age-specific prevalence reference if available.
+    training_config = model_dict.get("training_config", {})
 
-    if train_prev is not None and target_prev is not None:
-        probabilities = _prior_probability_shift(
-            raw_probabilities,
-            train_prevalence=float(train_prev),
-            target_prevalence=float(target_prev),
+    if training_config.get("age_prevalence_enabled", False):
+        probabilities, thresholds = _rowwise_age_prior_shift_and_thresholds(
+            raw_probabilities=raw_probabilities,
+            feature_table=df,
+            training_config=training_config,
         )
     else:
-        probabilities = raw_probabilities
+        train_prev = training_config.get("training_prevalence", None)
+        target_prev = training_config.get("expected_test_prevalence", None)
+
+        if train_prev is not None and target_prev is not None:
+            probabilities = _prior_probability_shift(
+                raw_probabilities,
+                train_prevalence=float(train_prev),
+                target_prevalence=float(target_prev),
+            )
+            thresholds = np.full(
+                len(probabilities),
+                float(np.clip(target_prev, 1e-6, 1.0 - 1e-6)),
+                dtype=float,
+            )
+        else:
+            probabilities = raw_probabilities
+            thresholds = np.full(
+                len(probabilities),
+                float(training_config.get("decision_threshold", 0.5)),
+                dtype=float,
+            )
 
     probabilities = np.clip(probabilities, 0.0, 1.0)
-    predictions = (probabilities >= threshold).astype(int)
+    predictions = (probabilities >= thresholds).astype(int)
 
-    return pd.DataFrame({
-        "patient_id": patient_ids,
-        "prediction": predictions.astype(int),
-        "probability": probabilities.astype(float),
-    })
+
+    return pd.DataFrame(
+        {
+            "patient_id": patient_ids,
+            "prediction": predictions.astype(int),
+            "probability": probabilities.astype(float),
+        }
+    )
+
 
 # ---------------------------------------------------------------------------
-# 1.  TRAIN MODEL  (called by the challenge's train_model.py)
+# 4. TRAIN MODEL
 # ---------------------------------------------------------------------------
 
 def train_model(data_folder, model_folder, verbose):
     """
-    Train the model on *all* patients found in data_folder.
+    Train the model on all labelled patients found in data_folder.
     Save everything needed for inference into model_folder.
     """
-    # --- 0. Patch paths & logger -------------------------------------------
+    # Patch paths before importing custom pipeline modules.
     _patch_config(data_folder, model_folder)
-
     logger = _setup_logger(verbose)
 
-    # Now safe to import pipeline modules (they read config at import time)
     import config
     from helper_code import find_patients, DEMOGRAPHICS_FILE, HEADERS
 
-    # Our pipeline imports
+    # If official create_labels.py has not yet been run, optionally create a
+    # labelled demographics copy in model_folder when an ICD file is available.
+    labelled_demographics = _maybe_create_labelled_demographics(
+        data_folder=data_folder,
+        model_folder=model_folder,
+        logger=logger,
+    )
+
+    # IMPORTANT:
+    # If create_labels.py created a labelled demographics copy, all downstream
+    # code must use that file. The previous version computed prevalence and
+    # built the feature table from config.DEMOGRAPHICS_FILE, which still pointed
+    # to the original demographics.csv.
+    config.DEMOGRAPHICS_FILE = Path(labelled_demographics).resolve()
+
+    prevalence_info = _compute_prevalence_reference(
+        demographics_path=config.DEMOGRAPHICS_FILE,
+        target_col=LABEL_COLUMN,
+        logger=logger,
+    )
+
+
+
+    expected_global_prevalence = prevalence_info.get("global_prevalence", None)
+
+    if expected_global_prevalence is None:
+        expected_global_prevalence = 0.10
+        logger.warning(
+            "Could not compute training prevalence from demographics. "
+            "Falling back to 0.10."
+        )
+
+
+    # Import custom pipeline modules only after config patching.
     from main import process_single_patient
-    from feature_table.build_feature_table import (
-        build_cohort_feature_table,
-    )
-    from classification.train_model import (
-        train_model as classification_train_model,
-    )
+    from feature_table.build_feature_table import build_cohort_feature_table
+    from classification.train_model import train_model as classification_train_model
 
     logger.info("Finding the Challenge data...")
 
@@ -285,33 +842,37 @@ def train_model(data_folder, model_folder, verbose):
 
     logger.info(f"Found {num_records} records. Starting preprocessing...")
 
-    # --- 1. Run preprocessing pipeline (parallel, pool-recycling) -----------
-    feature_dir = config.FEATURE_DIR
+    # -----------------------------------------------------------------------
+    # 4.1 Run preprocessing pipeline.
+    # -----------------------------------------------------------------------
+    feature_dir = Path(config.FEATURE_DIR)
     feature_dir.mkdir(parents=True, exist_ok=True)
 
-    successful_results = {}  # patient_id -> {seg_path, pat_path, sleep_summary}
-    max_workers = min(config.NUM_WORKERS, num_records) if num_records > 0 else 1
+    successful_results = {}
+    max_workers = min(int(getattr(config, "NUM_WORKERS", 1)), num_records)
+    max_workers = max(1, max_workers)
+
+    segment_length_sec = getattr(config, "SEGMENT_LENGTH_SEC", 30)
+    overlap_sec = getattr(config, "SEGMENT_OVERLAP_SEC", 0)
 
     total_start = time.time()
-
-    # Process in batches, recycling the pool after each batch
-    # so that worker process memory is fully released between batches
-    batch_size = max_workers  # One subject per worker, then recycle
+    batch_size = max_workers
 
     for batch_start in range(0, num_records, batch_size):
         batch_end = min(batch_start + batch_size, num_records)
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
+
             for i in range(batch_start, batch_end):
                 record = patient_metadata_list[i]
-                patient_id_bids = record[HEADERS['bids_folder']]
-                site_id = record[HEADERS['site_id']]
-                session_id = record[HEADERS['session_id']]
+                patient_id_bids = record[HEADERS["bids_folder"]]
+                site_id = record[HEADERS["site_id"]]
+                session_id = record[HEADERS["session_id"]]
 
                 record_name = f"{patient_id_bids}_ses-{session_id}"
                 pipeline_patient_id = f"{site_id}/{record_name}"
-                patient_dir = config.PHYSIOLOGICAL_DATA_DIR / site_id
+                patient_dir = Path(config.PHYSIOLOGICAL_DATA_DIR) / site_id
 
                 if not patient_dir.exists():
                     logger.warning(f"Directory not found: {patient_dir}. Skipping.")
@@ -322,8 +883,8 @@ def train_model(data_folder, model_folder, verbose):
                     patient_id=pipeline_patient_id,
                     patient_dir=patient_dir,
                     record_name=record_name,
-                    segment_length_sec=config.SEGMENT_LENGTH_SEC,
-                    overlap_sec=config.SEGMENT_OVERLAP_SEC,
+                    segment_length_sec=segment_length_sec,
+                    overlap_sec=overlap_sec,
                     feature_output_dir=feature_dir,
                 )
                 futures[future] = pipeline_patient_id
@@ -332,16 +893,16 @@ def train_model(data_folder, model_folder, verbose):
                 pid = futures[future]
                 try:
                     result = future.result()
-                    if result and result["success"]:
+                    if result and result.get("success"):
                         successful_results[pid] = {
                             "seg_features_path": result.get("seg_features_path"),
                             "pat_features_path": result.get("pat_features_path"),
                             "sleep_summary": result.get("sleep_summary"),
                         }
                 except Exception as e:
-                    logger.error(f"Error processing {pid}: {e}")
+                    logger.error(f"Error processing {pid}: {type(e).__name__}: {e}")
 
-        # Pool is destroyed here — all worker processes are killed and RAM is freed
+        # Recycle process pool and release memory after each batch.
         gc.collect()
 
         elapsed = time.time() - total_start
@@ -355,7 +916,9 @@ def train_model(data_folder, model_folder, verbose):
         f"successful in {time.time() - total_start:.0f}s"
     )
 
-    # --- 2. Load features from disk & build cohort table -------------------
+    # -----------------------------------------------------------------------
+    # 4.2 Load saved per-patient features and build cohort table.
+    # -----------------------------------------------------------------------
     patient_segment_tables = {}
     patient_level_tables = {}
     patient_sleep_summaries = {}
@@ -366,14 +929,14 @@ def train_model(data_folder, model_folder, verbose):
             try:
                 patient_segment_tables[pid] = pd.read_parquet(seg_path)
             except Exception as e:
-                logger.warning(f"Failed to load {seg_path}: {e}")
+                logger.warning(f"Failed to load segment features {seg_path}: {e}")
 
         pat_path = paths.get("pat_features_path")
         if pat_path and Path(pat_path).exists():
             try:
                 patient_level_tables[pid] = pd.read_parquet(pat_path)
             except Exception as e:
-                logger.warning(f"Failed to load {pat_path}: {e}")
+                logger.warning(f"Failed to load patient features {pat_path}: {e}")
 
         if paths.get("sleep_summary"):
             patient_sleep_summaries[pid] = paths["sleep_summary"]
@@ -396,59 +959,56 @@ def train_model(data_folder, model_folder, verbose):
         _save_fallback_model(model_folder)
         return
 
-    # --- 3. Train the ML model ---------------------------------------------
-    from sklearn.model_selection import train_test_split
-    from classification.train_model import train_model as classification_train_model
+    # -----------------------------------------------------------------------
+    # 4.3 Prepare labels.
+    # -----------------------------------------------------------------------
+    target_candidates = [
+        "target",
+        getattr(config, "TARGET_COLUMN", LABEL_COLUMN),
+        LABEL_COLUMN,
+    ]
 
-    logger.info(
-        f"Training model on {len(patient_level)} patients, "
-        f"{len(patient_level.columns)} features..."
-    )
+    target_col = next((c for c in target_candidates if c in patient_level.columns), None)
 
-    # --- 3a. Reserve a 20% held-out internal validation set ---
-    # This gives us ONE truly unbiased AUROC estimate that has never
-    # been seen by feature selection, hyperparameters, or model fitting.
-    target_col = next(
-        (c for c in ["target", config.TARGET_COLUMN, "Cognitive_Impairment"]
-        if c in patient_level.columns), None
-    )
     if target_col is None:
-        logger.error("No target column. Saving fallback.")
+        logger.error(
+            f"No target column found. Expected one of {target_candidates}. "
+            "Saving fallback model."
+        )
         _save_fallback_model(model_folder)
         return
 
-    valid_mask = patient_level[target_col].notna()
-    patient_level_valid = patient_level.loc[valid_mask].reset_index(drop=True)
+    patient_level = _coerce_target_column(patient_level, target_col)
+    patient_level_valid = patient_level.loc[
+        patient_level[target_col].notna()
+    ].reset_index(drop=True)
 
-    train_df, holdout_df = train_test_split(
-        patient_level_valid,
-        test_size=0.20,
-        stratify=patient_level_valid[target_col].astype(int),
-        random_state=config.RANDOM_SEED,
-    )
+    if len(patient_level_valid) == 0:
+        logger.error("No valid labels after sanitization. Saving fallback model.")
+        _save_fallback_model(model_folder)
+        return
+
+    unique_labels = sorted(patient_level_valid[target_col].dropna().unique().tolist())
+    if len(unique_labels) < 2:
+        logger.error(
+            f"Only one class present in training labels: {unique_labels}. "
+            "Saving fallback model."
+        )
+        _save_fallback_model(model_folder)
+        return
+
+    patient_level_valid[target_col] = patient_level_valid[target_col].astype(int)
+
     logger.info(
-        f"Internal split: train={len(train_df)} (prev={train_df[target_col].mean():.3f}), "
-        f"holdout={len(holdout_df)} (prev={holdout_df[target_col].mean():.3f})"
+        f"Training data after label filtering: {len(patient_level_valid)} patients, "
+        f"prevalence={patient_level_valid[target_col].mean():.3f}, "
+        f"{len(patient_level_valid.columns)} columns."
     )
 
-    # --- 3b. Train (CV runs inside, all preprocessing inside pipeline) ---
-    model_result = classification_train_model(
-        feature_table=train_df,
-        output_dir=config.MODEL_DIR,
-        expected_test_prevalence=0.10,
-        logger=logger if verbose else None,
-    )
-
-
-    if not model_result:
-        logger.error("Training failed. Saving fallback.")
-        _save_fallback_model(model_folder)
-        return
-
-        # --- 3c. Honest evaluation on the untouched 20% holdout ---
-    # Important:
-    # Use the exact same preprocessing + probability correction as inference.
-    # Do NOT call model.predict_proba() directly on raw holdout features.
+    # -----------------------------------------------------------------------
+    # 4.4 Optional honest internal holdout, then final refit on all data.
+    # -----------------------------------------------------------------------
+    from sklearn.model_selection import train_test_split
     from sklearn.metrics import (
         roc_auc_score,
         average_precision_score,
@@ -457,131 +1017,235 @@ def train_model(data_folder, model_folder, verbose):
         balanced_accuracy_score,
     )
 
-    y_hold = holdout_df[target_col].astype(int).values
-
-    if len(np.unique(y_hold)) == 2:
-        holdout_pred_df = _predict_feature_table(
-            model_dict=model_result,
-            feature_table=holdout_df,
-            verbose=verbose,
-        )
-
-        proba_hold = holdout_pred_df["probability"].values.astype(float)
-        binary_hold = holdout_pred_df["prediction"].values.astype(int)
-
-        holdout_auroc = roc_auc_score(y_hold, proba_hold)
-        holdout_auprc = average_precision_score(y_hold, proba_hold)
-        holdout_accuracy = accuracy_score(y_hold, binary_hold)
-        holdout_f1 = f1_score(y_hold, binary_hold, zero_division=0)
-        holdout_bal_acc = balanced_accuracy_score(y_hold, binary_hold)
-
-        cv_auroc = model_result.get("cv_results", {}).get("auroc_mean", np.nan)
-        gap = (
-            float(cv_auroc) - float(holdout_auroc)
-            if np.isfinite(cv_auroc)
-            else np.nan
-        )
-
-        logger.info("=" * 60)
-        logger.info("HONEST HOLDOUT EVALUATION (20% never-seen)")
-        logger.info(f"  CV AUROC:       {cv_auroc:.4f}" if np.isfinite(cv_auroc) else "  CV AUROC:       N/A")
-        logger.info(f"  Holdout AUROC:  {holdout_auroc:.4f}")
-        logger.info(f"  Holdout AUPRC:  {holdout_auprc:.4f}")
-        logger.info(f"  Holdout Acc:    {holdout_accuracy:.4f}")
-        logger.info(f"  Holdout F1:     {holdout_f1:.4f}")
-        logger.info(f"  Holdout BalAcc: {holdout_bal_acc:.4f}")
-
-        if np.isfinite(gap):
-            logger.info(
-                f"  CV-Holdout gap: {gap:+.4f}  "
-                f"{'⚠ overfitting' if gap > 0.05 else '✓ healthy'}"
-            )
-        logger.info("=" * 60)
-
-        model_result.setdefault("cv_results", {}).update({
-            "holdout_auroc": float(holdout_auroc),
-            "holdout_auprc": float(holdout_auprc),
-            "holdout_accuracy": float(holdout_accuracy),
-            "holdout_f1": float(holdout_f1),
-            "holdout_balanced_accuracy": float(holdout_bal_acc),
-            "cv_holdout_gap": float(gap) if np.isfinite(gap) else np.nan,
-        })
-    else:
-        logger.warning(
-            "Holdout evaluation skipped because holdout set contains "
-            "only one class."
-        )
-
-
-    # --- 3d. Optional: refit on 100% of training data for final submission ---
-        # Trade-off: more data vs. having an honest estimate. With ~600 patients,
-    # refitting can still help, while the holdout estimate above remains the
-    # unbiased diagnostic number.
-    logger.info("Refitting final model on 100% of training data...")
-    final_result = classification_train_model(
-        feature_table=patient_level_valid,
-        output_dir=config.MODEL_DIR,
-        expected_test_prevalence=0.10,
-        logger=logger if verbose else None,
+    class_counts = patient_level_valid[target_col].value_counts()
+    can_holdout = (
+        len(patient_level_valid) >= 10
+        and len(class_counts) == 2
+        and int(class_counts.min()) >= 2
     )
 
+    model_result = None
+
+    if can_holdout:
+        try:
+            train_df, holdout_df = train_test_split(
+                patient_level_valid,
+                test_size=0.20,
+                stratify=patient_level_valid[target_col].astype(int),
+                random_state=int(getattr(config, "RANDOM_SEED", 56)),
+            )
+
+            logger.info(
+                f"Internal split: train={len(train_df)} "
+                f"(prev={train_df[target_col].mean():.3f}), "
+                f"holdout={len(holdout_df)} "
+                f"(prev={holdout_df[target_col].mean():.3f})"
+            )
+
+            model_result = classification_train_model(
+                feature_table=train_df,
+                output_dir=config.MODEL_DIR,
+                expected_test_prevalence=expected_global_prevalence,
+                logger=logger if verbose else None,
+            )
+
+            model_result = _attach_prevalence_info_to_model(
+                model_result=model_result,
+                prevalence_info=prevalence_info,
+                expected_global_prevalence=expected_global_prevalence,
+            )
+
+
+            if model_result:
+                y_hold = holdout_df[target_col].astype(int).values
+
+                if len(np.unique(y_hold)) == 2:
+                    holdout_pred_df = _predict_feature_table(
+                        model_dict=model_result,
+                        feature_table=holdout_df,
+                        verbose=verbose,
+                    )
+
+                    proba_hold = holdout_pred_df["probability"].values.astype(float)
+                    binary_hold = holdout_pred_df["prediction"].values.astype(int)
+
+                    holdout_auroc = roc_auc_score(y_hold, proba_hold)
+                    holdout_auprc = average_precision_score(y_hold, proba_hold)
+                    holdout_accuracy = accuracy_score(y_hold, binary_hold)
+                    holdout_f1 = f1_score(y_hold, binary_hold, zero_division=0)
+                    holdout_bal_acc = balanced_accuracy_score(y_hold, binary_hold)
+
+                    holdout_reward = _compute_official_style_reward(
+                        y_true=y_hold,
+                        y_pred=binary_hold,
+                        feature_table=holdout_df,
+                        training_config=model_result.get("training_config", {}),
+                    )
+
+                    cv_auroc = model_result.get("cv_results", {}).get(
+                        "auroc_mean", np.nan
+                    )
+                    gap = (
+                        float(cv_auroc) - float(holdout_auroc)
+                        if np.isfinite(cv_auroc)
+                        else np.nan
+                    )
+
+                    logger.info("=" * 60)
+                    logger.info("HONEST HOLDOUT EVALUATION")
+                    if np.isfinite(cv_auroc):
+                        logger.info(f"  CV AUROC:       {cv_auroc:.4f}")
+                    else:
+                        logger.info("  CV AUROC:       N/A")
+                    logger.info(f"  Holdout AUROC:  {holdout_auroc:.4f}")
+                    logger.info(f"  Holdout AUPRC:  {holdout_auprc:.4f}")
+                    logger.info(f"  Holdout Acc:    {holdout_accuracy:.4f}")
+                    logger.info(f"  Holdout F1:     {holdout_f1:.4f}")
+                    logger.info(f"  Holdout BalAcc: {holdout_bal_acc:.4f}")
+
+                    if np.isfinite(holdout_reward):
+                        logger.info(f"  Holdout Reward: {holdout_reward:.4f}")
+                    else:
+                        logger.info("  Holdout Reward: N/A")
+
+
+                    if np.isfinite(gap):
+                        logger.info(
+                            f"  CV-Holdout gap: {gap:+.4f}  "
+                            f"{'overfitting?' if gap > 0.05 else 'healthy'}"
+                        )
+                    logger.info("=" * 60)
+
+                    model_result.setdefault("cv_results", {}).update(
+                        {
+                            "holdout_auroc": float(holdout_auroc),
+                            "holdout_auprc": float(holdout_auprc),
+                            "holdout_accuracy": float(holdout_accuracy),
+                            "holdout_f1": float(holdout_f1),
+                            "holdout_balanced_accuracy": float(holdout_bal_acc),
+                            "cv_holdout_gap": (
+                                float(gap) if np.isfinite(gap) else np.nan
+                            ),
+                            "holdout_reward": (
+                                float(holdout_reward)
+                                if np.isfinite(holdout_reward)
+                                else np.nan
+                            ),
+
+                        }
+                    )
+
+        except Exception as e:
+            logger.warning(
+                f"Internal holdout training/evaluation failed: "
+                f"{type(e).__name__}: {e}. Continuing with full-data fit."
+            )
+            model_result = None
+    else:
+        logger.info(
+            "Skipping internal holdout because the dataset/class counts are too small."
+        )
+
+    # Final model for Challenge submission: train on all valid labelled data.
+    logger.info("Fitting final model on 100% of valid labelled training data...")
+
+    try:
+        final_result = classification_train_model(
+            feature_table=patient_level_valid,
+            output_dir=config.MODEL_DIR,
+            expected_test_prevalence=expected_global_prevalence,
+            logger=logger if verbose else None,
+        )
+    except Exception as e:
+        logger.error(f"Final training failed: {type(e).__name__}: {e}")
+        final_result = None
+
     if final_result:
-        # Preserve honest holdout diagnostics from the pre-refit model.
-        holdout_keys = [
-            "holdout_auroc",
-            "holdout_auprc",
-            "holdout_accuracy",
-            "holdout_f1",
-            "holdout_balanced_accuracy",
-            "cv_holdout_gap",
-        ]
-        final_result.setdefault("cv_results", {}).update({
-            k: model_result.get("cv_results", {}).get(k)
-            for k in holdout_keys
-            if k in model_result.get("cv_results", {})
-        })
+        # Preserve honest holdout diagnostics from pre-refit model.
+        if model_result and model_result.get("cv_results"):
+            holdout_keys = [
+                "holdout_auroc",
+                "holdout_auprc",
+                "holdout_accuracy",
+                "holdout_f1",
+                "holdout_balanced_accuracy",
+                "holdout_reward",
+                "cv_holdout_gap",
+            ]
+
+            final_result.setdefault("cv_results", {}).update(
+                {
+                    k: model_result.get("cv_results", {}).get(k)
+                    for k in holdout_keys
+                    if k in model_result.get("cv_results", {})
+                }
+            )
+
         model_result = final_result
 
+    if not model_result:
+        logger.error("Training failed. Saving fallback model.")
+        _save_fallback_model(model_folder)
+        return
 
-    # --- 4. Save to model_folder -------------------------------------------
+    # -----------------------------------------------------------------------
+    # 4.5 Save final model.
+    # -----------------------------------------------------------------------
+    # Store official-style prevalence reference for inference-time calibration
+    # and prevalence-aware binary decisions.
+    model_result = _attach_prevalence_info_to_model(
+        model_result=model_result,
+        prevalence_info=prevalence_info,
+        expected_global_prevalence=expected_global_prevalence,
+    )
+
+
+
     save_model(model_folder, model_result)
 
     cv = model_result.get("cv_results", {})
-
-    logger.info(
-        f"Training complete. CV AUROC={cv.get('auroc_mean', 'N/A')}"
-    )
+    logger.info(f"Training complete. CV AUROC={cv.get('auroc_mean', 'N/A')}")
     logger.info("Done.")
 
 
-
-
 # ---------------------------------------------------------------------------
-# 2.  LOAD MODEL
+# 5. LOAD MODEL
 # ---------------------------------------------------------------------------
 
 def load_model(model_folder, verbose):
-    model_path = os.path.join(model_folder, 'model.sav')
+    """
+    Load the trained model from model_folder/model.sav.
+    """
+    model_path = os.path.join(model_folder, "model.sav")
 
     if not os.path.exists(model_path):
         if verbose:
             print(f"WARNING: {model_path} not found. Using fallback.")
         return {"fallback": True}
 
-    model_dict = joblib.load(model_path)
+    try:
+        model_dict = joblib.load(model_path)
+    except Exception as e:
+        if verbose:
+            print(f"WARNING: Could not load {model_path}: {e}. Using fallback.")
+        return {"fallback": True}
+
+    if not isinstance(model_dict, dict):
+        if verbose:
+            print("WARNING: Loaded model is not a dictionary. Using fallback.")
+        return {"fallback": True}
 
     if verbose:
         mt = model_dict.get("training_config", {}).get("model_type", "unknown")
         nf = len(model_dict.get("selected_features", []))
-        print(f"Model loaded: type={mt}, features={nf}")
+        fb = model_dict.get("fallback", False)
+        print(f"Model loaded: type={mt}, features={nf}, fallback={fb}")
 
-    # No prefetch pool — process each patient synchronously in run_model()
-    model_dict["_config_patched"] = False
     return model_dict
 
 
 # ---------------------------------------------------------------------------
-# WORKER: runs ONE patient in a child process, then exits
+# 6. Inference worker
 # ---------------------------------------------------------------------------
 
 def _preprocess_one_patient_worker(
@@ -595,11 +1259,13 @@ def _preprocess_one_patient_worker(
     feature_output_dir_str,
 ):
     """
-    Runs process_single_patient in a fresh child process.
-    The child exits when done → all memory (YASA, MNE, numpy arrays) is
-    fully reclaimed by the OS before the next patient starts.
+    Run process_single_patient in a fresh child process.
+
+    The child exits after each patient, so memory held by MNE/YASA/numpy arrays
+    is reclaimed by the OS before the next patient.
     """
     _patch_config(data_folder, tmp_model_dir)
+
     from main import process_single_patient
 
     return process_single_patient(
@@ -612,58 +1278,139 @@ def _preprocess_one_patient_worker(
     )
 
 
+def _manual_add_demographics(
+    patient_features: pd.DataFrame,
+    demographics_path: Path,
+) -> pd.DataFrame:
+    """
+    Fallback demographic merge if the custom add_demographics() function fails,
+    e.g., because hidden holdout demographics do not contain labels.
+
+    It creates a pipeline-compatible patient_id:
+        SiteID / (BidsFolder_ses-SessionID)
+    and merges demographics columns onto patient_features.
+    """
+    from helper_code import HEADERS
+
+    if patient_features is None or len(patient_features) == 0:
+        return patient_features
+
+    demo = pd.read_csv(demographics_path)
+
+    required = [
+        HEADERS["site_id"],
+        HEADERS["bids_folder"],
+        HEADERS["session_id"],
+    ]
+    if any(c not in demo.columns for c in required):
+        return patient_features
+
+    demo = demo.copy()
+    demo["patient_id"] = (
+        demo[HEADERS["site_id"]].astype(str)
+        + "/"
+        + demo[HEADERS["bids_folder"]].astype(str)
+        + "_ses-"
+        + demo[HEADERS["session_id"]].astype(str)
+    )
+
+    if "patient_id" not in patient_features.columns:
+        return patient_features
+
+    # Avoid duplicating existing columns except patient_id.
+    merge_cols = ["patient_id"] + [
+        c for c in demo.columns if c != "patient_id" and c not in patient_features.columns
+    ]
+
+    return patient_features.merge(demo[merge_cols], on="patient_id", how="left")
+
+
+def _add_demographics_safely(
+    patient_features: pd.DataFrame,
+    demographics_path: Path,
+    verbose: bool,
+) -> pd.DataFrame:
+    """
+    Try the custom add_demographics() first; if it fails, use a conservative
+    manual merge that does not require labels.
+    """
+    try:
+        from feature_table.build_feature_table import add_demographics
+
+        return add_demographics(
+            patient_features,
+            demographics_path=demographics_path,
+        )
+    except Exception as e:
+        if verbose:
+            print(
+                f"  ! add_demographics() failed "
+                f"({type(e).__name__}: {e}); using manual merge."
+            )
+
+        try:
+            return _manual_add_demographics(patient_features, demographics_path)
+        except Exception as e2:
+            if verbose:
+                print(
+                    f"  ! Manual demographics merge also failed "
+                    f"({type(e2).__name__}: {e2})."
+                )
+            return patient_features
+
+
 # ---------------------------------------------------------------------------
-# 3.  RUN MODEL  — one patient at a time, fresh worker each call
+# 7. RUN MODEL
 # ---------------------------------------------------------------------------
 
 def run_model(model, record, data_folder, verbose):
     """
     Run the trained model on a single patient record.
 
-    Processes the patient in a *single-use* ProcessPoolExecutor
-    (max_workers=1). The worker exits after each patient, fully freeing
-    memory and avoiding the BrokenProcessPool that occurs when too many
-    heavy preprocessing jobs are queued at once.
+    The official run_model.py calls this once per patient and expects:
+        binary_output, probability_output
+
+    binary_output must be boolean-like, i.e., 0/1 or False/True.
+    probability_output must be numeric.
     """
     from helper_code import HEADERS
 
-    patient_id_bids = record[HEADERS['bids_folder']]
-    site_id         = record[HEADERS['site_id']]
-    session_id      = record[HEADERS['session_id']]
+    patient_id_bids = record[HEADERS["bids_folder"]]
+    site_id = record[HEADERS["site_id"]]
+    session_id = record[HEADERS["session_id"]]
 
-    # ---- Fallback model ---------------------------------------------------
-    if model.get("fallback", False):
+    # Fallback model.
+    if model is None or model.get("fallback", False):
         return 0, 0.10
 
+    tmp_main = None
+    tmp_worker_dir = None
 
-    # ---- Patch config in main process (once) ------------------------------
-    import tempfile
-    tmp_main = tempfile.mkdtemp(prefix="physionet_run_main_")
-    _patch_config(data_folder, tmp_main)
-
-    import config
-    logger = _setup_logger(verbose)
-
-    # ---- Build patient identifier -----------------------------------------
-    record_name         = f"{patient_id_bids}_ses-{session_id}"
-    pipeline_patient_id = f"{site_id}/{record_name}"
-    patient_dir         = config.PHYSIOLOGICAL_DATA_DIR / site_id
-
-    if not patient_dir.exists():
-        if verbose:
-            print(f"  ! Patient dir not found: {patient_dir}")
-        _cleanup_dir(tmp_main)
-        return 0, 0.1
-
-    # ---- Per-patient temp dir for the worker ------------------------------
-    tmp_worker_dir = tempfile.mkdtemp(prefix=f"physionet_run_worker_")
-    feature_output_dir = Path(tmp_worker_dir) / "features"
-    feature_output_dir.mkdir(parents=True, exist_ok=True)
-
-    result = None
     try:
+        # Patch config in main process.
+        tmp_main = tempfile.mkdtemp(prefix="physionet_run_main_")
+        _patch_config(data_folder, tmp_main)
+
+        import config
+
+        logger = _setup_logger(verbose)
+
+        record_name = f"{patient_id_bids}_ses-{session_id}"
+        pipeline_patient_id = f"{site_id}/{record_name}"
+        patient_dir = Path(config.PHYSIOLOGICAL_DATA_DIR) / site_id
+
+        if not patient_dir.exists():
+            if verbose:
+                print(f"  ! Patient dir not found: {patient_dir}")
+            return 0, 0.10
+
+        tmp_worker_dir = tempfile.mkdtemp(prefix="physionet_run_worker_")
+        feature_output_dir = Path(tmp_worker_dir) / "features"
+        feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+        result = None
+
         # Single-use pool: one worker, one patient, then tear down.
-        # This mirrors the batch-recycling pattern in train_model().
         with ProcessPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
                 _preprocess_one_patient_worker,
@@ -672,91 +1419,92 @@ def run_model(model, record, data_folder, verbose):
                 pipeline_patient_id=pipeline_patient_id,
                 patient_dir_str=str(patient_dir),
                 record_name=record_name,
-                segment_length_sec=config.SEGMENT_LENGTH_SEC,
-                overlap_sec=config.SEGMENT_OVERLAP_SEC,
+                segment_length_sec=getattr(config, "SEGMENT_LENGTH_SEC", 30),
+                overlap_sec=getattr(config, "SEGMENT_OVERLAP_SEC", 0),
                 feature_output_dir_str=str(feature_output_dir),
             )
+
             try:
                 result = future.result()
             except Exception as e:
-                # Covers BrokenProcessPool and any in-worker exception [[8]]
                 if verbose:
-                    print(f"  ! Worker failed for {pipeline_patient_id}: "
-                          f"{type(e).__name__}: {e}")
+                    print(
+                        f"  ! Worker failed for {pipeline_patient_id}: "
+                        f"{type(e).__name__}: {e}"
+                    )
                     traceback.print_exc()
                 result = None
-        # Pool is destroyed here → all worker memory released
 
         gc.collect()
 
         if result is None or not result.get("success"):
             if verbose:
                 print(f"  ! Pipeline unsuccessful for {pipeline_patient_id}")
-            return 0, 0.1
+            return 0, 0.10
 
-        # ---- Load patient-level features ----------------------------------
+        # Load patient-level features.
         pat_path = result.get("pat_features_path")
         seg_path = result.get("seg_features_path")
 
         if pat_path and Path(pat_path).exists():
             patient_features = pd.read_parquet(pat_path)
-            from feature_table.build_feature_table import add_demographics
-            patient_features = add_demographics(
+            patient_features = _add_demographics_safely(
                 patient_features,
-                demographics_path=config.DEMOGRAPHICS_FILE,
+                demographics_path=Path(config.DEMOGRAPHICS_FILE),
+                verbose=verbose,
             )
+
         elif seg_path and Path(seg_path).exists():
-            from feature_table.build_feature_table import (
-                aggregate_to_patient_level, add_demographics,
-            )
+            from feature_table.build_feature_table import aggregate_to_patient_level
+
             seg_df = pd.read_parquet(seg_path)
             patient_features = aggregate_to_patient_level(
-                seg_df, result.get("sleep_summary")
+                seg_df,
+                result.get("sleep_summary"),
             )
-            patient_features = add_demographics(
+            patient_features = _add_demographics_safely(
                 patient_features,
-                demographics_path=config.DEMOGRAPHICS_FILE,
+                demographics_path=Path(config.DEMOGRAPHICS_FILE),
+                verbose=verbose,
             )
+
         else:
             if verbose:
                 print(f"  ! No features on disk for {pipeline_patient_id}")
-            return 0, 0.1
-        
-        if patient_features is None or len(patient_features) == 0:
-            return 0, 0.1
+            return 0, 0.10
 
-        # ---- Predict ------------------------------------------------------
+        if patient_features is None or len(patient_features) == 0:
+            return 0, 0.10
+
         return _predict_single_patient(model, patient_features, verbose)
 
     except Exception as e:
         if verbose:
-            print(f"  !!! run_model error for {pipeline_patient_id}: "
-                  f"{type(e).__name__}: {e}")
+            print(
+                f"  !!! run_model error for {patient_id_bids}: "
+                f"{type(e).__name__}: {e}"
+            )
             traceback.print_exc()
-        return 0, 0.1
+        return 0, 0.10
 
     finally:
         gc.collect()
-        _cleanup_dir(tmp_worker_dir)
-        _cleanup_dir(tmp_main)
 
+        if tmp_worker_dir is not None:
+            _cleanup_dir(tmp_worker_dir)
 
-def _cleanup_dir(path):
-    try:
-        import shutil
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
+        if tmp_main is not None:
+            _cleanup_dir(tmp_main)
 
 
 def _predict_single_patient(
     model_dict: dict,
     patient_features: pd.DataFrame,
-    verbose: bool
+    verbose: bool,
 ) -> Tuple[int, float]:
     """
-    Predict one patient using the same preprocessing and prior correction
-    used for holdout evaluation.
+    Predict one patient using the same preprocessing and prior correction used
+    during internal holdout evaluation.
     """
     pred_df = _predict_feature_table(
         model_dict=model_dict,
@@ -775,31 +1523,35 @@ def _predict_single_patient(
         binary_output = 0
 
     probability_output = float(np.clip(probability_output, 0.0, 1.0))
+    binary_output = int(1 if binary_output else 0)
 
     return binary_output, probability_output
 
 
-
 # ---------------------------------------------------------------------------
-# 4.  SAVE MODEL
+# 8. SAVE MODEL
 # ---------------------------------------------------------------------------
 
 def save_model(model_folder, model_dict):
     """
-    Save the full model dictionary (model + scaler + imputer + selector +
-    feature names + config) into model_folder/model.sav.
+    Save the full model dictionary into model_folder/model.sav.
     """
     os.makedirs(model_folder, exist_ok=True)
-    filename = os.path.join(model_folder, 'model.sav')
+    filename = os.path.join(model_folder, "model.sav")
 
-    # Build a serialisable dict
-    to_save = {}
     keys_to_save = [
-        "model", "scaler", "imputer", "feature_selector",
-        "feature_names", "selected_features",
-        "training_config", "cv_results", "fallback",
+        "model",
+        "scaler",
+        "imputer",
+        "feature_selector",
+        "feature_names",
+        "selected_features",
+        "training_config",
+        "cv_results",
+        "fallback",
     ]
 
+    to_save = {}
     for k in keys_to_save:
         if k in model_dict:
             to_save[k] = model_dict[k]
@@ -809,25 +1561,38 @@ def save_model(model_folder, model_dict):
 
 def _save_fallback_model(model_folder):
     """
-    Save a trivial fallback model that always predicts 0 / 0.5.
-    Used when preprocessing fails for all patients.
+    Save a trivial fallback model that always predicts 0 / 0.10.
+    Used when preprocessing or training fails.
     """
-    from sklearn.dummy import DummyClassifier
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.impute import SimpleImputer
-
-    dummy = DummyClassifier(strategy="constant", constant=0)
-    dummy.fit(np.zeros((2, 1)), np.array([0, 1]))
+    os.makedirs(model_folder, exist_ok=True)
 
     model_dict = {
-        "model": dummy,
-        "scaler": StandardScaler().fit(np.zeros((2, 1))),
-        "imputer": SimpleImputer(strategy="median").fit(np.zeros((2, 1))),
-        "feature_selector": None,
         "feature_names": ["dummy_feature"],
         "selected_features": ["dummy_feature"],
-        "training_config": {"model_type": "fallback"},
+        "training_config": {
+            "model_type": "fallback",
+            "decision_threshold": 0.5,
+            "expected_test_prevalence": None,
+            "expected_test_prevalence_source": "fallback",
+            "age_prevalence_enabled": False,
+            "prevalence_reference_ages": [],
+            "prevalence_reference_labels": [],
+            "prevalence_age_gap": 2,
+            "decision_threshold_strategy": "fallback",
+        },
+
         "cv_results": {},
         "fallback": True,
     }
+
     save_model(model_folder, model_dict)
+
+
+def _cleanup_dir(path):
+    """
+    Best-effort recursive directory cleanup.
+    """
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
