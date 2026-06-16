@@ -348,30 +348,72 @@ def process_single_patient(
                 stats.update("total_obstructive_apneas",
                              summary.get("obstructive_apnea_count", 0))
         
-        # --- Delta Power Entropy ---
+        # --- Delta Power Entropy / ORP / Sleep Depth Features ---
+        # Wichtig: Alle Variablen vor dem try initialisieren.
+        # Wenn compute_delta_power_entropy(...) fehlschlägt, bleiben die Werte NaN
+        # und die spätere Feature-Zuweisung verursacht keinen UnboundLocalError.
         delta_entropy = np.nan
-        try:        
-            stages_raw = annotation_data["stages_raw"]
+        num_chan = 0
+        mean_orp = np.nan
+        orp_per_window = None
+        artifact_fraction = np.nan
+        orp_nrem = np.nan
+        orp_std_nrem = np.nan
+        orp_rem = np.nan
+        orp_wake = np.nan
+        orp_apeak = np.nan
+        orp_a9 = np.nan
+        csi = np.nan
+
+        try:
+            if annotation_data is None:
+                raise ValueError("annotation_data is None")
+
+            stages_raw = annotation_data.get("stages_raw")
             events_raw = annotation_data.get("events_raw")
+
+            if stages_raw is None or len(stages_raw) == 0:
+                raise ValueError("No valid sleep-stage annotations available")
+
+            if not eeg_preprocessed:
+                raise ValueError("No preprocessed EEG channels available")
+
             (
-            delta_entropy, num_chan, mean_orp, orp_per_window, artifact_fraction,
-            orp_nrem, orp_std_nrem, orp_rem, orp_wake, orp_apeak, orp_a9, csi
+                delta_entropy,
+                num_chan,
+                mean_orp,
+                orp_per_window,
+                artifact_fraction,
+                orp_nrem,
+                orp_std_nrem,
+                orp_rem,
+                orp_wake,
+                orp_apeak,
+                orp_a9,
+                csi,
             ) = compute_delta_power_entropy(
                 eeg_preprocessed=eeg_preprocessed,
                 sfreq=eeg_fs,
                 stages_raw=stages_raw,
                 events_raw=events_raw,
-                logger=logger,  # Optional
+                logger=patient_logger,
             )
+
             patient_logger.info(
-            f"Delta-power entropy (sleep period only) from {num_chan} channel(s): {delta_entropy:.4f} bits"
+                f"Delta-power entropy sleep period only from "
+                f"{num_chan} channel(s): {delta_entropy:.4f} bits"
             )
-            if not np.isnan(mean_orp):
-                patient_logger.info(f"Mean ORP (sleep period): {mean_orp:.4f}")
+
+            if np.isfinite(mean_orp):
+                patient_logger.info(f"Mean ORP sleep period: {mean_orp:.4f}")
 
         except Exception as e:
             if patient_logger:
-                patient_logger.warning(f"[Sleep-Depth Integration] Skipped Calculation of Advanced Sleep Depth Parameters: {e}")
+                patient_logger.warning(
+                    "[Sleep-Depth Integration] Skipped calculation of advanced "
+                    f"sleep-depth parameters: {type(e).__name__}: {e}"
+                )
+
         
         # ==============================================================
         # SCHRITT 4: SEGMENTIERUNG (unchanged)
