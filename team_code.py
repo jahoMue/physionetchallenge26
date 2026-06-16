@@ -34,6 +34,8 @@ import tempfile
 import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
 
 import joblib
 import numpy as np
@@ -50,6 +52,284 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 DEMOGRAPHICS_BASENAME = "demographics.csv"
 LABEL_COLUMN = "Cognitive_Impairment"
 TIME_TO_EVENT_COLUMN = "Time_to_Event"
+
+# ---------------------------------------------------------------------------
+# Preprocessing cache / manifest helpers
+# ---------------------------------------------------------------------------
+
+PREPROCESS_MANIFEST_FILENAME = "preprocessing_manifest.json"
+
+
+def _safe_cache_key(s: str) -> str:
+    """
+    Convert a patient identifier into a filesystem/JSON-friendly key.
+    """
+    return (
+        str(s)
+        .replace("\\", "/")
+        .replace("/", "__")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def _preprocess_manifest_path(feature_output_dir) -> Path:
+    return Path(feature_output_dir) / PREPROCESS_MANIFEST_FILENAME
+
+
+def _load_preprocess_manifest(feature_output_dir) -> Dict:
+    """
+    Load preprocessing manifest from feature_output_dir.
+    """
+    manifest_path = _preprocess_manifest_path(feature_output_dir)
+
+    if not manifest_path.exists():
+        return {}
+
+    try:
+        with open(manifest_path, "r") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+
+    except Exception:
+        pass
+
+    return {}
+
+
+def _save_preprocess_manifest(feature_output_dir, manifest: Dict):
+    """
+    Atomically save preprocessing manifest.
+    """
+    feature_output_dir = Path(feature_output_dir)
+    feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = _preprocess_manifest_path(feature_output_dir)
+    tmp_path = manifest_path.with_suffix(".json.tmp")
+
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    os.replace(tmp_path, manifest_path)
+
+
+def _parquet_file_looks_valid(path) -> bool:
+    """
+    Check that a cached parquet file exists and is readable.
+    This is intentionally conservative: corrupt or empty files are ignored.
+    """
+    if path is None:
+        return False
+
+    try:
+        p = Path(path)
+
+        if not p.exists() or not p.is_file():
+            return False
+
+        if p.stat().st_size == 0:
+            return False
+
+        # Patient-level files are small; segment files are usually manageable.
+        # Reading validates that the parquet is not truncated/corrupt.
+        df = pd.read_parquet(p)
+
+        return df is not None and len(df) > 0
+
+    except Exception:
+        return False
+
+
+def _normalise_cached_preprocessing_entry(entry: Dict) -> Optional[Dict]:
+    """
+    Convert a manifest entry into the same result-like dictionary returned by
+    process_single_patient(), but only if at least one feature parquet is valid.
+    """
+    if not isinstance(entry, dict):
+        return None
+
+    seg_path = entry.get("seg_features_path")
+    pat_path = entry.get("pat_features_path")
+
+    seg_ok = _parquet_file_looks_valid(seg_path)
+    pat_ok = _parquet_file_looks_valid(pat_path)
+
+    if not seg_ok and not pat_ok:
+        return None
+
+    return {
+        "success": True,
+        "seg_features_path": str(Path(seg_path)) if seg_ok else None,
+        "pat_features_path": str(Path(pat_path)) if pat_ok else None,
+        "sleep_summary": entry.get("sleep_summary", None),
+        "from_cache": True,
+    }
+
+
+def _find_cached_preprocessing(
+    feature_output_dir,
+    pipeline_patient_id: str,
+    record_name: Optional[str] = None,
+    logger=None,
+) -> Optional[Dict]:
+    """
+    Look for cached preprocessing results for one subject.
+
+    Primary method:
+      - preprocessing_manifest.json
+
+    Fallback method:
+      - simple filename/path heuristic for older preprocessed files created
+        before the manifest existed.
+    """
+    feature_output_dir = Path(feature_output_dir)
+
+    if not feature_output_dir.exists():
+        return None
+
+    manifest = _load_preprocess_manifest(feature_output_dir)
+
+    possible_keys = [
+        pipeline_patient_id,
+        _safe_cache_key(pipeline_patient_id),
+    ]
+
+    if record_name:
+        possible_keys.append(record_name)
+        possible_keys.append(_safe_cache_key(record_name))
+
+    for key in possible_keys:
+        if key in manifest:
+            cached = _normalise_cached_preprocessing_entry(manifest[key])
+            if cached is not None:
+                if logger:
+                    logger.info(f"Using cached preprocessing for {pipeline_patient_id}")
+                return cached
+
+    # ------------------------------------------------------------------
+    # Fallback heuristic for existing parquet files without manifest.
+    # This is intentionally conservative.
+    # ------------------------------------------------------------------
+    try:
+        patient_token = _safe_cache_key(pipeline_patient_id).lower()
+        record_token = _safe_cache_key(record_name).lower() if record_name else None
+
+        parquet_files = list(feature_output_dir.rglob("*.parquet"))
+
+        matches = []
+        for p in parquet_files:
+            haystack = _safe_cache_key(str(p.relative_to(feature_output_dir))).lower()
+
+            if patient_token in haystack or (record_token and record_token in haystack):
+                matches.append(p)
+
+        if not matches:
+            return None
+
+        seg_candidates = []
+        pat_candidates = []
+
+        for p in matches:
+            name = p.name.lower()
+            full = str(p).lower()
+
+            if "segment" in name or "segments" in name or "seg" in name:
+                seg_candidates.append(p)
+            elif "patient" in name or "pat" in name:
+                pat_candidates.append(p)
+            elif "segment" in full or "segments" in full:
+                seg_candidates.append(p)
+            elif "patient" in full:
+                pat_candidates.append(p)
+
+        seg_path = None
+        pat_path = None
+
+        for p in sorted(seg_candidates, key=lambda x: x.stat().st_mtime, reverse=True):
+            if _parquet_file_looks_valid(p):
+                seg_path = str(p)
+                break
+
+        for p in sorted(pat_candidates, key=lambda x: x.stat().st_mtime, reverse=True):
+            if _parquet_file_looks_valid(p):
+                pat_path = str(p)
+                break
+
+        if seg_path is None and pat_path is None:
+            return None
+
+        cached = {
+            "success": True,
+            "seg_features_path": seg_path,
+            "pat_features_path": pat_path,
+            "sleep_summary": None,
+            "from_cache": True,
+        }
+
+        if logger:
+            logger.info(
+                f"Found cached preprocessing by file scan for {pipeline_patient_id}"
+            )
+
+        return cached
+
+    except Exception as e:
+        if logger:
+            logger.debug(f"Cache scan failed for {pipeline_patient_id}: {e}")
+
+    return None
+
+
+def _remember_preprocessing_result(
+    feature_output_dir,
+    pipeline_patient_id: str,
+    result: Dict,
+    record_name: Optional[str] = None,
+    logger=None,
+):
+    """
+    Store successful preprocessing paths in preprocessing_manifest.json.
+    """
+    if not result or not result.get("success"):
+        return
+
+    feature_output_dir = Path(feature_output_dir)
+    feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+    seg_path = result.get("seg_features_path")
+    pat_path = result.get("pat_features_path")
+
+    if not seg_path and not pat_path:
+        return
+
+    entry = {
+        "pipeline_patient_id": pipeline_patient_id,
+        "record_name": record_name,
+        "seg_features_path": str(Path(seg_path).resolve()) if seg_path else None,
+        "pat_features_path": str(Path(pat_path).resolve()) if pat_path else None,
+        "sleep_summary": result.get("sleep_summary", None),
+        "cached_at_utc": datetime.utcnow().isoformat() + "Z",
+    }
+
+    manifest = _load_preprocess_manifest(feature_output_dir)
+
+    manifest[pipeline_patient_id] = entry
+    manifest[_safe_cache_key(pipeline_patient_id)] = entry
+
+    if record_name:
+        manifest[record_name] = entry
+        manifest[_safe_cache_key(record_name)] = entry
+
+    try:
+        _save_preprocess_manifest(feature_output_dir, manifest)
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"Could not update preprocessing manifest for "
+                f"{pipeline_patient_id}: {e}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -842,37 +1122,102 @@ def train_model(data_folder, model_folder, verbose):
 
     logger.info(f"Found {num_records} records. Starting preprocessing...")
 
-    # -----------------------------------------------------------------------
-    # 4.1 Run preprocessing pipeline.
+        # -----------------------------------------------------------------------
+    # 4.1 Run preprocessing pipeline, with cache/skip support.
     # -----------------------------------------------------------------------
     feature_dir = Path(config.FEATURE_DIR)
     feature_dir.mkdir(parents=True, exist_ok=True)
 
     successful_results = {}
-    max_workers = min(int(getattr(config, "NUM_WORKERS", 1)), num_records)
-    max_workers = max(1, max_workers)
+    records_to_process = []
+    cached_subjects = []
 
     segment_length_sec = getattr(config, "SEGMENT_LENGTH_SEC", 30)
     overlap_sec = getattr(config, "SEGMENT_OVERLAP_SEC", 0)
 
+    logger.info("Checking preprocessing cache for training subjects...")
+
+    for i, record in enumerate(patient_metadata_list):
+        patient_id_bids = record[HEADERS["bids_folder"]]
+        site_id = record[HEADERS["site_id"]]
+        session_id = record[HEADERS["session_id"]]
+
+        record_name = f"{patient_id_bids}_ses-{session_id}"
+        pipeline_patient_id = f"{site_id}/{record_name}"
+        patient_dir = Path(config.PHYSIOLOGICAL_DATA_DIR) / site_id
+
+        cached = _find_cached_preprocessing(
+            feature_output_dir=feature_dir,
+            pipeline_patient_id=pipeline_patient_id,
+            record_name=record_name,
+            logger=logger if verbose else None,
+        )
+
+        if cached is not None:
+            successful_results[pipeline_patient_id] = {
+                "seg_features_path": cached.get("seg_features_path"),
+                "pat_features_path": cached.get("pat_features_path"),
+                "sleep_summary": cached.get("sleep_summary"),
+            }
+            cached_subjects.append(pipeline_patient_id)
+            continue
+
+        records_to_process.append(
+            {
+                "index": i,
+                "record": record,
+                "patient_id_bids": patient_id_bids,
+                "site_id": site_id,
+                "session_id": session_id,
+                "record_name": record_name,
+                "pipeline_patient_id": pipeline_patient_id,
+                "patient_dir": patient_dir,
+            }
+        )
+
+    logger.info(
+        f"Preprocessing cache status: "
+        f"{len(cached_subjects)}/{num_records} already preprocessed, "
+        f"{len(records_to_process)} still need preprocessing."
+    )
+
+    if verbose and records_to_process:
+        pending_preview = [
+            x["pipeline_patient_id"] for x in records_to_process[:50]
+        ]
+        logger.info(
+            "Subjects still needing preprocessing"
+            + (" first 50" if len(records_to_process) > 50 else "")
+            + ": "
+            + ", ".join(pending_preview)
+        )
+
+    if verbose and cached_subjects:
+        cached_preview = cached_subjects[:50]
+        logger.info(
+            "Subjects skipped because cached"
+            + (" first 50" if len(cached_subjects) > 50 else "")
+            + ": "
+            + ", ".join(cached_preview)
+        )
+
+    max_workers = min(int(getattr(config, "NUM_WORKERS", 1)), max(1, len(records_to_process)))
+    max_workers = max(1, max_workers)
+
     total_start = time.time()
     batch_size = max_workers
 
-    for batch_start in range(0, num_records, batch_size):
-        batch_end = min(batch_start + batch_size, num_records)
+    for batch_start in range(0, len(records_to_process), batch_size):
+        batch_end = min(batch_start + batch_size, len(records_to_process))
+        batch = records_to_process[batch_start:batch_end]
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
 
-            for i in range(batch_start, batch_end):
-                record = patient_metadata_list[i]
-                patient_id_bids = record[HEADERS["bids_folder"]]
-                site_id = record[HEADERS["site_id"]]
-                session_id = record[HEADERS["session_id"]]
-
-                record_name = f"{patient_id_bids}_ses-{session_id}"
-                pipeline_patient_id = f"{site_id}/{record_name}"
-                patient_dir = Path(config.PHYSIOLOGICAL_DATA_DIR) / site_id
+            for item in batch:
+                pipeline_patient_id = item["pipeline_patient_id"]
+                patient_dir = item["patient_dir"]
+                record_name = item["record_name"]
 
                 if not patient_dir.exists():
                     logger.warning(f"Directory not found: {patient_dir}. Skipping.")
@@ -887,18 +1232,35 @@ def train_model(data_folder, model_folder, verbose):
                     overlap_sec=overlap_sec,
                     feature_output_dir=feature_dir,
                 )
-                futures[future] = pipeline_patient_id
+
+                futures[future] = item
 
             for future in as_completed(futures):
-                pid = futures[future]
+                item = futures[future]
+                pid = item["pipeline_patient_id"]
+                record_name = item["record_name"]
+
                 try:
                     result = future.result()
+
                     if result and result.get("success"):
                         successful_results[pid] = {
                             "seg_features_path": result.get("seg_features_path"),
                             "pat_features_path": result.get("pat_features_path"),
                             "sleep_summary": result.get("sleep_summary"),
                         }
+
+                        _remember_preprocessing_result(
+                            feature_output_dir=feature_dir,
+                            pipeline_patient_id=pid,
+                            record_name=record_name,
+                            result=result,
+                            logger=logger if verbose else None,
+                        )
+
+                    else:
+                        logger.warning(f"Preprocessing failed for {pid}")
+
                 except Exception as e:
                     logger.error(f"Error processing {pid}: {type(e).__name__}: {e}")
 
@@ -906,10 +1268,21 @@ def train_model(data_folder, model_folder, verbose):
         gc.collect()
 
         elapsed = time.time() - total_start
+        processed_now = batch_end
         logger.info(
-            f"Batch progress: {batch_end}/{num_records} patients processed "
-            f"({len(successful_results)} successful, {elapsed:.0f}s elapsed)"
+            f"Batch progress: {processed_now}/{len(records_to_process)} newly "
+            f"processed subjects, {len(cached_subjects)} cached, "
+            f"{len(successful_results)} usable total, "
+            f"{elapsed:.0f}s elapsed."
         )
+
+    logger.info(
+        f"Preprocessing done: {len(successful_results)}/{num_records} usable "
+        f"subjects. Skipped cached={len(cached_subjects)}, "
+        f"newly processed={len(records_to_process)}. "
+        f"Elapsed={time.time() - total_start:.0f}s"
+    )
+
 
     logger.info(
         f"Preprocessing done: {len(successful_results)}/{num_records} "
@@ -1234,6 +1607,10 @@ def load_model(model_folder, verbose):
         if verbose:
             print("WARNING: Loaded model is not a dictionary. Using fallback.")
         return {"fallback": True}
+    
+    # Runtime-only metadata. Do not save this inside model.sav.
+    model_dict["__model_folder"] = os.path.abspath(model_folder)
+
 
     if verbose:
         mt = model_dict.get("training_config", {}).get("model_type", "unknown")
@@ -1405,37 +1782,79 @@ def run_model(model, record, data_folder, verbose):
             return 0, 0.10
 
         tmp_worker_dir = tempfile.mkdtemp(prefix="physionet_run_worker_")
-        feature_output_dir = Path(tmp_worker_dir) / "features"
-        feature_output_dir.mkdir(parents=True, exist_ok=True)
 
-        result = None
+        # Best-effort persistent test cache.
+        # If model_folder is writable, cached test features survive repeated
+        # local run_model.py executions. If not, fall back to a temp cache.
+        runtime_model_folder = model.get("__model_folder", None)
 
-        # Single-use pool: one worker, one patient, then tear down.
-        with ProcessPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                _preprocess_one_patient_worker,
-                data_folder=data_folder,
-                tmp_model_dir=tmp_worker_dir,
-                pipeline_patient_id=pipeline_patient_id,
-                patient_dir_str=str(patient_dir),
-                record_name=record_name,
-                segment_length_sec=getattr(config, "SEGMENT_LENGTH_SEC", 30),
-                overlap_sec=getattr(config, "SEGMENT_OVERLAP_SEC", 0),
-                feature_output_dir_str=str(feature_output_dir),
-            )
-
+        if runtime_model_folder is not None:
             try:
-                result = future.result()
-            except Exception as e:
-                if verbose:
-                    print(
-                        f"  ! Worker failed for {pipeline_patient_id}: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    traceback.print_exc()
-                result = None
+                feature_output_dir = (
+                    Path(runtime_model_folder)
+                    / "preprocessed_test_cache"
+                    / "features"
+                )
+                feature_output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                feature_output_dir = Path(tmp_worker_dir) / "features"
+                feature_output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            feature_output_dir = Path(tmp_worker_dir) / "features"
+            feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+        result = _find_cached_preprocessing(
+            feature_output_dir=feature_output_dir,
+            pipeline_patient_id=pipeline_patient_id,
+            record_name=record_name,
+            logger=logger if verbose else None,
+        )
+
+        if result is not None:
+            if verbose:
+                print(f"  - Using cached preprocessing for {pipeline_patient_id}")
+
+        else:
+            if verbose:
+                print(f"  - No cached preprocessing for {pipeline_patient_id}; processing...")
+
+            # Single-use pool: one worker, one patient, then tear down.
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    _preprocess_one_patient_worker,
+                    data_folder=data_folder,
+                    tmp_model_dir=tmp_worker_dir,
+                    pipeline_patient_id=pipeline_patient_id,
+                    patient_dir_str=str(patient_dir),
+                    record_name=record_name,
+                    segment_length_sec=getattr(config, "SEGMENT_LENGTH_SEC", 30),
+                    overlap_sec=getattr(config, "SEGMENT_OVERLAP_SEC", 0),
+                    feature_output_dir_str=str(feature_output_dir),
+                )
+
+                try:
+                    result = future.result()
+
+                    if result and result.get("success"):
+                        _remember_preprocessing_result(
+                            feature_output_dir=feature_output_dir,
+                            pipeline_patient_id=pipeline_patient_id,
+                            record_name=record_name,
+                            result=result,
+                            logger=logger if verbose else None,
+                        )
+
+                except Exception as e:
+                    if verbose:
+                        print(
+                            f"  ! Worker failed for {pipeline_patient_id}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        traceback.print_exc()
+                    result = None
 
         gc.collect()
+
 
         if result is None or not result.get("success"):
             if verbose:
