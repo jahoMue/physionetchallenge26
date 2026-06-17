@@ -574,8 +574,8 @@ def process_single_patient(
         patient_features.at[0, 'ORP_A9'] = orp_a9
         patient_features.at[0, 'CSI'] = csi
 
-        result["segment_features"] = segment_features
-        result["patient_features"] = patient_features
+        # result["segment_features"] = segment_features
+        # result["patient_features"] = patient_features
         
         # ==============================================================
         # NEW: SAVE FEATURES TO DISK INSTEAD OF RETURNING THEM

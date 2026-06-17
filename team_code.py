@@ -1056,6 +1056,207 @@ def _predict_feature_table(
         }
     )
 
+def _load_patient_level_features_streaming(
+    successful_results: Dict,
+    feature_dir: Path,
+    demographics_path: Path,
+    logger=None,
+) -> pd.DataFrame:
+    """
+    Memory-safe cohort builder for Challenge training.
+
+    Instead of loading all segment-level parquet files and re-aggregating the
+    entire cohort, this function loads the already saved per-patient
+    patient-level parquet files.
+
+    This avoids creating a huge segment_level DataFrame such as:
+        79,642 segments x ~994 columns
+
+    and prevents Docker/container OOM kills during training.
+    """
+    feature_dir = Path(feature_dir)
+    feature_dir.mkdir(parents=True, exist_ok=True)
+
+    patient_rows = []
+    n_from_patient_cache = 0
+    n_from_segment_fallback = 0
+    n_failed = 0
+
+    # Import here so config has already been patched by _patch_config().
+    try:
+        from feature_table.build_feature_table import (
+            aggregate_to_patient_level,
+            add_demographics,
+            _final_cleanup_patient_level,
+        )
+    except Exception:
+        aggregate_to_patient_level = None
+        add_demographics = None
+        _final_cleanup_patient_level = None
+
+    for i, (pid, paths) in enumerate(successful_results.items(), start=1):
+        patient_df = None
+
+        # --------------------------------------------------------------
+        # Preferred path: use saved patient-level parquet.
+        # --------------------------------------------------------------
+        pat_path = paths.get("pat_features_path")
+        if pat_path and Path(pat_path).exists():
+            try:
+                tmp = pd.read_parquet(pat_path)
+
+                if tmp is not None and len(tmp) > 0:
+                    patient_df = tmp.iloc[[0]].copy()
+
+                    # Ensure the patient_id is exactly the pipeline ID used
+                    # for demographics merging.
+                    patient_df["patient_id"] = pid
+
+                    n_from_patient_cache += 1
+
+            except Exception as e:
+                if logger:
+                    logger.warning(
+                        f"Could not read patient-level features for {pid}: {e}"
+                    )
+                patient_df = None
+
+        # --------------------------------------------------------------
+        # Fallback path: aggregate this one patient's segment parquet only.
+        # This is still memory-safe because we do not keep segment tables.
+        # --------------------------------------------------------------
+        if patient_df is None:
+            seg_path = paths.get("seg_features_path")
+
+            if (
+                aggregate_to_patient_level is not None
+                and seg_path
+                and Path(seg_path).exists()
+            ):
+                try:
+                    seg_df = pd.read_parquet(seg_path)
+
+                    if seg_df is not None and len(seg_df) > 0:
+                        patient_df = aggregate_to_patient_level(
+                            seg_df,
+                            paths.get("sleep_summary"),
+                            logger=None,
+                        )
+
+                        if patient_df is not None and len(patient_df) > 0:
+                            patient_df = patient_df.iloc[[0]].copy()
+                            patient_df["patient_id"] = pid
+                            n_from_segment_fallback += 1
+
+                    del seg_df
+                    gc.collect()
+
+                except Exception as e:
+                    if logger:
+                        logger.warning(
+                            f"Could not aggregate segment features for {pid}: {e}"
+                        )
+                    patient_df = None
+
+        if patient_df is None or len(patient_df) == 0:
+            n_failed += 1
+            continue
+
+        # Downcast each row early when possible.
+        for col in patient_df.select_dtypes(include=["float64"]).columns:
+            patient_df[col] = patient_df[col].astype(np.float32)
+
+        patient_rows.append(patient_df)
+
+        if logger and i % 100 == 0:
+            logger.info(
+                f"Loaded patient-level features: {i}/{len(successful_results)} "
+                f"records scanned, {len(patient_rows)} usable."
+            )
+
+    if not patient_rows:
+        if logger:
+            logger.error("No patient-level feature rows could be loaded.")
+        return pd.DataFrame()
+
+    if logger:
+        logger.info(
+            f"Concatenating {len(patient_rows)} patient-level rows "
+            f"(from patient cache={n_from_patient_cache}, "
+            f"segment fallback={n_from_segment_fallback}, failed={n_failed})."
+        )
+
+    patient_level = pd.concat(patient_rows, ignore_index=True, sort=False)
+
+    del patient_rows
+    gc.collect()
+
+    # --------------------------------------------------------------
+    # Add demographics/labels.
+    # --------------------------------------------------------------
+    if add_demographics is not None:
+        try:
+            patient_level = add_demographics(
+                patient_level,
+                demographics_path=demographics_path,
+                logger=logger,
+            )
+        except Exception as e:
+            if logger:
+                logger.warning(f"add_demographics failed: {e}")
+
+    # --------------------------------------------------------------
+    # Final cleanup.
+    # --------------------------------------------------------------
+    if _final_cleanup_patient_level is not None:
+        try:
+            patient_level = _final_cleanup_patient_level(
+                patient_level,
+                logger=logger,
+            )
+        except Exception as e:
+            if logger:
+                logger.warning(f"Final patient-level cleanup failed: {e}")
+
+    # Downcast again after demographics/cleanup.
+    for col in patient_level.select_dtypes(include=["float64"]).columns:
+        patient_level[col] = patient_level[col].astype(np.float32)
+
+    # Optional integer downcast.
+    for col in patient_level.select_dtypes(include=["int64"]).columns:
+        if col not in ["target", LABEL_COLUMN]:
+            try:
+                patient_level[col] = pd.to_numeric(
+                    patient_level[col],
+                    downcast="integer",
+                )
+            except Exception:
+                pass
+
+    # Save the memory-safe cohort patient table.
+    out_parquet = feature_dir / "features_patient_level.parquet"
+    out_csv = feature_dir / "features_patient_level.csv"
+
+    try:
+        patient_level.to_parquet(out_parquet, index=False)
+        if logger:
+            logger.info(f"Patient-level features saved: {out_parquet}")
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"Could not save patient-level parquet ({e}); saving CSV instead."
+            )
+        patient_level.to_csv(out_csv, index=False)
+        if logger:
+            logger.info(f"Patient-level features saved: {out_csv}")
+
+    if logger:
+        logger.info(
+            f"Memory-safe patient-level table: "
+            f"{patient_level.shape[0]} patients x {patient_level.shape[1]} columns"
+        )
+
+    return patient_level
 
 # ---------------------------------------------------------------------------
 # 4. TRAIN MODEL
@@ -1108,7 +1309,7 @@ def train_model(data_folder, model_folder, verbose):
 
     # Import custom pipeline modules only after config patching.
     from main import process_single_patient
-    from feature_table.build_feature_table import build_cohort_feature_table
+    #from feature_table.build_feature_table import build_cohort_feature_table
     from classification.train_model import train_model as classification_train_model
 
     logger.info("Finding the Challenge data...")
@@ -1290,42 +1491,26 @@ def train_model(data_folder, model_folder, verbose):
     )
 
     # -----------------------------------------------------------------------
-    # 4.2 Load saved per-patient features and build cohort table.
+    # 4.2 Load saved per-patient patient-level features.
+    #
+    # MEMORY FIX:
+    # Do NOT load all segment-level parquet files and do NOT call
+    # build_cohort_feature_table() here. That function concatenates all
+    # segment tables and re-aggregates the cohort, which caused the Docker
+    # process to be killed by OOM.
+    #
+    # process_single_patient() already saved one patient-level parquet per
+    # subject, so use those files directly.
     # -----------------------------------------------------------------------
-    patient_segment_tables = {}
-    patient_level_tables = {}
-    patient_sleep_summaries = {}
-
-    for pid, paths in successful_results.items():
-        seg_path = paths.get("seg_features_path")
-        if seg_path and Path(seg_path).exists():
-            try:
-                patient_segment_tables[pid] = pd.read_parquet(seg_path)
-            except Exception as e:
-                logger.warning(f"Failed to load segment features {seg_path}: {e}")
-
-        pat_path = paths.get("pat_features_path")
-        if pat_path and Path(pat_path).exists():
-            try:
-                patient_level_tables[pid] = pd.read_parquet(pat_path)
-            except Exception as e:
-                logger.warning(f"Failed to load patient features {pat_path}: {e}")
-
-        if paths.get("sleep_summary"):
-            patient_sleep_summaries[pid] = paths["sleep_summary"]
-
-    segment_level, patient_level = build_cohort_feature_table(
-        patient_segment_tables=patient_segment_tables,
-        patient_features_tables=patient_level_tables,
-        patient_sleep_summaries=patient_sleep_summaries,
+    patient_level = _load_patient_level_features_streaming(
+        successful_results=successful_results,
+        feature_dir=feature_dir,
         demographics_path=config.DEMOGRAPHICS_FILE,
-        output_dir=feature_dir,
-        save=True,
         logger=logger if verbose else None,
     )
 
-    del patient_segment_tables, patient_sleep_summaries
     gc.collect()
+
 
     if patient_level is None or len(patient_level) == 0:
         logger.error("Patient-level table is empty. Saving fallback model.")
