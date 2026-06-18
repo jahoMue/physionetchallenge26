@@ -117,8 +117,11 @@ def _save_preprocess_manifest(feature_output_dir, manifest: Dict):
 
 def _parquet_file_looks_valid(path) -> bool:
     """
-    Check that a cached parquet file exists and is readable.
-    This is intentionally conservative: corrupt or empty files are ignored.
+    Lightweight parquet validation.
+
+    Do NOT read the full parquet file here. Some cached patient-level files
+    have tens of thousands of columns, and reading all of them during cache
+    validation can exhaust RAM before training starts.
     """
     if path is None:
         return False
@@ -132,14 +135,22 @@ def _parquet_file_looks_valid(path) -> bool:
         if p.stat().st_size == 0:
             return False
 
-        # Patient-level files are small; segment files are usually manageable.
-        # Reading validates that the parquet is not truncated/corrupt.
-        df = pd.read_parquet(p)
+        try:
+            import pyarrow.parquet as pq
 
-        return df is not None and len(df) > 0
+            pf = pq.ParquetFile(p)
+            md = pf.metadata
+
+            return md is not None and md.num_rows > 0
+
+        except Exception:
+            # Fallback: file exists and is non-empty.
+            # Do not call pd.read_parquet() here.
+            return True
 
     except Exception:
         return False
+
 
 
 def _normalise_cached_preprocessing_entry(entry: Dict) -> Optional[Dict]:
@@ -1056,6 +1067,249 @@ def _predict_feature_table(
         }
     )
 
+def _keep_patient_feature_column(col: str) -> bool:
+    """
+    Keep a compact clinically useful feature set.
+
+    This prevents old cached 20k-33k-column patient parquet files from
+    exhausting memory when building the cohort table.
+    """
+    col = str(col)
+
+    # Required IDs / labels / demographics.
+    if col in {
+        "patient_id",
+        "target",
+        LABEL_COLUMN,
+        "Cognitive_Impairment",
+        "Age",
+        "Sex",
+        "Race",
+        "Ethnicity",
+        "BMI",
+        "SiteID",
+        "BDSPPatientID",
+        "BidsFolder",
+        "SessionID",
+        "CreationTime",
+    }:
+        return True
+
+    # Derived demographics.
+    if col.startswith("demo_"):
+        return True
+
+    # Sleep architecture / compact stage / quality / availability.
+    if col.startswith((
+        "sleep_",
+        "stage_",
+        "missingness_",
+        "n_",
+        "pct_",
+    )):
+        return True
+
+    # CAP / ORP / sleep-depth extras.
+    if (
+        col.startswith("cap_")
+        or col.startswith("ORP_")
+        or col in {
+            "CSI",
+            "Delta_Power_Entropy",
+            "ORP_Mean",
+            "Artifact_Fraction",
+            "ORP_NREM",
+            "ORP_std_NREM",
+            "ORP_REM",
+            "ORP_Wake",
+            "ORP_APeak",
+            "ORP_A9",
+        }
+    ):
+        return True
+
+    # Clinically useful feature families.
+    key_patterns = [
+        # ECG / HRV / RSA
+        "hr_mean",
+        "hr_cv",
+        "hrv_sdnn",
+        "hrv_rmssd",
+        "hrv_pnn50",
+        "hrv_pnn20",
+        "hrv_lf_power",
+        "hrv_hf_power",
+        "hrv_lf_hf_ratio",
+        "hrv_sd1",
+        "hrv_sd2",
+        "hrv_sample_entropy",
+        "hrv_dfa_alpha1",
+        "rsa_p2t_mean",
+        "rsa_coupling_strength",
+
+        # EEG spectral / slowing / complexity
+        "delta_power",
+        "delta_power_rel",
+        "theta_power",
+        "theta_power_rel",
+        "alpha_power",
+        "alpha_power_rel",
+        "sigma_power",
+        "sigma_power_rel",
+        "beta_power",
+        "beta_power_rel",
+        "swa_power",
+        "spindle_power_total",
+        "slow_spindle_power",
+        "fast_spindle_power",
+        "theta_alpha_ratio",
+        "delta_alpha_ratio",
+        "slowing_ratio",
+        "dar",
+        "spectral_entropy",
+        "sample_entropy",
+        "permutation_entropy",
+        "hjorth_complexity",
+
+        # Spindles / slow oscillations / coupling
+        "_sp_density",
+        "_sp_amplitude_mean",
+        "_sp_duration_mean",
+        "_sp_frequency_mean",
+        "_sp_slow_density",
+        "_sp_fast_density",
+        "_sp_fast_slow_ratio",
+        "_sp_rms_mean",
+        "_sp_rel_power_mean",
+        "_so_density",
+        "_so_ptp_amplitude_mean",
+        "_so_slope_mean",
+        "_so_neg_peak_mean",
+        "_so_frequency_mean",
+        "_coup_mrl",
+        "_coup_mean_phase_deg",
+        "_coup_rate",
+        "_coup_pac_mi",
+        "_coup_rayleigh_z",
+
+        # Annotation/event features
+        "ann_sleep_depth",
+        "ann_total_event_count",
+        "ann_arousal_count",
+        "ann_respiratory_event_count",
+    ]
+
+    useful_prefixes = (
+        "all_",
+        "nrem_",
+        "rem_",
+        "n2_",
+        "n3_",
+        "third",
+        "cycle",
+    )
+
+    if col.startswith(useful_prefixes) and any(p in col for p in key_patterns):
+        # Keep robust summary statistics only.
+        allowed_suffixes = (
+            "_mean",
+            "_std",
+            "_median",
+            "_iqr",
+        )
+
+        if col.endswith(allowed_suffixes):
+            return True
+
+        # Keep compact temporal dynamics.
+        if (
+            "third_diff" in col
+            or "third_rel_change" in col
+            or "cycle_trend" in col
+            or "cycle_diff" in col
+            or "cycle_rel_change" in col
+        ):
+            return True
+
+    return False
+
+
+def _read_parquet_compact(path: Path, logger=None) -> Optional[pd.DataFrame]:
+    """
+    Read only selected columns from a patient-level parquet file.
+
+    Important:
+    Do not call pd.read_parquet(path) without columns=... on old cached files,
+    because they may contain 20k-33k columns per patient.
+    """
+    path = Path(path)
+
+    try:
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(path)
+        available_cols = list(pf.schema.names)
+
+        keep_cols = [
+            c for c in available_cols
+            if _keep_patient_feature_column(c)
+        ]
+
+        if "patient_id" in available_cols and "patient_id" not in keep_cols:
+            keep_cols.insert(0, "patient_id")
+
+        if not keep_cols:
+            return None
+
+        return pd.read_parquet(path, columns=keep_cols)
+
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"Compact parquet read failed for {path}: "
+                f"{type(e).__name__}: {e}"
+            )
+        return None
+
+
+def _compact_patient_df(patient_df: pd.DataFrame, pid: str) -> Optional[Dict]:
+    """
+    Convert one patient-level DataFrame into one compact Python dict.
+    """
+    if patient_df is None or len(patient_df) == 0:
+        return None
+
+    patient_df = patient_df.loc[:, ~patient_df.columns.duplicated()]
+    patient_df = patient_df.iloc[[0]].copy()
+    patient_df["patient_id"] = pid
+
+    keep_cols = [
+        c for c in patient_df.columns
+        if _keep_patient_feature_column(c)
+    ]
+
+    if "patient_id" not in keep_cols:
+        keep_cols.insert(0, "patient_id")
+
+    patient_df = patient_df[keep_cols]
+
+    # Convert numpy scalars to compact Python/numpy values.
+    row = {}
+
+    for col, val in patient_df.iloc[0].items():
+        if isinstance(val, (np.floating, float)):
+            if pd.isna(val):
+                row[col] = np.nan
+            else:
+                row[col] = np.float32(val)
+        elif isinstance(val, (np.integer, int)):
+            row[col] = int(val)
+        else:
+            row[col] = val
+
+    return row
+
+
 def _load_patient_level_features_streaming(
     successful_results: Dict,
     feature_dir: Path,
@@ -1065,24 +1319,20 @@ def _load_patient_level_features_streaming(
     """
     Memory-safe cohort builder for Challenge training.
 
-    Instead of loading all segment-level parquet files and re-aggregating the
-    entire cohort, this function loads the already saved per-patient
-    patient-level parquet files.
-
-    This avoids creating a huge segment_level DataFrame such as:
-        79,642 segments x ~994 columns
-
-    and prevents Docker/container OOM kills during training.
+    This function avoids:
+      - concatenating all segment-level features;
+      - reading all columns from old huge patient-level parquet files;
+      - keeping hundreds of one-row DataFrames alive.
     """
     feature_dir = Path(feature_dir)
     feature_dir.mkdir(parents=True, exist_ok=True)
 
-    patient_rows = []
+    rows = []
+
     n_from_patient_cache = 0
     n_from_segment_fallback = 0
     n_failed = 0
 
-    # Import here so config has already been patched by _patch_config().
     try:
         from feature_table.build_feature_table import (
             aggregate_to_patient_level,
@@ -1094,38 +1344,45 @@ def _load_patient_level_features_streaming(
         add_demographics = None
         _final_cleanup_patient_level = None
 
+    total = len(successful_results)
+
     for i, (pid, paths) in enumerate(successful_results.items(), start=1):
-        patient_df = None
+        row = None
 
         # --------------------------------------------------------------
-        # Preferred path: use saved patient-level parquet.
+        # Preferred: compact column-projected read from patient parquet.
         # --------------------------------------------------------------
         pat_path = paths.get("pat_features_path")
+
         if pat_path and Path(pat_path).exists():
             try:
-                tmp = pd.read_parquet(pat_path)
+                patient_df = _read_parquet_compact(
+                    Path(pat_path),
+                    logger=logger,
+                )
 
-                if tmp is not None and len(tmp) > 0:
-                    patient_df = tmp.iloc[[0]].copy()
+                row = _compact_patient_df(patient_df, pid)
 
-                    # Ensure the patient_id is exactly the pipeline ID used
-                    # for demographics merging.
-                    patient_df["patient_id"] = pid
-
+                if row is not None:
                     n_from_patient_cache += 1
+
+                del patient_df
+                gc.collect()
 
             except Exception as e:
                 if logger:
                     logger.warning(
-                        f"Could not read patient-level features for {pid}: {e}"
+                        f"Could not read compact patient-level features "
+                        f"for {pid}: {type(e).__name__}: {e}"
                     )
-                patient_df = None
+                row = None
+                gc.collect()
 
         # --------------------------------------------------------------
-        # Fallback path: aggregate this one patient's segment parquet only.
-        # This is still memory-safe because we do not keep segment tables.
+        # Fallback: aggregate only this patient's segment parquet.
+        # This should happen rarely.
         # --------------------------------------------------------------
-        if patient_df is None:
+        if row is None:
             seg_path = paths.get("seg_features_path")
 
             if (
@@ -1143,53 +1400,126 @@ def _load_patient_level_features_streaming(
                             logger=None,
                         )
 
-                        if patient_df is not None and len(patient_df) > 0:
-                            patient_df = patient_df.iloc[[0]].copy()
-                            patient_df["patient_id"] = pid
+                        row = _compact_patient_df(patient_df, pid)
+
+                        if row is not None:
                             n_from_segment_fallback += 1
 
                     del seg_df
+                    try:
+                        del patient_df
+                    except Exception:
+                        pass
                     gc.collect()
 
                 except Exception as e:
                     if logger:
                         logger.warning(
-                            f"Could not aggregate segment features for {pid}: {e}"
+                            f"Could not aggregate segment features for {pid}: "
+                            f"{type(e).__name__}: {e}"
                         )
-                    patient_df = None
+                    row = None
+                    gc.collect()
 
-        if patient_df is None or len(patient_df) == 0:
+        if row is None:
             n_failed += 1
             continue
 
-        # Downcast each row early when possible.
-        for col in patient_df.select_dtypes(include=["float64"]).columns:
-            patient_df[col] = patient_df[col].astype(np.float32)
-
-        patient_rows.append(patient_df)
+        rows.append(row)
 
         if logger and i % 100 == 0:
             logger.info(
-                f"Loaded patient-level features: {i}/{len(successful_results)} "
-                f"records scanned, {len(patient_rows)} usable."
+                f"Loaded compact patient-level features: "
+                f"{i}/{total} records scanned, {len(rows)} usable."
             )
 
-    if not patient_rows:
+    if not rows:
         if logger:
             logger.error("No patient-level feature rows could be loaded.")
         return pd.DataFrame()
 
     if logger:
         logger.info(
-            f"Concatenating {len(patient_rows)} patient-level rows "
-            f"(from patient cache={n_from_patient_cache}, "
+            f"Creating compact patient table from {len(rows)} rows "
+            f"(patient cache={n_from_patient_cache}, "
             f"segment fallback={n_from_segment_fallback}, failed={n_failed})."
         )
 
-    patient_level = pd.concat(patient_rows, ignore_index=True, sort=False)
+    patient_level = pd.DataFrame.from_records(rows)
 
-    del patient_rows
+    del rows
     gc.collect()
+
+    # --------------------------------------------------------------
+    # Add demographics / labels.
+    # --------------------------------------------------------------
+    if add_demographics is not None:
+        try:
+            patient_level = add_demographics(
+                patient_level,
+                demographics_path=demographics_path,
+                logger=logger,
+            )
+        except Exception as e:
+            if logger:
+                logger.warning(
+                    f"add_demographics failed: {type(e).__name__}: {e}"
+                )
+
+    # --------------------------------------------------------------
+    # Final cleanup.
+    # --------------------------------------------------------------
+    if _final_cleanup_patient_level is not None:
+        try:
+            patient_level = _final_cleanup_patient_level(
+                patient_level,
+                logger=logger,
+            )
+        except Exception as e:
+            if logger:
+                logger.warning(
+                    f"Final patient-level cleanup failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    # Downcast numeric columns.
+    for col in patient_level.select_dtypes(include=["float64"]).columns:
+        patient_level[col] = patient_level[col].astype(np.float32)
+
+    for col in patient_level.select_dtypes(include=["int64"]).columns:
+        if col not in ["target", LABEL_COLUMN, "Cognitive_Impairment"]:
+            try:
+                patient_level[col] = pd.to_numeric(
+                    patient_level[col],
+                    downcast="integer",
+                )
+            except Exception:
+                pass
+
+    # Save compact cohort table.
+    out_parquet = feature_dir / "features_patient_level.parquet"
+    out_csv = feature_dir / "features_patient_level.csv"
+
+    try:
+        patient_level.to_parquet(out_parquet, index=False)
+        if logger:
+            logger.info(f"Compact patient-level features saved: {out_parquet}")
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"Could not save compact patient-level parquet "
+                f"({type(e).__name__}: {e}); saving CSV instead."
+            )
+        patient_level.to_csv(out_csv, index=False)
+
+    if logger:
+        logger.info(
+            f"Compact patient-level table: "
+            f"{patient_level.shape[0]} patients x "
+            f"{patient_level.shape[1]} columns"
+        )
+
+    return patient_level
 
     # --------------------------------------------------------------
     # Add demographics/labels.
@@ -2004,7 +2334,7 @@ def run_model(model, record, data_folder, verbose):
                 print(f"  - No cached preprocessing for {pipeline_patient_id}; processing...")
 
             # Single-use pool: one worker, one patient, then tear down.
-            with ProcessPoolExecutor(max_workers=1) as executor:
+            with ProcessPoolExecutor(max_workers=4) as executor:
                 future = executor.submit(
                     _preprocess_one_patient_worker,
                     data_folder=data_folder,

@@ -69,6 +69,14 @@ STAGE_LABELS = ["W", "N1", "N2", "N3", "REM", "Unknown"]
 # Set to False to reduce dimensionality and overfitting risk.
 # If True, _aggregate_features() adds one *_valid_pct feature per variable.
 ADD_PER_FEATURE_VALID_PCT = False
+# Reduce patient-level dimensionality and memory use.
+# Global aggregation still uses the full numeric feature set, but
+# sleep-stage-specific aggregation is restricted to key features.
+STAGE_AGGREGATE_KEY_FEATURES_ONLY = True
+STAGE_AGGREGATE_MAX_FEATURES = 250
+
+# Bound temporal comparison features.
+TEMPORAL_COMPARISON_MAX_FEATURES = 150
 
 
 def _is_categorical_segment_column(col: str) -> bool:
@@ -518,16 +526,44 @@ def aggregate_to_patient_level(
         _compute_stage_distribution_features(segment_features, stage_col)
     )
 
-    # --- Schlafphasen-spezifische Aggregation ---
+        # --- Schlafphasen-spezifische Aggregation ---
     if stage_col is not None:
         stages = segment_features[stage_col].fillna("Unknown").astype(str)
+
+        # MEMORY / OVERFITTING FIX:
+        # Do not aggregate every numeric feature separately for every sleep
+        # stage. With ~1,000 segment features this creates tens of thousands
+        # of patient-level columns.
+        stage_numeric_cols = numeric_cols
+
+        if STAGE_AGGREGATE_KEY_FEATURES_ONLY:
+            try:
+                stage_numeric_cols = _select_key_features_for_comparison(
+                    segment_features,
+                    numeric_cols,
+                )
+
+                if len(stage_numeric_cols) > STAGE_AGGREGATE_MAX_FEATURES:
+                    stage_numeric_cols = stage_numeric_cols[
+                        :STAGE_AGGREGATE_MAX_FEATURES
+                    ]
+
+                if len(stage_numeric_cols) == 0:
+                    stage_numeric_cols = numeric_cols[
+                        :min(STAGE_AGGREGATE_MAX_FEATURES, len(numeric_cols))
+                    ]
+
+            except Exception:
+                stage_numeric_cols = numeric_cols[
+                    :min(STAGE_AGGREGATE_MAX_FEATURES, len(numeric_cols))
+                ]
 
         # NREM (N1 + N2 + N3)
         nrem_mask = stages.isin(["N1", "N2", "N3"])
         if nrem_mask.sum() > 0:
             nrem_data = segment_features[nrem_mask]
             patient_features.update(
-                _aggregate_features(nrem_data, numeric_cols, prefix="nrem")
+                _aggregate_features(nrem_data, stage_numeric_cols, prefix="nrem")
             )
             patient_features["n_nrem_segments"] = int(nrem_mask.sum())
         else:
@@ -538,7 +574,7 @@ def aggregate_to_patient_level(
         if rem_mask.sum() > 0:
             rem_data = segment_features[rem_mask]
             patient_features.update(
-                _aggregate_features(rem_data, numeric_cols, prefix="rem")
+                _aggregate_features(rem_data, stage_numeric_cols, prefix="rem")
             )
             patient_features["n_rem_segments"] = int(rem_mask.sum())
         else:
@@ -549,7 +585,7 @@ def aggregate_to_patient_level(
         if n3_mask.sum() > 0:
             n3_data = segment_features[n3_mask]
             patient_features.update(
-                _aggregate_features(n3_data, numeric_cols, prefix="n3")
+                _aggregate_features(n3_data, stage_numeric_cols, prefix="n3")
             )
             patient_features["n_n3_segments"] = int(n3_mask.sum())
         else:
@@ -560,7 +596,7 @@ def aggregate_to_patient_level(
         if n2_mask.sum() > 0:
             n2_data = segment_features[n2_mask]
             patient_features.update(
-                _aggregate_features(n2_data, numeric_cols, prefix="n2")
+                _aggregate_features(n2_data, stage_numeric_cols, prefix="n2")
             )
             patient_features["n_n2_segments"] = int(n2_mask.sum())
         else:
@@ -713,7 +749,9 @@ def _compute_night_third_features(
     key_features = _select_key_features_for_comparison(
         segment_features, numeric_cols
     )
-    
+    if len(key_features) > TEMPORAL_COMPARISON_MAX_FEATURES:
+        key_features = key_features[:TEMPORAL_COMPARISON_MAX_FEATURES]
+
     for col in key_features:
         values_by_third = {}
         for third in [1, 2, 3]:
@@ -872,6 +910,9 @@ def _compute_cycle_features(
     key_features = _select_key_features_for_comparison(
         segment_features, numeric_cols
     )
+    if len(key_features) > TEMPORAL_COMPARISON_MAX_FEATURES:
+        key_features = key_features[:TEMPORAL_COMPARISON_MAX_FEATURES]
+
     
     for col in key_features:
         cycle_means = {}
