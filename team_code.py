@@ -5,23 +5,12 @@ team_code.py
 ============
 
 Bridge between the PhysioNet Challenge 2026 interface
-(train_model.py / run_model.py) and our custom pipeline.
+(train_model.py / run_model.py) and the custom pipeline.
 
 Required Challenge functions; signatures MUST NOT change:
     train_model(data_folder, model_folder, verbose)
     load_model(model_folder, verbose)
     run_model(model, record, data_folder, verbose)
-
-Optional helper:
-    save_model(model_folder, model_dict)
-
-This version is adapted for the updated official PhysioNet 2026 code base:
-  - train_model.py still calls train_model(data_folder, model_folder, verbose)
-  - run_model.py loads the model once and calls run_model(...) per patient
-  - run_model.py now asserts that the binary output is boolean-like or NaN
-    and that the probability output is numeric
-  - labels are expected in demographics.csv as Cognitive_Impairment, which
-    may have been produced by the official create_labels.py script
 """
 
 import gc
@@ -36,38 +25,39 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
-
 import joblib
 import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-# ---------------------------------------------------------------------------
-# Constants used without importing helper_code globally.
-# helper_code is safe to import globally, but keeping these literals here makes
-# early path/label handling independent of challenge helper changes.
-# ---------------------------------------------------------------------------
-
 DEMOGRAPHICS_BASENAME = "demographics.csv"
 LABEL_COLUMN = "Cognitive_Impairment"
 TIME_TO_EVENT_COLUMN = "Time_to_Event"
 
-# ---------------------------------------------------------------------------
-# Preprocessing cache / manifest helpers
-# ---------------------------------------------------------------------------
-
 PREPROCESS_MANIFEST_FILENAME = "preprocessing_manifest.json"
+HOLDOUT_PREPROCESS_MARKER_FILENAME = "holdout_preprocessing_complete.json"
 
+
+# =============================================================================
+# Cache helpers
+# =============================================================================
 
 def _safe_cache_key(s: str) -> str:
-    """
-    Convert a patient identifier into a filesystem/JSON-friendly key.
-    """
     return (
         str(s)
         .replace("\\", "/")
         .replace("/", "__")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def _legacy_single_underscore_cache_key(s: str) -> str:
+    return (
+        str(s)
+        .replace("\\", "_")
+        .replace("/", "_")
         .replace(":", "_")
         .replace(" ", "_")
     )
@@ -78,9 +68,6 @@ def _preprocess_manifest_path(feature_output_dir) -> Path:
 
 
 def _load_preprocess_manifest(feature_output_dir) -> Dict:
-    """
-    Load preprocessing manifest from feature_output_dir.
-    """
     manifest_path = _preprocess_manifest_path(feature_output_dir)
 
     if not manifest_path.exists():
@@ -92,7 +79,6 @@ def _load_preprocess_manifest(feature_output_dir) -> Dict:
 
         if isinstance(data, dict):
             return data
-
     except Exception:
         pass
 
@@ -100,9 +86,6 @@ def _load_preprocess_manifest(feature_output_dir) -> Dict:
 
 
 def _save_preprocess_manifest(feature_output_dir, manifest: Dict):
-    """
-    Atomically save preprocessing manifest.
-    """
     feature_output_dir = Path(feature_output_dir)
     feature_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,13 +99,6 @@ def _save_preprocess_manifest(feature_output_dir, manifest: Dict):
 
 
 def _parquet_file_looks_valid(path) -> bool:
-    """
-    Lightweight parquet validation.
-
-    Do NOT read the full parquet file here. Some cached patient-level files
-    have tens of thousands of columns, and reading all of them during cache
-    validation can exhaust RAM before training starts.
-    """
     if path is None:
         return False
 
@@ -142,22 +118,14 @@ def _parquet_file_looks_valid(path) -> bool:
             md = pf.metadata
 
             return md is not None and md.num_rows > 0
-
         except Exception:
-            # Fallback: file exists and is non-empty.
-            # Do not call pd.read_parquet() here.
             return True
 
     except Exception:
         return False
 
 
-
 def _normalise_cached_preprocessing_entry(entry: Dict) -> Optional[Dict]:
-    """
-    Convert a manifest entry into the same result-like dictionary returned by
-    process_single_patient(), but only if at least one feature parquet is valid.
-    """
     if not isinstance(entry, dict):
         return None
 
@@ -188,12 +156,16 @@ def _find_cached_preprocessing(
     """
     Look for cached preprocessing results for one subject.
 
-    Primary method:
-      - preprocessing_manifest.json
+    This version intentionally searches only inside the fixed cache directory:
 
-    Fallback method:
-      - simple filename/path heuristic for older preprocessed files created
-        before the manifest existed.
+        <model_folder>/preprocessed_test_cache/features
+
+    It also supports older filenames created by process_single_patient(), which
+    use single underscores, e.g.:
+
+        S0001_sub-xxx_ses-1_patient_features.parquet
+
+    while the manifest-safe cache key uses double underscores for slashes.
     """
     feature_output_dir = Path(feature_output_dir)
 
@@ -205,11 +177,17 @@ def _find_cached_preprocessing(
     possible_keys = [
         pipeline_patient_id,
         _safe_cache_key(pipeline_patient_id),
+        _legacy_single_underscore_cache_key(pipeline_patient_id),
     ]
 
     if record_name:
-        possible_keys.append(record_name)
-        possible_keys.append(_safe_cache_key(record_name))
+        possible_keys.extend(
+            [
+                record_name,
+                _safe_cache_key(record_name),
+                _legacy_single_underscore_cache_key(record_name),
+            ]
+        )
 
     for key in possible_keys:
         if key in manifest:
@@ -219,21 +197,37 @@ def _find_cached_preprocessing(
                     logger.info(f"Using cached preprocessing for {pipeline_patient_id}")
                 return cached
 
-    # ------------------------------------------------------------------
-    # Fallback heuristic for existing parquet files without manifest.
-    # This is intentionally conservative.
-    # ------------------------------------------------------------------
+    # Fallback scan for old parquet files without a manifest.
     try:
-        patient_token = _safe_cache_key(pipeline_patient_id).lower()
-        record_token = _safe_cache_key(record_name).lower() if record_name else None
+        tokens = set()
+
+        tokens.add(_safe_cache_key(pipeline_patient_id).lower())
+        tokens.add(_legacy_single_underscore_cache_key(pipeline_patient_id).lower())
+        tokens.add(str(pipeline_patient_id).replace("\\", "/").lower())
+
+        if record_name:
+            tokens.add(_safe_cache_key(record_name).lower())
+            tokens.add(_legacy_single_underscore_cache_key(record_name).lower())
+            tokens.add(str(record_name).lower())
+
+        tokens = {t for t in tokens if t}
 
         parquet_files = list(feature_output_dir.rglob("*.parquet"))
 
         matches = []
-        for p in parquet_files:
-            haystack = _safe_cache_key(str(p.relative_to(feature_output_dir))).lower()
 
-            if patient_token in haystack or (record_token and record_token in haystack):
+        for p in parquet_files:
+            rel = str(p.relative_to(feature_output_dir))
+            haystack_raw = rel.replace("\\", "/").lower()
+            haystack_safe = _safe_cache_key(rel).lower()
+            haystack_single = _legacy_single_underscore_cache_key(rel).lower()
+
+            if any(
+                token in haystack_raw
+                or token in haystack_safe
+                or token in haystack_single
+                for token in tokens
+            ):
                 matches.append(p)
 
         if not matches:
@@ -300,9 +294,6 @@ def _remember_preprocessing_result(
     record_name: Optional[str] = None,
     logger=None,
 ):
-    """
-    Store successful preprocessing paths in preprocessing_manifest.json.
-    """
     if not result or not result.get("success"):
         return
 
@@ -326,12 +317,23 @@ def _remember_preprocessing_result(
 
     manifest = _load_preprocess_manifest(feature_output_dir)
 
-    manifest[pipeline_patient_id] = entry
-    manifest[_safe_cache_key(pipeline_patient_id)] = entry
+    keys = [
+        pipeline_patient_id,
+        _safe_cache_key(pipeline_patient_id),
+        _legacy_single_underscore_cache_key(pipeline_patient_id),
+    ]
 
     if record_name:
-        manifest[record_name] = entry
-        manifest[_safe_cache_key(record_name)] = entry
+        keys.extend(
+            [
+                record_name,
+                _safe_cache_key(record_name),
+                _legacy_single_underscore_cache_key(record_name),
+            ]
+        )
+
+    for key in keys:
+        manifest[key] = entry
 
     try:
         _save_preprocess_manifest(feature_output_dir, manifest)
@@ -343,13 +345,11 @@ def _remember_preprocessing_result(
             )
 
 
-# ---------------------------------------------------------------------------
-# 0. Logging
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Logging
+# =============================================================================
 
 class _SimpleLogger:
-    """Fallback logger if loguru is unavailable."""
-
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
 
@@ -371,11 +371,9 @@ class _SimpleLogger:
 
 
 def _setup_logger(verbose: bool):
-    """
-    Configure loguru when available. Otherwise, use a minimal stdout logger.
-    """
     try:
         from loguru import logger
+
         logger.remove()
         if verbose:
             logger.add(
@@ -388,37 +386,25 @@ def _setup_logger(verbose: bool):
         return _SimpleLogger(verbose=verbose)
 
 
-# ---------------------------------------------------------------------------
-# 1. Config patching
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Config patching
+# =============================================================================
 
 def _patch_config(data_folder: str, model_folder: str):
-    """
-    Override config.py path variables so that downstream pipeline modules use
-    the Challenge-provided folders instead of hardcoded local paths.
-
-    This function must run before importing custom pipeline modules that read
-    config.py at import time.
-    """
     import config
 
     data_path = Path(data_folder).resolve()
     model_path = Path(model_folder).resolve()
 
-    # Training/test data root.
     config.TRAINING_SET_DIR = data_path
 
-    # Challenge subdirectories.
     config.PHYSIOLOGICAL_DATA_DIR = data_path / "physiological_data"
     config.ALGORITHMIC_ANNOTATIONS_DIR = data_path / "algorithmic_annotations"
     config.HUMAN_ANNOTATIONS_DIR = data_path / "human_annotations"
     config.DATA_DIR = config.PHYSIOLOGICAL_DATA_DIR
 
-    # Demographics file.
     config.DEMOGRAPHICS_FILE = data_path / DEMOGRAPHICS_BASENAME
 
-    # Persist all custom-pipeline outputs in model_folder during training.
-    # During inference, callers pass a temporary folder here.
     config.OUTPUT_DIR = model_path
     config.FEATURE_DIR = model_path / "features"
     config.MODEL_DIR = model_path / "models"
@@ -434,10 +420,8 @@ def _patch_config(data_folder: str, model_folder: str):
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Disable plotting in the Challenge environment.
     config.PLOT_ENABLED = False
 
-    # Robust defaults if these are absent in config.py.
     if not hasattr(config, "NUM_WORKERS"):
         config.NUM_WORKERS = max(1, min(os.cpu_count() or 1, 4))
     if not hasattr(config, "SEGMENT_LENGTH_SEC"):
@@ -450,15 +434,11 @@ def _patch_config(data_folder: str, model_folder: str):
         config.TARGET_COLUMN = LABEL_COLUMN
 
 
-# ---------------------------------------------------------------------------
-# 2. Label handling for updated official create_labels.py compatibility
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Labels
+# =============================================================================
 
 def _sanitize_label_value(x):
-    """
-    Convert common boolean/numeric/string label representations to 0/1.
-    Return NaN if the value cannot be interpreted.
-    """
     if x is None:
         return np.nan
 
@@ -493,14 +473,6 @@ def _maybe_create_labelled_demographics(
     model_folder: str,
     logger,
 ) -> Path:
-    """
-    Use data_folder/demographics.csv if it already contains Cognitive_Impairment.
-
-    If labels are missing but an ICD file is available, try to call the official
-    create_labels.py function and store the labelled demographics inside
-    model_folder. This is optional robustness; official training data should
-    already include the labels.
-    """
     demographics_path = Path(data_folder) / DEMOGRAPHICS_BASENAME
 
     if not demographics_path.exists():
@@ -514,7 +486,6 @@ def _maybe_create_labelled_demographics(
         logger.warning(f"Could not inspect demographics labels: {e}")
         return demographics_path
 
-    # Try common ICD filename locations.
     candidates = [
         Path(data_folder) / "icd_codes_CI.csv",
         Path(data_folder) / "ICD_codes_CI.csv",
@@ -533,6 +504,7 @@ def _maybe_create_labelled_demographics(
         return demographics_path
 
     labelled_path = Path(model_folder) / "demographics_with_CI.csv"
+
     try:
         from create_labels import create_labels
 
@@ -552,24 +524,19 @@ def _maybe_create_labelled_demographics(
 
 
 def _coerce_target_column(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
-    """
-    Return a copy of df with target_col converted to numeric 0/1/NaN.
-    """
     out = df.copy()
     out[target_col] = out[target_col].apply(_sanitize_label_value)
     return out
 
-# ---------------------------------------------------------------------------
-# 2b. Official age-specific prevalence handling
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# Prevalence handling
+# =============================================================================
 
 AGE_COLUMN_CANDIDATES = ["Age", "age", "demo_age"]
 
 
 def _extract_age_series(df: pd.DataFrame) -> Optional[pd.Series]:
-    """
-    Return numeric age Series from common age columns.
-    """
     for col in AGE_COLUMN_CANDIDATES:
         if col in df.columns:
             return pd.to_numeric(df[col], errors="coerce")
@@ -581,12 +548,6 @@ def _compute_prevalence_reference(
     target_col: str = LABEL_COLUMN,
     logger=None,
 ) -> Dict:
-    """
-    Store labelled training ages and labels as the prevalence reference.
-
-    This mirrors the official evaluator, which computes prevalence for each
-    evaluated age from prevalence-reference patients within +/-2 years.
-    """
     info = {
         "global_prevalence": None,
         "prevalence_reference_ages": [],
@@ -649,13 +610,6 @@ def _official_age_prevalence_from_config(
     training_config: Dict,
     fallback: Optional[float] = None,
 ) -> Optional[float]:
-    """
-    Compute age-specific prevalence using the same rule as official
-    evaluate_model.compute_prevalence():
-
-        labels within abs(age - prevalence_age) <= gap
-        p = max(sum(labels), 0.5) / n
-    """
     if fallback is None:
         fallback = training_config.get("expected_test_prevalence", None)
 
@@ -692,19 +646,37 @@ def _official_age_prevalence_from_config(
     return float(np.clip(prevalence, 1e-6, 1.0 - 1e-6))
 
 
+def _prior_probability_shift(
+    p: np.ndarray,
+    train_prevalence: float,
+    target_prevalence: Optional[float],
+    eps: float = 1e-7,
+) -> np.ndarray:
+    if target_prevalence is None:
+        return p
+
+    train_prevalence = float(np.clip(train_prevalence, eps, 1.0 - eps))
+    target_prevalence = float(np.clip(target_prevalence, eps, 1.0 - eps))
+
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, eps, 1.0 - eps)
+
+    odds = p / (1.0 - p)
+
+    train_prior_odds = train_prevalence / (1.0 - train_prevalence)
+    target_prior_odds = target_prevalence / (1.0 - target_prevalence)
+
+    correction = target_prior_odds / train_prior_odds
+    adjusted_odds = odds * correction
+
+    return adjusted_odds / (1.0 + adjusted_odds)
+
+
 def _rowwise_age_prior_shift_and_thresholds(
     raw_probabilities: np.ndarray,
     feature_table: pd.DataFrame,
     training_config: Dict,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Apply age-specific prior correction and return age-specific decision
-    thresholds.
-
-    For the official reward, if q is the calibrated risk and p is the
-    age-specific prevalence, the expected reward is maximized by predicting
-    positive when q >= p.
-    """
     raw_probabilities = np.asarray(raw_probabilities, dtype=float)
 
     train_prev = training_config.get("training_prevalence", None)
@@ -759,19 +731,12 @@ def _rowwise_age_prior_shift_and_thresholds(
 
     return probabilities, thresholds
 
+
 def _attach_prevalence_info_to_model(
     model_result: Optional[dict],
     prevalence_info: Dict,
     expected_global_prevalence: float,
 ) -> Optional[dict]:
-    """
-    Attach official-style prevalence metadata to a model dictionary.
-
-    This is needed both for:
-      - the internal holdout model, so holdout evaluation uses the same
-        age-specific reward-aware thresholding as inference; and
-      - the final model saved for Challenge inference.
-    """
     if model_result is None:
         return model_result
 
@@ -797,22 +762,14 @@ def _attach_prevalence_info_to_model(
     tc["decision_threshold_strategy"] = "age_specific_official_prevalence"
 
     return model_result
+
+
 def _compute_official_style_reward(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     feature_table: pd.DataFrame,
     training_config: Dict,
 ) -> float:
-    """
-    Compute the official-style age-specific reward for internal validation.
-
-    For each patient:
-      p_age = prevalence among reference patients within +/- prevalence_age_gap
-      TP reward = 1 / p_age - 1
-      FP reward = -1
-      FN reward = -1
-      TN reward = 1 / (1 - p_age) - 1
-    """
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
 
@@ -821,7 +778,6 @@ def _compute_official_style_reward(
         return np.nan
 
     rewards = []
-
     global_prev = training_config.get("expected_test_prevalence", None)
 
     for i in range(len(y_true)):
@@ -852,47 +808,12 @@ def _compute_official_style_reward(
 
     return float(np.mean(rewards))
 
-# ---------------------------------------------------------------------------
-# 3. Probability and prediction helpers
-# ---------------------------------------------------------------------------
 
-def _prior_probability_shift(
-    p: np.ndarray,
-    train_prevalence: float,
-    target_prevalence: Optional[float],
-    eps: float = 1e-7,
-) -> np.ndarray:
-    """
-    Adjust predicted probabilities from the training prior to an expected
-    deployment/test prior.
-
-    odds_target = odds_model *
-        [pi_target / (1 - pi_target)] / [pi_train / (1 - pi_train)]
-    """
-    if target_prevalence is None:
-        return p
-
-    train_prevalence = float(np.clip(train_prevalence, eps, 1.0 - eps))
-    target_prevalence = float(np.clip(target_prevalence, eps, 1.0 - eps))
-
-    p = np.asarray(p, dtype=np.float64)
-    p = np.clip(p, eps, 1.0 - eps)
-
-    odds = p / (1.0 - p)
-
-    train_prior_odds = train_prevalence / (1.0 - train_prevalence)
-    target_prior_odds = target_prevalence / (1.0 - target_prevalence)
-
-    correction = target_prior_odds / train_prior_odds
-    adjusted_odds = odds * correction
-
-    return adjusted_odds / (1.0 + adjusted_odds)
-
+# =============================================================================
+# Prediction helpers
+# =============================================================================
 
 def _safe_predict_proba_positive(ml_model, X_scaled: np.ndarray) -> np.ndarray:
-    """
-    Return P(class=1) robustly, including degenerate/dummy models.
-    """
     if not hasattr(ml_model, "predict_proba"):
         pred = ml_model.predict(X_scaled)
         return np.asarray(pred, dtype=float)
@@ -926,20 +847,6 @@ def _predict_feature_table(
     feature_table: pd.DataFrame,
     verbose: bool = False,
 ) -> pd.DataFrame:
-    """
-    Apply the saved preprocessing chain:
-
-        raw feature table
-        -> column alignment
-        -> imputer
-        -> feature selector
-        -> scaler
-        -> model probabilities
-        -> optional prior-probability correction
-        -> binary threshold
-
-    Used for both internal holdout evaluation and Challenge inference.
-    """
     if model_dict.get("fallback", False):
         patient_ids = (
             feature_table["patient_id"].values
@@ -983,11 +890,13 @@ def _predict_feature_table(
 
     df = feature_table.copy()
 
+    # Remove duplicate columns and create a compact frame.
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
     patient_ids = (
         df["patient_id"].values if "patient_id" in df.columns else np.arange(len(df))
     )
 
-    # Ensure all expected training features exist.
     missing_features = [f for f in feature_names if f not in df.columns]
     if missing_features and verbose:
         print(
@@ -995,13 +904,13 @@ def _predict_feature_table(
             f"{len(missing_features)}/{len(feature_names)}"
         )
 
-    for f in missing_features:
-        df[f] = np.nan
+    # Important:
+    # Do not insert missing columns one by one with df[f] = np.nan.
+    # That causes DataFrame fragmentation and the repeated pandas warning.
+    # reindex creates all missing columns at once.
+    X_df = df.reindex(columns=feature_names)
+    X = X_df.to_numpy(dtype=np.float32, copy=False)
 
-    # Match training feature order exactly.
-    X = df[feature_names].values.astype(np.float32)
-
-    # Saved preprocessing.
     X_imp = imputer.transform(X).astype(np.float32)
 
     if feature_selector is not None:
@@ -1018,12 +927,8 @@ def _predict_feature_table(
         X_sel = X_imp
 
     X_scaled = scaler.transform(X_sel).astype(np.float32)
-
-    # Raw model probability.
     raw_probabilities = _safe_predict_proba_positive(ml_model, X_scaled)
 
-    # Prior correction and binary decision.
-    # Prefer the official age-specific prevalence reference if available.
     training_config = model_dict.get("training_config", {})
 
     if training_config.get("age_prevalence_enabled", False):
@@ -1058,7 +963,6 @@ def _predict_feature_table(
     probabilities = np.clip(probabilities, 0.0, 1.0)
     predictions = (probabilities >= thresholds).astype(int)
 
-
     return pd.DataFrame(
         {
             "patient_id": patient_ids,
@@ -1067,16 +971,14 @@ def _predict_feature_table(
         }
     )
 
-def _keep_patient_feature_column(col: str) -> bool:
-    """
-    Keep a compact clinically useful feature set.
 
-    This prevents old cached 20k-33k-column patient parquet files from
-    exhausting memory when building the cohort table.
-    """
+# =============================================================================
+# Compact feature loading for training
+# =============================================================================
+
+def _keep_patient_feature_column(col: str) -> bool:
     col = str(col)
 
-    # Required IDs / labels / demographics.
     if col in {
         "patient_id",
         "target",
@@ -1095,25 +997,25 @@ def _keep_patient_feature_column(col: str) -> bool:
     }:
         return True
 
-    # Derived demographics.
     if col.startswith("demo_"):
         return True
 
-    # Sleep architecture / compact stage / quality / availability.
-    if col.startswith((
-        "sleep_",
-        "stage_",
-        "missingness_",
-        "n_",
-        "pct_",
-    )):
+    if col.startswith(
+        (
+            "sleep_",
+            "stage_",
+            "missingness_",
+            "n_",
+            "pct_",
+        )
+    ):
         return True
 
-    # CAP / ORP / sleep-depth extras.
     if (
         col.startswith("cap_")
         or col.startswith("ORP_")
-        or col in {
+        or col
+        in {
             "CSI",
             "Delta_Power_Entropy",
             "ORP_Mean",
@@ -1128,9 +1030,7 @@ def _keep_patient_feature_column(col: str) -> bool:
     ):
         return True
 
-    # Clinically useful feature families.
     key_patterns = [
-        # ECG / HRV / RSA
         "hr_mean",
         "hr_cv",
         "hrv_sdnn",
@@ -1146,8 +1046,6 @@ def _keep_patient_feature_column(col: str) -> bool:
         "hrv_dfa_alpha1",
         "rsa_p2t_mean",
         "rsa_coupling_strength",
-
-        # EEG spectral / slowing / complexity
         "delta_power",
         "delta_power_rel",
         "theta_power",
@@ -1170,8 +1068,6 @@ def _keep_patient_feature_column(col: str) -> bool:
         "sample_entropy",
         "permutation_entropy",
         "hjorth_complexity",
-
-        # Spindles / slow oscillations / coupling
         "_sp_density",
         "_sp_amplitude_mean",
         "_sp_duration_mean",
@@ -1191,8 +1087,6 @@ def _keep_patient_feature_column(col: str) -> bool:
         "_coup_rate",
         "_coup_pac_mi",
         "_coup_rayleigh_z",
-
-        # Annotation/event features
         "ann_sleep_depth",
         "ann_total_event_count",
         "ann_arousal_count",
@@ -1210,7 +1104,6 @@ def _keep_patient_feature_column(col: str) -> bool:
     )
 
     if col.startswith(useful_prefixes) and any(p in col for p in key_patterns):
-        # Keep robust summary statistics only.
         allowed_suffixes = (
             "_mean",
             "_std",
@@ -1221,7 +1114,6 @@ def _keep_patient_feature_column(col: str) -> bool:
         if col.endswith(allowed_suffixes):
             return True
 
-        # Keep compact temporal dynamics.
         if (
             "third_diff" in col
             or "third_rel_change" in col
@@ -1235,13 +1127,6 @@ def _keep_patient_feature_column(col: str) -> bool:
 
 
 def _read_parquet_compact(path: Path, logger=None) -> Optional[pd.DataFrame]:
-    """
-    Read only selected columns from a patient-level parquet file.
-
-    Important:
-    Do not call pd.read_parquet(path) without columns=... on old cached files,
-    because they may contain 20k-33k columns per patient.
-    """
     path = Path(path)
 
     try:
@@ -1273,9 +1158,6 @@ def _read_parquet_compact(path: Path, logger=None) -> Optional[pd.DataFrame]:
 
 
 def _compact_patient_df(patient_df: pd.DataFrame, pid: str) -> Optional[Dict]:
-    """
-    Convert one patient-level DataFrame into one compact Python dict.
-    """
     if patient_df is None or len(patient_df) == 0:
         return None
 
@@ -1293,7 +1175,6 @@ def _compact_patient_df(patient_df: pd.DataFrame, pid: str) -> Optional[Dict]:
 
     patient_df = patient_df[keep_cols]
 
-    # Convert numpy scalars to compact Python/numpy values.
     row = {}
 
     for col, val in patient_df.iloc[0].items():
@@ -1316,14 +1197,6 @@ def _load_patient_level_features_streaming(
     demographics_path: Path,
     logger=None,
 ) -> pd.DataFrame:
-    """
-    Memory-safe cohort builder for Challenge training.
-
-    This function avoids:
-      - concatenating all segment-level features;
-      - reading all columns from old huge patient-level parquet files;
-      - keeping hundreds of one-row DataFrames alive.
-    """
     feature_dir = Path(feature_dir)
     feature_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1349,9 +1222,6 @@ def _load_patient_level_features_streaming(
     for i, (pid, paths) in enumerate(successful_results.items(), start=1):
         row = None
 
-        # --------------------------------------------------------------
-        # Preferred: compact column-projected read from patient parquet.
-        # --------------------------------------------------------------
         pat_path = paths.get("pat_features_path")
 
         if pat_path and Path(pat_path).exists():
@@ -1378,10 +1248,6 @@ def _load_patient_level_features_streaming(
                 row = None
                 gc.collect()
 
-        # --------------------------------------------------------------
-        # Fallback: aggregate only this patient's segment parquet.
-        # This should happen rarely.
-        # --------------------------------------------------------------
         if row is None:
             seg_path = paths.get("seg_features_path")
 
@@ -1450,9 +1316,6 @@ def _load_patient_level_features_streaming(
     del rows
     gc.collect()
 
-    # --------------------------------------------------------------
-    # Add demographics / labels.
-    # --------------------------------------------------------------
     if add_demographics is not None:
         try:
             patient_level = add_demographics(
@@ -1466,9 +1329,6 @@ def _load_patient_level_features_streaming(
                     f"add_demographics failed: {type(e).__name__}: {e}"
                 )
 
-    # --------------------------------------------------------------
-    # Final cleanup.
-    # --------------------------------------------------------------
     if _final_cleanup_patient_level is not None:
         try:
             patient_level = _final_cleanup_patient_level(
@@ -1482,7 +1342,6 @@ def _load_patient_level_features_streaming(
                     f"{type(e).__name__}: {e}"
                 )
 
-    # Downcast numeric columns.
     for col in patient_level.select_dtypes(include=["float64"]).columns:
         patient_level[col] = patient_level[col].astype(np.float32)
 
@@ -1496,7 +1355,6 @@ def _load_patient_level_features_streaming(
             except Exception:
                 pass
 
-    # Save compact cohort table.
     out_parquet = feature_dir / "features_patient_level.parquet"
     out_csv = feature_dir / "features_patient_level.csv"
 
@@ -1521,102 +1379,24 @@ def _load_patient_level_features_streaming(
 
     return patient_level
 
-    # --------------------------------------------------------------
-    # Add demographics/labels.
-    # --------------------------------------------------------------
-    if add_demographics is not None:
-        try:
-            patient_level = add_demographics(
-                patient_level,
-                demographics_path=demographics_path,
-                logger=logger,
-            )
-        except Exception as e:
-            if logger:
-                logger.warning(f"add_demographics failed: {e}")
 
-    # --------------------------------------------------------------
-    # Final cleanup.
-    # --------------------------------------------------------------
-    if _final_cleanup_patient_level is not None:
-        try:
-            patient_level = _final_cleanup_patient_level(
-                patient_level,
-                logger=logger,
-            )
-        except Exception as e:
-            if logger:
-                logger.warning(f"Final patient-level cleanup failed: {e}")
-
-    # Downcast again after demographics/cleanup.
-    for col in patient_level.select_dtypes(include=["float64"]).columns:
-        patient_level[col] = patient_level[col].astype(np.float32)
-
-    # Optional integer downcast.
-    for col in patient_level.select_dtypes(include=["int64"]).columns:
-        if col not in ["target", LABEL_COLUMN]:
-            try:
-                patient_level[col] = pd.to_numeric(
-                    patient_level[col],
-                    downcast="integer",
-                )
-            except Exception:
-                pass
-
-    # Save the memory-safe cohort patient table.
-    out_parquet = feature_dir / "features_patient_level.parquet"
-    out_csv = feature_dir / "features_patient_level.csv"
-
-    try:
-        patient_level.to_parquet(out_parquet, index=False)
-        if logger:
-            logger.info(f"Patient-level features saved: {out_parquet}")
-    except Exception as e:
-        if logger:
-            logger.warning(
-                f"Could not save patient-level parquet ({e}); saving CSV instead."
-            )
-        patient_level.to_csv(out_csv, index=False)
-        if logger:
-            logger.info(f"Patient-level features saved: {out_csv}")
-
-    if logger:
-        logger.info(
-            f"Memory-safe patient-level table: "
-            f"{patient_level.shape[0]} patients x {patient_level.shape[1]} columns"
-        )
-
-    return patient_level
-
-# ---------------------------------------------------------------------------
-# 4. TRAIN MODEL
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Training
+# =============================================================================
 
 def train_model(data_folder, model_folder, verbose):
-    """
-    Train the model on all labelled patients found in data_folder.
-    Save everything needed for inference into model_folder.
-    """
-    # Patch paths before importing custom pipeline modules.
     _patch_config(data_folder, model_folder)
     logger = _setup_logger(verbose)
 
     import config
     from helper_code import find_patients, DEMOGRAPHICS_FILE, HEADERS
 
-    # If official create_labels.py has not yet been run, optionally create a
-    # labelled demographics copy in model_folder when an ICD file is available.
     labelled_demographics = _maybe_create_labelled_demographics(
         data_folder=data_folder,
         model_folder=model_folder,
         logger=logger,
     )
 
-    # IMPORTANT:
-    # If create_labels.py created a labelled demographics copy, all downstream
-    # code must use that file. The previous version computed prevalence and
-    # built the feature table from config.DEMOGRAPHICS_FILE, which still pointed
-    # to the original demographics.csv.
     config.DEMOGRAPHICS_FILE = Path(labelled_demographics).resolve()
 
     prevalence_info = _compute_prevalence_reference(
@@ -1624,8 +1404,6 @@ def train_model(data_folder, model_folder, verbose):
         target_col=LABEL_COLUMN,
         logger=logger,
     )
-
-
 
     expected_global_prevalence = prevalence_info.get("global_prevalence", None)
 
@@ -1636,10 +1414,7 @@ def train_model(data_folder, model_folder, verbose):
             "Falling back to 0.10."
         )
 
-
-    # Import custom pipeline modules only after config patching.
     from main import process_single_patient
-    #from feature_table.build_feature_table import build_cohort_feature_table
     from classification.train_model import train_model as classification_train_model
 
     logger.info("Finding the Challenge data...")
@@ -1653,9 +1428,6 @@ def train_model(data_folder, model_folder, verbose):
 
     logger.info(f"Found {num_records} records. Starting preprocessing...")
 
-        # -----------------------------------------------------------------------
-    # 4.1 Run preprocessing pipeline, with cache/skip support.
-    # -----------------------------------------------------------------------
     feature_dir = Path(config.FEATURE_DIR)
     feature_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1732,7 +1504,9 @@ def train_model(data_folder, model_folder, verbose):
             + ", ".join(cached_preview)
         )
 
-    max_workers = min(int(getattr(config, "NUM_WORKERS", 1)), max(1, len(records_to_process)))
+    configured_workers = int(getattr(config, "NUM_WORKERS", 1))
+    configured_workers = max(1, configured_workers)
+    max_workers = min(configured_workers, max(1, len(records_to_process)))
     max_workers = max(1, max_workers)
 
     total_start = time.time()
@@ -1788,14 +1562,12 @@ def train_model(data_folder, model_folder, verbose):
                             result=result,
                             logger=logger if verbose else None,
                         )
-
                     else:
                         logger.warning(f"Preprocessing failed for {pid}")
 
                 except Exception as e:
                     logger.error(f"Error processing {pid}: {type(e).__name__}: {e}")
 
-        # Recycle process pool and release memory after each batch.
         gc.collect()
 
         elapsed = time.time() - total_start
@@ -1814,24 +1586,6 @@ def train_model(data_folder, model_folder, verbose):
         f"Elapsed={time.time() - total_start:.0f}s"
     )
 
-
-    logger.info(
-        f"Preprocessing done: {len(successful_results)}/{num_records} "
-        f"successful in {time.time() - total_start:.0f}s"
-    )
-
-    # -----------------------------------------------------------------------
-    # 4.2 Load saved per-patient patient-level features.
-    #
-    # MEMORY FIX:
-    # Do NOT load all segment-level parquet files and do NOT call
-    # build_cohort_feature_table() here. That function concatenates all
-    # segment tables and re-aggregates the cohort, which caused the Docker
-    # process to be killed by OOM.
-    #
-    # process_single_patient() already saved one patient-level parquet per
-    # subject, so use those files directly.
-    # -----------------------------------------------------------------------
     patient_level = _load_patient_level_features_streaming(
         successful_results=successful_results,
         feature_dir=feature_dir,
@@ -1841,15 +1595,11 @@ def train_model(data_folder, model_folder, verbose):
 
     gc.collect()
 
-
     if patient_level is None or len(patient_level) == 0:
         logger.error("Patient-level table is empty. Saving fallback model.")
         _save_fallback_model(model_folder)
         return
 
-    # -----------------------------------------------------------------------
-    # 4.3 Prepare labels.
-    # -----------------------------------------------------------------------
     target_candidates = [
         "target",
         getattr(config, "TARGET_COLUMN", LABEL_COLUMN),
@@ -1893,9 +1643,6 @@ def train_model(data_folder, model_folder, verbose):
         f"{len(patient_level_valid.columns)} columns."
     )
 
-    # -----------------------------------------------------------------------
-    # 4.4 Optional honest internal holdout, then final refit on all data.
-    # -----------------------------------------------------------------------
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import (
         roc_auc_score,
@@ -1942,7 +1689,6 @@ def train_model(data_folder, model_folder, verbose):
                 prevalence_info=prevalence_info,
                 expected_global_prevalence=expected_global_prevalence,
             )
-
 
             if model_result:
                 y_hold = holdout_df[target_col].astype(int).values
@@ -1996,7 +1742,6 @@ def train_model(data_folder, model_folder, verbose):
                     else:
                         logger.info("  Holdout Reward: N/A")
 
-
                     if np.isfinite(gap):
                         logger.info(
                             f"  CV-Holdout gap: {gap:+.4f}  "
@@ -2019,7 +1764,6 @@ def train_model(data_folder, model_folder, verbose):
                                 if np.isfinite(holdout_reward)
                                 else np.nan
                             ),
-
                         }
                     )
 
@@ -2034,7 +1778,6 @@ def train_model(data_folder, model_folder, verbose):
             "Skipping internal holdout because the dataset/class counts are too small."
         )
 
-    # Final model for Challenge submission: train on all valid labelled data.
     logger.info("Fitting final model on 100% of valid labelled training data...")
 
     try:
@@ -2049,7 +1792,6 @@ def train_model(data_folder, model_folder, verbose):
         final_result = None
 
     if final_result:
-        # Preserve honest holdout diagnostics from pre-refit model.
         if model_result and model_result.get("cv_results"):
             holdout_keys = [
                 "holdout_auroc",
@@ -2076,18 +1818,11 @@ def train_model(data_folder, model_folder, verbose):
         _save_fallback_model(model_folder)
         return
 
-    # -----------------------------------------------------------------------
-    # 4.5 Save final model.
-    # -----------------------------------------------------------------------
-    # Store official-style prevalence reference for inference-time calibration
-    # and prevalence-aware binary decisions.
     model_result = _attach_prevalence_info_to_model(
         model_result=model_result,
         prevalence_info=prevalence_info,
         expected_global_prevalence=expected_global_prevalence,
     )
-
-
 
     save_model(model_folder, model_result)
 
@@ -2096,14 +1831,11 @@ def train_model(data_folder, model_folder, verbose):
     logger.info("Done.")
 
 
-# ---------------------------------------------------------------------------
-# 5. LOAD MODEL
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Model loading
+# =============================================================================
 
 def load_model(model_folder, verbose):
-    """
-    Load the trained model from model_folder/model.sav.
-    """
     model_path = os.path.join(model_folder, "model.sav")
 
     if not os.path.exists(model_path):
@@ -2122,10 +1854,8 @@ def load_model(model_folder, verbose):
         if verbose:
             print("WARNING: Loaded model is not a dictionary. Using fallback.")
         return {"fallback": True}
-    
-    # Runtime-only metadata. Do not save this inside model.sav.
-    model_dict["__model_folder"] = os.path.abspath(model_folder)
 
+    model_dict["__model_folder"] = os.path.abspath(model_folder)
 
     if verbose:
         mt = model_dict.get("training_config", {}).get("model_type", "unknown")
@@ -2136,9 +1866,9 @@ def load_model(model_folder, verbose):
     return model_dict
 
 
-# ---------------------------------------------------------------------------
-# 6. Inference worker
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Inference preprocessing
+# =============================================================================
 
 def _preprocess_one_patient_worker(
     data_folder,
@@ -2150,12 +1880,6 @@ def _preprocess_one_patient_worker(
     overlap_sec,
     feature_output_dir_str,
 ):
-    """
-    Run process_single_patient in a fresh child process.
-
-    The child exits after each patient, so memory held by MNE/YASA/numpy arrays
-    is reclaimed by the OS before the next patient.
-    """
     _patch_config(data_folder, tmp_model_dir)
 
     from main import process_single_patient
@@ -2170,18 +1894,373 @@ def _preprocess_one_patient_worker(
     )
 
 
+def _is_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        test_file = path / ".write_test"
+        with open(test_file, "w") as f:
+            f.write("ok")
+        test_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _get_inference_feature_output_dir(
+    model: dict,
+    data_folder: str,
+    tmp_worker_dir: str,
+) -> Path:
+    """
+    Fixed inference cache directory.
+
+    IMPORTANT:
+    This intentionally keeps the cache path unchanged:
+
+        <model_folder>/preprocessed_test_cache/features
+
+    In your Docker container this is expected to be:
+
+        challenge/model/preprocessed_test_cache/features
+
+    No data-key subfolder is used.
+    """
+    runtime_model_folder = None
+
+    if isinstance(model, dict):
+        runtime_model_folder = model.get("__model_folder", None)
+
+    if runtime_model_folder is not None:
+        fixed_dir = (
+            Path(runtime_model_folder)
+            / "preprocessed_test_cache"
+            / "features"
+        )
+
+        if _is_writable_dir(fixed_dir):
+            return fixed_dir
+
+    fallback_dir = Path(tmp_worker_dir) / "features"
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    return fallback_dir
+
+
+def _holdout_preprocess_marker_path(feature_output_dir: Path) -> Path:
+    return Path(feature_output_dir) / HOLDOUT_PREPROCESS_MARKER_FILENAME
+
+
+def _load_holdout_preprocess_marker(feature_output_dir: Path) -> Optional[Dict]:
+    marker_path = _holdout_preprocess_marker_path(feature_output_dir)
+
+    if not marker_path.exists():
+        return None
+
+    try:
+        with open(marker_path, "r") as f:
+            marker = json.load(f)
+
+        if isinstance(marker, dict):
+            return marker
+    except Exception:
+        pass
+
+    return None
+
+
+def _save_holdout_preprocess_marker(feature_output_dir: Path, marker: Dict):
+    feature_output_dir = Path(feature_output_dir)
+    feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+    marker_path = _holdout_preprocess_marker_path(feature_output_dir)
+    tmp_path = marker_path.with_suffix(".json.tmp")
+
+    with open(tmp_path, "w") as f:
+        json.dump(marker, f, indent=2)
+
+    os.replace(tmp_path, marker_path)
+
+
+def _ensure_holdout_preprocessed_parallel(
+    data_folder: str,
+    tmp_model_dir: str,
+    feature_output_dir: Path,
+    verbose: bool,
+):
+    """
+    Preprocess all holdout patients once, in parallel, using config.NUM_WORKERS.
+
+    Unlike the earlier version, this function does NOT blindly trust an old
+    holdout_preprocessing_complete.json marker. It always scans the fixed cache
+    directory first. If all current holdout subjects are cached, it returns.
+    If some are missing, it processes only the missing ones in parallel.
+    """
+    _patch_config(data_folder, tmp_model_dir)
+
+    import config
+    from helper_code import find_patients, DEMOGRAPHICS_FILE, HEADERS
+
+    logger = _setup_logger(verbose)
+
+    feature_output_dir = Path(feature_output_dir)
+    feature_output_dir.mkdir(parents=True, exist_ok=True)
+
+    marker = _load_holdout_preprocess_marker(feature_output_dir)
+
+    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    patient_metadata_list = find_patients(patient_data_file)
+    num_records = len(patient_metadata_list)
+
+    if num_records == 0:
+        raise FileNotFoundError("No holdout data were provided.")
+
+    # Fast path:
+    # If a previous pass already completed for this cache directory and the
+    # demographics row count matches, do not scan all cached subjects again.
+    if marker is not None:
+        marker_num_records = marker.get("num_records", None)
+        marker_cache_dir = marker.get("cache_dir", None)
+
+        try:
+            marker_num_records_ok = (
+                marker_num_records is None
+                or int(marker_num_records) == int(num_records)
+            )
+        except Exception:
+            marker_num_records_ok = False
+
+        try:
+            marker_cache_dir_ok = (
+                marker_cache_dir is None
+                or Path(marker_cache_dir).resolve() == feature_output_dir.resolve()
+            )
+        except Exception:
+            marker_cache_dir_ok = True
+
+        if marker_num_records_ok and marker_cache_dir_ok:
+            if verbose:
+                logger.info(
+                    f"Holdout preprocessing marker found for "
+                    f"{num_records} records in {feature_output_dir}; "
+                    "skipping full cache scan."
+                )
+            return
+
+
+    segment_length_sec = getattr(config, "SEGMENT_LENGTH_SEC", 30)
+    overlap_sec = getattr(config, "SEGMENT_OVERLAP_SEC", 0)
+
+    records_to_process = []
+    cached_subjects = []
+
+    if verbose:
+        logger.info(f"Checking fixed holdout preprocessing cache: {feature_output_dir}")
+
+    for i, record in enumerate(patient_metadata_list):
+        patient_id_bids = record[HEADERS["bids_folder"]]
+        site_id = record[HEADERS["site_id"]]
+        session_id = record[HEADERS["session_id"]]
+
+        record_name = f"{patient_id_bids}_ses-{session_id}"
+        pipeline_patient_id = f"{site_id}/{record_name}"
+        patient_dir = Path(config.PHYSIOLOGICAL_DATA_DIR) / site_id
+
+        cached = _find_cached_preprocessing(
+            feature_output_dir=feature_output_dir,
+            pipeline_patient_id=pipeline_patient_id,
+            record_name=record_name,
+            # Do not log every cache hit during the global scan.
+            # Otherwise verbose mode prints one line per cached patient per run_model call.
+            logger=None,
+        )
+
+
+        if cached is not None:
+            cached_subjects.append(pipeline_patient_id)
+
+            # If an old cache was found only by filename scan, ensure the
+            # manifest is updated so later lookups are fast.
+            #_remember_preprocessing_result(
+            #    feature_output_dir=feature_output_dir,
+            #    pipeline_patient_id=pipeline_patient_id,
+            #    record_name=record_name,
+            #    result=cached,
+            #    logger=logger if verbose else None,
+            #)
+            continue
+
+        records_to_process.append(
+            {
+                "index": i,
+                "record": record,
+                "patient_id_bids": patient_id_bids,
+                "site_id": site_id,
+                "session_id": session_id,
+                "record_name": record_name,
+                "pipeline_patient_id": pipeline_patient_id,
+                "patient_dir": patient_dir,
+            }
+        )
+
+    configured_workers = int(getattr(config, "NUM_WORKERS", 1))
+    configured_workers = max(1, configured_workers)
+
+    if len(records_to_process) == 0:
+        if verbose:
+            if marker is not None:
+                logger.info(
+                    f"Holdout marker exists and all subjects are cached: "
+                    f"{len(cached_subjects)}/{num_records}."
+                )
+            else:
+                logger.info(
+                    f"All holdout subjects already cached without marker: "
+                    f"{len(cached_subjects)}/{num_records}."
+                )
+
+        _save_holdout_preprocess_marker(
+            feature_output_dir,
+            {
+                "completed_at_utc": datetime.utcnow().isoformat() + "Z",
+                "cache_dir": str(feature_output_dir),
+                "num_records": num_records,
+                "num_cached_initially": len(cached_subjects),
+                "num_newly_processed": 0,
+                "num_failed": 0,
+                "configured_num_workers": configured_workers,
+            },
+        )
+        return
+
+    max_workers = min(configured_workers, len(records_to_process))
+    max_workers = max(1, max_workers)
+    batch_size = max_workers
+
+    if verbose:
+        logger.info(
+            f"Preprocessing holdout data in parallel into fixed cache "
+            f"{feature_output_dir}: "
+            f"{len(records_to_process)} uncached / {num_records} total, "
+            f"config.NUM_WORKERS={configured_workers}, using {max_workers} workers."
+        )
+
+    total_start = time.time()
+    newly_processed = 0
+    failed_subjects = []
+
+    for batch_start in range(0, len(records_to_process), batch_size):
+        batch_end = min(batch_start + batch_size, len(records_to_process))
+        batch = records_to_process[batch_start:batch_end]
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+
+            for item in batch:
+                pipeline_patient_id = item["pipeline_patient_id"]
+                patient_dir = item["patient_dir"]
+                record_name = item["record_name"]
+
+                if not patient_dir.exists():
+                    if verbose:
+                        logger.warning(
+                            f"Patient directory not found: {patient_dir}. Skipping."
+                        )
+                    failed_subjects.append(pipeline_patient_id)
+                    continue
+
+                future = executor.submit(
+                    _preprocess_one_patient_worker,
+                    data_folder=data_folder,
+                    tmp_model_dir=tmp_model_dir,
+                    pipeline_patient_id=pipeline_patient_id,
+                    patient_dir_str=str(patient_dir),
+                    record_name=record_name,
+                    segment_length_sec=segment_length_sec,
+                    overlap_sec=overlap_sec,
+                    feature_output_dir_str=str(feature_output_dir),
+                )
+
+                futures[future] = item
+
+            for future in as_completed(futures):
+                item = futures[future]
+                pid = item["pipeline_patient_id"]
+                record_name = item["record_name"]
+
+                try:
+                    result = future.result()
+
+                    if result and result.get("success"):
+                        newly_processed += 1
+
+                        _remember_preprocessing_result(
+                            feature_output_dir=feature_output_dir,
+                            pipeline_patient_id=pid,
+                            record_name=record_name,
+                            result=result,
+                            logger=logger if verbose else None,
+                        )
+                    else:
+                        failed_subjects.append(pid)
+                        if verbose:
+                            logger.warning(f"Holdout preprocessing failed for {pid}")
+
+                except Exception as e:
+                    failed_subjects.append(pid)
+                    if verbose:
+                        logger.error(
+                            f"Error preprocessing holdout subject {pid}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        logger.error(traceback.format_exc())
+
+        gc.collect()
+
+        if verbose:
+            elapsed = time.time() - total_start
+            logger.info(
+                f"Holdout preprocessing progress: "
+                f"{batch_end}/{len(records_to_process)} uncached subjects scanned, "
+                f"{newly_processed} newly processed, "
+                f"{len(cached_subjects)} initially cached, "
+                f"{len(failed_subjects)} failed, "
+                f"{elapsed:.0f}s elapsed."
+            )
+
+    _save_holdout_preprocess_marker(
+        feature_output_dir,
+        {
+            "completed_at_utc": datetime.utcnow().isoformat() + "Z",
+            "cache_dir": str(feature_output_dir),
+            "num_records": num_records,
+            "num_cached_initially": len(cached_subjects),
+            "num_newly_processed": newly_processed,
+            "num_failed": len(failed_subjects),
+            "failed_subjects": failed_subjects,
+            "configured_num_workers": configured_workers,
+            "used_num_workers": max_workers,
+            "elapsed_sec": time.time() - total_start,
+        },
+    )
+
+    if verbose:
+        logger.info(
+            f"Parallel holdout preprocessing complete in fixed cache "
+            f"{feature_output_dir}: "
+            f"{len(cached_subjects)} cached initially, "
+            f"{newly_processed} newly processed, "
+            f"{len(failed_subjects)} failed, "
+            f"elapsed={time.time() - total_start:.0f}s."
+        )
+
+
+# =============================================================================
+# Demographics during inference
+# =============================================================================
+
 def _manual_add_demographics(
     patient_features: pd.DataFrame,
     demographics_path: Path,
 ) -> pd.DataFrame:
-    """
-    Fallback demographic merge if the custom add_demographics() function fails,
-    e.g., because hidden holdout demographics do not contain labels.
-
-    It creates a pipeline-compatible patient_id:
-        SiteID / (BidsFolder_ses-SessionID)
-    and merges demographics columns onto patient_features.
-    """
     from helper_code import HEADERS
 
     if patient_features is None or len(patient_features) == 0:
@@ -2209,7 +2288,6 @@ def _manual_add_demographics(
     if "patient_id" not in patient_features.columns:
         return patient_features
 
-    # Avoid duplicating existing columns except patient_id.
     merge_cols = ["patient_id"] + [
         c for c in demo.columns if c != "patient_id" and c not in patient_features.columns
     ]
@@ -2222,10 +2300,6 @@ def _add_demographics_safely(
     demographics_path: Path,
     verbose: bool,
 ) -> pd.DataFrame:
-    """
-    Try the custom add_demographics() first; if it fails, use a conservative
-    manual merge that does not require labels.
-    """
     try:
         from feature_table.build_feature_table import add_demographics
 
@@ -2251,27 +2325,17 @@ def _add_demographics_safely(
             return patient_features
 
 
-# ---------------------------------------------------------------------------
-# 7. RUN MODEL
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Inference
+# =============================================================================
 
 def run_model(model, record, data_folder, verbose):
-    """
-    Run the trained model on a single patient record.
-
-    The official run_model.py calls this once per patient and expects:
-        binary_output, probability_output
-
-    binary_output must be boolean-like, i.e., 0/1 or False/True.
-    probability_output must be numeric.
-    """
     from helper_code import HEADERS
 
     patient_id_bids = record[HEADERS["bids_folder"]]
     site_id = record[HEADERS["site_id"]]
     session_id = record[HEADERS["session_id"]]
 
-    # Fallback model.
     if model is None or model.get("fallback", False):
         return 0, 0.10
 
@@ -2279,7 +2343,6 @@ def run_model(model, record, data_folder, verbose):
     tmp_worker_dir = None
 
     try:
-        # Patch config in main process.
         tmp_main = tempfile.mkdtemp(prefix="physionet_run_main_")
         _patch_config(data_folder, tmp_main)
 
@@ -2298,25 +2361,32 @@ def run_model(model, record, data_folder, verbose):
 
         tmp_worker_dir = tempfile.mkdtemp(prefix="physionet_run_worker_")
 
-        # Best-effort persistent test cache.
-        # If model_folder is writable, cached test features survive repeated
-        # local run_model.py executions. If not, fall back to a temp cache.
-        runtime_model_folder = model.get("__model_folder", None)
+        feature_output_dir = _get_inference_feature_output_dir(
+            model=model,
+            data_folder=data_folder,
+            tmp_worker_dir=tmp_worker_dir,
+        )
 
-        if runtime_model_folder is not None:
-            try:
-                feature_output_dir = (
-                    Path(runtime_model_folder)
-                    / "preprocessed_test_cache"
-                    / "features"
-                )
-                feature_output_dir.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                feature_output_dir = Path(tmp_worker_dir) / "features"
-                feature_output_dir.mkdir(parents=True, exist_ok=True)
+        # run_model.py loads `model` once and then calls run_model(...) once per patient.
+        # Therefore, do the expensive global holdout cache/preprocessing check only once
+        # per run_model.py execution.
+        preprocess_state_key = (
+            f"{Path(data_folder).resolve()}::"
+            f"{Path(feature_output_dir).resolve()}"
+        )
+
+        if model.get("__holdout_preprocess_state_key") != preprocess_state_key:
+            _ensure_holdout_preprocessed_parallel(
+                data_folder=data_folder,
+                tmp_model_dir=tmp_worker_dir,
+                feature_output_dir=feature_output_dir,
+                verbose=verbose,
+            )
+            model["__holdout_preprocess_state_key"] = preprocess_state_key
         else:
-            feature_output_dir = Path(tmp_worker_dir) / "features"
-            feature_output_dir.mkdir(parents=True, exist_ok=True)
+            if verbose:
+                print("  - Global holdout preprocessing/cache check already done; skipping.")
+
 
         result = _find_cached_preprocessing(
             feature_output_dir=feature_output_dir,
@@ -2327,14 +2397,19 @@ def run_model(model, record, data_folder, verbose):
 
         if result is not None:
             if verbose:
-                print(f"  - Using cached preprocessing for {pipeline_patient_id}")
+                print(
+                    f"  - Using cached preprocessing for {pipeline_patient_id} "
+                    f"from {feature_output_dir}"
+                )
 
         else:
             if verbose:
-                print(f"  - No cached preprocessing for {pipeline_patient_id}; processing...")
+                print(
+                    f"  - No cached preprocessing for {pipeline_patient_id}; "
+                    f"processing this patient only..."
+                )
 
-            # Single-use pool: one worker, one patient, then tear down.
-            with ProcessPoolExecutor(max_workers=4) as executor:
+            with ProcessPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
                     _preprocess_one_patient_worker,
                     data_folder=data_folder,
@@ -2370,13 +2445,11 @@ def run_model(model, record, data_folder, verbose):
 
         gc.collect()
 
-
         if result is None or not result.get("success"):
             if verbose:
                 print(f"  ! Pipeline unsuccessful for {pipeline_patient_id}")
             return 0, 0.10
 
-        # Load patient-level features.
         pat_path = result.get("pat_features_path")
         seg_path = result.get("seg_features_path")
 
@@ -2436,10 +2509,6 @@ def _predict_single_patient(
     patient_features: pd.DataFrame,
     verbose: bool,
 ) -> Tuple[int, float]:
-    """
-    Predict one patient using the same preprocessing and prior correction used
-    during internal holdout evaluation.
-    """
     pred_df = _predict_feature_table(
         model_dict=model_dict,
         feature_table=patient_features,
@@ -2462,14 +2531,11 @@ def _predict_single_patient(
     return binary_output, probability_output
 
 
-# ---------------------------------------------------------------------------
-# 8. SAVE MODEL
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Save model
+# =============================================================================
 
 def save_model(model_folder, model_dict):
-    """
-    Save the full model dictionary into model_folder/model.sav.
-    """
     os.makedirs(model_folder, exist_ok=True)
     filename = os.path.join(model_folder, "model.sav")
 
@@ -2494,10 +2560,6 @@ def save_model(model_folder, model_dict):
 
 
 def _save_fallback_model(model_folder):
-    """
-    Save a trivial fallback model that always predicts 0 / 0.10.
-    Used when preprocessing or training fails.
-    """
     os.makedirs(model_folder, exist_ok=True)
 
     model_dict = {
@@ -2514,7 +2576,6 @@ def _save_fallback_model(model_folder):
             "prevalence_age_gap": 2,
             "decision_threshold_strategy": "fallback",
         },
-
         "cv_results": {},
         "fallback": True,
     }
@@ -2523,9 +2584,6 @@ def _save_fallback_model(model_folder):
 
 
 def _cleanup_dir(path):
-    """
-    Best-effort recursive directory cleanup.
-    """
     try:
         shutil.rmtree(path, ignore_errors=True)
     except Exception:
