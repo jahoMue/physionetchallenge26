@@ -213,6 +213,28 @@ EEG_AMPLITUDE_MIN_UV = 0.5      # Minimale Amplitude (Flatliner-Erkennung)
 EEG_CORRELATION_THRESHOLD = 0.7 # Mindestkorrelation für Kanal-Mittelung
 
 # ==============================================================================
+# DELTA POWER ENTROPY / ORP / CSI
+# ==============================================================================
+# If False:
+#   - skip compute_delta_power_entropy(...)
+#   - do not add Delta_Power_Entropy, ORP_*, Artifact_Fraction, CSI to patient features
+#   - do not keep these columns during compact training feature loading
+enable_delta_power_entropy = False
+
+DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
+    "Delta_Power_Entropy",
+    "ORP_Mean",
+    "Artifact_Fraction",
+    "ORP_NREM",
+    "ORP_std_NREM",
+    "ORP_REM",
+    "ORP_Wake",
+    "ORP_APeak",
+    "ORP_A9",
+    "CSI",
+]
+
+# ==============================================================================
 # PARALLEL COMPUTING
 # ==============================================================================
 NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)

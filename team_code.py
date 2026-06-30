@@ -432,6 +432,8 @@ def _patch_config(data_folder: str, model_folder: str):
         config.RANDOM_SEED = 56
     if not hasattr(config, "TARGET_COLUMN"):
         config.TARGET_COLUMN = LABEL_COLUMN
+    if not hasattr(config, "enable_delta_power_entropy"):
+        config.enable_delta_power_entropy = False
 
 
 # =============================================================================
@@ -975,6 +977,15 @@ def _predict_feature_table(
 # =============================================================================
 # Compact feature loading for training
 # =============================================================================
+def _delta_power_entropy_enabled() -> bool:
+    try:
+        import config
+        return bool(getattr(config, "enable_delta_power_entropy", True))
+    except Exception:
+        # Backward-compatible default: if the flag is unavailable,
+        # preserve previous behavior.
+        return True
+
 
 def _keep_patient_feature_column(col: str) -> bool:
     col = str(col)
@@ -1011,24 +1022,25 @@ def _keep_patient_feature_column(col: str) -> bool:
     ):
         return True
 
-    if (
-        col.startswith("cap_")
-        or col.startswith("ORP_")
-        or col
-        in {
-            "CSI",
-            "Delta_Power_Entropy",
-            "ORP_Mean",
-            "Artifact_Fraction",
-            "ORP_NREM",
-            "ORP_std_NREM",
-            "ORP_REM",
-            "ORP_Wake",
-            "ORP_APeak",
-            "ORP_A9",
-        }
-    ):
+    if col.startswith("cap_"):
         return True
+
+    delta_power_entropy_cols = {
+        "CSI",
+        "Delta_Power_Entropy",
+        "ORP_Mean",
+        "Artifact_Fraction",
+        "ORP_NREM",
+        "ORP_std_NREM",
+        "ORP_REM",
+        "ORP_Wake",
+        "ORP_APeak",
+        "ORP_A9",
+    }
+
+    if col.startswith("ORP_") or col in delta_power_entropy_cols:
+        return _delta_power_entropy_enabled()
+
 
     key_patterns = [
         "hr_mean",
