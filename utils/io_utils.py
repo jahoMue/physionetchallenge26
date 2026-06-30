@@ -96,6 +96,38 @@ def _stage_label_to_annotation_description(stage_label: str) -> str:
 
     return "Unknown"
 
+def select_two_eeg_derivations(eeg_channels: dict, logger=None) -> dict:
+    """
+    Restrict the detected EEG channels to at most TWO derivations,
+    following the clinical priority order:
+        F4-M1, C4-M1  (preferred)
+        -> O2-M1 -> F3-M2 -> C3-M2 -> O1-M2  (backups)
+
+    Works on the standardized keys returned by find_eeg_channels()
+    (e.g. "F4"), which already cover both "F4" and "F4-M1" raw labels
+    via EEG_CHANNEL_MAPPING.
+    """
+    selected = {}
+    for name in EEG_DERIVATION_PRIORITY:
+        if name in eeg_channels and eeg_channels[name] is not None:
+            selected[name] = eeg_channels[name]
+        if len(selected) == 2:
+            break
+
+    if logger:
+        if len(selected) < 2:
+            logger.warning(
+                f"EEG-Ableitungsauswahl: Nur {len(selected)} Ableitung(en) "
+                f"verfügbar: {list(selected.keys())} "
+                f"(im Record gefunden: {list(eeg_channels.keys())})"
+            )
+        else:
+            logger.info(
+                f"EEG-Ableitungsauswahl: Verwende {list(selected.keys())} "
+                f"(verfügbar: {list(eeg_channels.keys())})"
+            )
+    return selected
+
 
 def _map_numeric_to_stage(value) -> str:
     """
