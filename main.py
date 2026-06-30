@@ -219,9 +219,15 @@ def process_single_patient(
                             f"fs={fs} Hz, Dauer={total_duration_sec/60:.1f} min")
         patient_logger.info(f"Kanäle: {sig_names}")
         
+        t_ann0 = time.perf_counter()
+
         annotations = load_annotations(
             patient_dir, record_name=record_name, patient_id=patient_id
         )
+
+        t_ann = time.perf_counter() - t_ann0
+        patient_logger.info(f"[TIMING] load_annotations: {t_ann:.2f}s")
+
         
         if annotations:
             patient_logger.info(f"Annotationen geladen: {list(annotations.keys())}")

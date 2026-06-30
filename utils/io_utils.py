@@ -43,6 +43,30 @@ from config import (
     RESP_CHANNEL_NAMES, SLEEP_STAGE_ENCODING,
     SIGNAL_DTYPE,
 )
+try:
+    from config import FAST_ANNOTATION_LOADING
+except Exception:
+    FAST_ANNOTATION_LOADING = True
+
+try:
+    from config import ANNOTATION_SOURCE_MODE
+except Exception:
+    ANNOTATION_SOURCE_MODE = "algorithmic_only"
+
+try:
+    from config import FALLBACK_TO_HUMAN_IF_NO_ALGO
+except Exception:
+    FALLBACK_TO_HUMAN_IF_NO_ALGO = True
+
+try:
+    from config import SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND
+except Exception:
+    SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND = True
+
+try:
+    from config import ANNOTATION_FAST_DEBUG
+except Exception:
+    ANNOTATION_FAST_DEBUG = False
 
 # ==============================================================================
 # PHYSIONET 2026 ANNOTATION ENCODINGS
@@ -274,6 +298,152 @@ def load_record(
 # ==============================================================================
 # ANNOTATIONEN LADEN
 # ==============================================================================
+def _is_trivial_annotation_description(desc: str) -> bool:
+    desc = str(desc).strip().lower()
+    return desc in {
+        "",
+        "sleep onset",
+        "recording start",
+        "lights off",
+        "lights on",
+        "recording end",
+    }
+
+
+def _label_is_relevant_annotation_channel(label: str) -> bool:
+    label = str(label).lower().strip()
+
+    if "prob" in label:
+        return False
+
+    return any(
+        key in label
+        for key in (
+            "stage",
+            "sleep",
+            "hypno",
+            "arousal",
+            "arsl",
+            "resp",
+            "limb",
+        )
+    )
+
+
+def _load_annotations_from_edf_fast(edf_path: Path) -> Optional[pd.DataFrame]:
+    """
+    Fast path für Challenge-Annotation-EDFs.
+
+    Ziel:
+    - zuerst echte EDF+/TAL-Annotationen ohne Signaldaten lesen
+    - dann nur relevante numerische Annotation-Signalkanäle lesen
+    - kein MNE Raw, kein raw.get_data() über alle Kanäle
+    - Fallback auf alte robuste Methode
+    """
+    try:
+        import pyedflib
+    except Exception:
+        return _load_annotations_from_edf(edf_path)
+
+    # ------------------------------------------------------------------
+    # 1. EDF+/TAL-Annotationen lesen, falls vorhanden
+    # ------------------------------------------------------------------
+    try:
+        f = pyedflib.EdfReader(str(edf_path))
+        try:
+            annotations = f.readAnnotations()
+        finally:
+            f.close()
+
+        if annotations is not None and len(annotations) >= 3:
+            onsets, durations, descriptions = annotations[0], annotations[1], annotations[2]
+
+            records = []
+            for i in range(len(onsets)):
+                desc = str(descriptions[i]).strip() if i < len(descriptions) else ""
+                if _is_trivial_annotation_description(desc):
+                    continue
+
+                records.append({
+                    "onset": float(onsets[i]),
+                    "duration": float(durations[i]) if i < len(durations) else 0.0,
+                    "description": desc,
+                })
+
+            if records:
+                return pd.DataFrame(records)
+
+    except Exception as e:
+        if ANNOTATION_FAST_DEBUG:
+            print(f"[ANN_FAST_DEBUG] EDF+/TAL failed for {edf_path.name}: {e}")
+
+    # ------------------------------------------------------------------
+    # 2. Challenge-style numerische Annotation-Kanäle lesen
+    # ------------------------------------------------------------------
+    all_annotations = []
+
+    try:
+        f = pyedflib.EdfReader(str(edf_path))
+        try:
+            n_signals = f.signals_in_file
+            labels = [f.getLabel(i).lower().strip() for i in range(n_signals)]
+
+            if ANNOTATION_FAST_DEBUG:
+                print(f"[ANN_FAST_DEBUG] {edf_path.name} labels={labels}")
+
+            for i, label in enumerate(labels):
+                if not _label_is_relevant_annotation_channel(label):
+                    continue
+
+                fs = float(f.getSampleFrequency(i))
+                if fs <= 0:
+                    continue
+
+                try:
+                    sig = f.readSignal(i).astype(SIGNAL_DTYPE, copy=False)
+                except Exception:
+                    continue
+
+                ann_df = None
+
+                # Sleep stages
+                if "stage" in label or "sleep" in label or "hypno" in label:
+                    ann_df = _parse_stage_channel(sig, fs, label)
+
+                # Arousals
+                elif "arousal" in label or "arsl" in label:
+                    ann_df = _parse_binary_event_channel(
+                        sig, fs, label, event_type="arousal"
+                    )
+
+                # Respiratory events
+                elif "resp" in label:
+                    ann_df = _parse_multiclass_event_channel(sig, fs, label)
+
+                # Limb movements
+                elif "limb" in label:
+                    ann_df = _parse_binary_event_channel(
+                        sig, fs, label, event_type="limb_movement"
+                    )
+
+                if ann_df is not None and len(ann_df) > 0:
+                    all_annotations.append(ann_df)
+
+        finally:
+            f.close()
+
+    except Exception as e:
+        if ANNOTATION_FAST_DEBUG:
+            print(f"[ANN_FAST_DEBUG] Signal-channel fast read failed for {edf_path.name}: {e}")
+
+    if all_annotations:
+        return pd.concat(all_annotations, ignore_index=True)
+
+    # ------------------------------------------------------------------
+    # 3. Fallback auf bisherige robuste Methode
+    # ------------------------------------------------------------------
+    return _load_annotations_from_edf(edf_path)
+
 
 def load_annotations(
     patient_dir: Path,
@@ -281,7 +451,13 @@ def load_annotations(
     patient_id: str = None
 ) -> Optional[Dict]:
     """
-    Lädt Schlaf-Annotationen aus den separaten Annotations-Verzeichnissen.
+    Lädt Schlaf-Annotationen aus separaten Annotations-Verzeichnissen.
+
+    Optimierte Strategie:
+    - Algorithmische Annotationen können bevorzugt oder exklusiv geladen werden.
+    - Das ist für Challenge-Testdaten wichtig, weil dort später nur algorithmische
+      Annotationen verfügbar sind.
+    - Embedded-Fallback wird nur verwendet, wenn keine externe Annotation gefunden wurde.
     """
     annotations = {}
 
@@ -299,40 +475,109 @@ def load_annotations(
         else:
             return None
 
-    # --- Human Annotations (EDF + .annot) ---
-    human_dir = HUMAN_ANNOTATIONS_DIR / site_id
-    if human_dir.exists():
-        for edf_file in sorted(human_dir.glob(f"{rec_name}*.edf")):
-            ann_key = f"human_{edf_file.stem}"
-            try:
-                ann_df = _load_annotations_from_edf(edf_file)
-                if ann_df is not None and len(ann_df) > 0:
-                    annotations[ann_key] = ann_df
-            except Exception as e:
-                print(f"[DEBUG] Failed to load human EDF annotation {edf_file.name}: {e}")
+    mode = str(ANNOTATION_SOURCE_MODE).lower().strip()
 
-        for annot_file in sorted(human_dir.glob(f"{rec_name}*.annot")):
-            ann_key = f"human_{annot_file.stem}"
-            try:
-                ann_df = _parse_annot_file(annot_file)
-                if ann_df is not None and len(ann_df) > 0:
-                    annotations[ann_key] = ann_df
-            except Exception as e:
-                print(f"[DEBUG] Failed to load .annot file {annot_file.name}: {e}")
+    def _load_edf_file(edf_file: Path) -> Optional[pd.DataFrame]:
+        if FAST_ANNOTATION_LOADING:
+            return _load_annotations_from_edf_fast(edf_file)
+        return _load_annotations_from_edf(edf_file)
 
-    # --- Algorithmic Annotations (EDF only) ---
-    algo_dir = ALGORITHMIC_ANNOTATIONS_DIR / site_id
-    if algo_dir.exists():
-        for edf_file in sorted(algo_dir.glob(f"{rec_name}*.edf")):
-            ann_key = f"algo_{edf_file.stem}"
-            try:
-                ann_df = _load_annotations_from_edf(edf_file)
-                if ann_df is not None and len(ann_df) > 0:
-                    annotations[ann_key] = ann_df
-            except Exception as e:
-                print(f"[DEBUG] Failed to load algo EDF annotation {edf_file.name}: {e}")
+    def _load_algorithmic_annotations():
+        algo_dir = ALGORITHMIC_ANNOTATIONS_DIR / site_id
+        loaded = 0
 
-    # --- Fallback: Embedded annotations in the physiological EDF ---
+        if algo_dir.exists():
+            for edf_file in sorted(algo_dir.glob(f"{rec_name}*.edf")):
+                ann_key = f"algo_{edf_file.stem}"
+                try:
+                    ann_df = _load_edf_file(edf_file)
+                    if ann_df is not None and len(ann_df) > 0:
+                        annotations[ann_key] = ann_df
+                        loaded += 1
+                except Exception as e:
+                    print(
+                        f"[DEBUG] Failed to load algo EDF annotation "
+                        f"{edf_file.name}: {e}"
+                    )
+
+        return loaded
+
+    def _load_human_annotations():
+        human_dir = HUMAN_ANNOTATIONS_DIR / site_id
+        loaded = 0
+
+        if human_dir.exists():
+            # Human EDF
+            for edf_file in sorted(human_dir.glob(f"{rec_name}*.edf")):
+                ann_key = f"human_{edf_file.stem}"
+                try:
+                    ann_df = _load_edf_file(edf_file)
+                    if ann_df is not None and len(ann_df) > 0:
+                        annotations[ann_key] = ann_df
+                        loaded += 1
+                except Exception as e:
+                    print(
+                        f"[DEBUG] Failed to load human EDF annotation "
+                        f"{edf_file.name}: {e}"
+                    )
+
+            # Human .annot
+            for annot_file in sorted(human_dir.glob(f"{rec_name}*.annot")):
+                ann_key = f"human_{annot_file.stem}"
+                try:
+                    ann_df = _parse_annot_file(annot_file)
+                    if ann_df is not None and len(ann_df) > 0:
+                        annotations[ann_key] = ann_df
+                        loaded += 1
+                except Exception as e:
+                    print(f"[DEBUG] Failed to load .annot file {annot_file.name}: {e}")
+
+        return loaded
+
+    # ------------------------------------------------------------------
+    # Source selection
+    # ------------------------------------------------------------------
+    if mode == "algorithmic_only":
+        n_algo = _load_algorithmic_annotations()
+
+        if n_algo == 0 and FALLBACK_TO_HUMAN_IF_NO_ALGO:
+            _load_human_annotations()
+
+    elif mode == "prefer_algorithmic":
+        n_algo = _load_algorithmic_annotations()
+
+        if n_algo == 0:
+            _load_human_annotations()
+
+    elif mode == "human_only":
+        n_human = _load_human_annotations()
+
+        if n_human == 0:
+            _load_algorithmic_annotations()
+
+    elif mode == "all_external":
+        # Alte fachliche Strategie, aber mit schnellem EDF-Reader und
+        # ohne unnötigen embedded fallback.
+        _load_human_annotations()
+        _load_algorithmic_annotations()
+
+    else:
+        # Sicherer Default für Challenge-Test-Konsistenz
+        n_algo = _load_algorithmic_annotations()
+
+        if n_algo == 0 and FALLBACK_TO_HUMAN_IF_NO_ALGO:
+            _load_human_annotations()
+
+    # ------------------------------------------------------------------
+    # Wenn externe Annotationen gefunden wurden, nicht noch das große
+    # physiologische EDF durchsuchen.
+    # ------------------------------------------------------------------
+    if annotations and SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND:
+        return annotations
+
+    # ------------------------------------------------------------------
+    # Embedded fallback nur wenn keine externe Annotation gefunden wurde
+    # ------------------------------------------------------------------
     phys_edf = patient_dir / f"{rec_name}.edf"
     if phys_edf.exists():
         try:
@@ -342,15 +587,8 @@ def load_annotations(
         except Exception:
             pass
 
-    # --- DEBUG: Log result ---
-    #print(f"[DEBUG] load_annotations result: {len(annotations)} annotation sets loaded")
-    #for key, df in annotations.items():
-    #    print(f"  {key}: {len(df)} entries")
-    #    if len(df) > 0:
-    #        print(f"    Columns: {list(df.columns)}")
-    #        print(f"    First descriptions: {df['description'].head(5).tolist()}")
-
     return annotations if annotations else None
+
 
 
 def _load_annotations_from_edf(edf_path: Path) -> Optional[pd.DataFrame]:

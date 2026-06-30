@@ -434,6 +434,21 @@ def _patch_config(data_folder: str, model_folder: str):
         config.TARGET_COLUMN = LABEL_COLUMN
     if not hasattr(config, "enable_delta_power_entropy"):
         config.enable_delta_power_entropy = False
+        
+    if not hasattr(config, "FAST_ANNOTATION_LOADING"):
+        config.FAST_ANNOTATION_LOADING = True
+
+    if not hasattr(config, "ANNOTATION_SOURCE_MODE"):
+        config.ANNOTATION_SOURCE_MODE = "algorithmic_only"
+
+    if not hasattr(config, "FALLBACK_TO_HUMAN_IF_NO_ALGO"):
+        config.FALLBACK_TO_HUMAN_IF_NO_ALGO = True
+
+    if not hasattr(config, "SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND"):
+        config.SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND = True
+
+    if not hasattr(config, "ANNOTATION_FAST_DEBUG"):
+        config.ANNOTATION_FAST_DEBUG = False
 
 
 # =============================================================================
