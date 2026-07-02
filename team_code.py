@@ -11,6 +11,47 @@ Required Challenge functions; signatures MUST NOT change:
     train_model(data_folder, model_folder, verbose)
     load_model(model_folder, verbose)
     run_model(model, record, data_folder, verbose)
+
+This version changes Challenge training behavior:
+
+1. Trains multiple top-level candidate models instead of only the default
+   single "ensemble" model.
+
+2. Performs hyperparameter optimization for:
+      - xgboost
+      - lightgbm
+      - random_forest
+
+3. Actually applies the tuned hyperparameters to the subsequently trained
+   model by temporarily patching classification.train_model._create_model.
+
+4. Uses an internal holdout split, evaluates all candidate models on that
+   holdout, selects the best candidate, then fits final candidate models on
+   100% of labelled training data and saves the selected final model to
+   model.sav.
+
+Environment variables you can use to control runtime:
+
+    TEAM_MODEL_TYPES
+        Comma-separated list of models.
+        Default:
+            xgboost,lightgbm,random_forest,ensemble
+
+    TEAM_ENABLE_HPO
+        1/true/yes to enable HPO.
+        Default:
+            1
+
+    TEAM_HPO_TRIALS
+        Number of tuning trials per tunable model.
+        Default:
+            25
+
+    TEAM_FINAL_TRAIN_ALL_MODELS
+        If true, fit all candidate models again on 100% labelled data.
+        If false, fit only the best holdout-selected model on full data.
+        Default:
+            1
 """
 
 import gc
@@ -21,9 +62,11 @@ import json
 import shutil
 import tempfile
 import traceback
+import importlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from contextlib import contextmanager
 
 import joblib
 import numpy as np
@@ -37,6 +80,64 @@ TIME_TO_EVENT_COLUMN = "Time_to_Event"
 
 PREPROCESS_MANIFEST_FILENAME = "preprocessing_manifest.json"
 HOLDOUT_PREPROCESS_MARKER_FILENAME = "holdout_preprocessing_complete.json"
+
+
+# =============================================================================
+# Runtime training controls
+# =============================================================================
+
+DEFAULT_MODEL_TYPES = [
+    "xgboost",
+    "lightgbm",
+    "random_forest",
+    "ensemble",
+]
+
+TUNABLE_MODEL_TYPES = {
+    "xgboost",
+    "lightgbm",
+    "random_forest",
+}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, None)
+    if value is None:
+        return bool(default)
+
+    value = str(value).strip().lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+
+    return bool(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, None)
+    if value is None:
+        return int(default)
+
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _get_candidate_model_types() -> List[str]:
+    value = os.environ.get("TEAM_MODEL_TYPES", None)
+
+    if value is None or not str(value).strip():
+        return list(DEFAULT_MODEL_TYPES)
+
+    model_types = [
+        x.strip()
+        for x in str(value).replace(";", ",").split(",")
+        if x.strip()
+    ]
+
+    return model_types or list(DEFAULT_MODEL_TYPES)
 
 
 # =============================================================================
@@ -153,20 +254,6 @@ def _find_cached_preprocessing(
     record_name: Optional[str] = None,
     logger=None,
 ) -> Optional[Dict]:
-    """
-    Look for cached preprocessing results for one subject.
-
-    This version intentionally searches only inside the fixed cache directory:
-
-        <model_folder>/preprocessed_test_cache/features
-
-    It also supports older filenames created by process_single_patient(), which
-    use single underscores, e.g.:
-
-        S0001_sub-xxx_ses-1_patient_features.parquet
-
-    while the manifest-safe cache key uses double underscores for slashes.
-    """
     feature_output_dir = Path(feature_output_dir)
 
     if not feature_output_dir.exists():
@@ -197,10 +284,8 @@ def _find_cached_preprocessing(
                     logger.info(f"Using cached preprocessing for {pipeline_patient_id}")
                 return cached
 
-    # Fallback scan for old parquet files without a manifest.
     try:
         tokens = set()
-
         tokens.add(_safe_cache_key(pipeline_patient_id).lower())
         tokens.add(_legacy_single_underscore_cache_key(pipeline_patient_id).lower())
         tokens.add(str(pipeline_patient_id).replace("\\", "/").lower())
@@ -211,9 +296,7 @@ def _find_cached_preprocessing(
             tokens.add(str(record_name).lower())
 
         tokens = {t for t in tokens if t}
-
         parquet_files = list(feature_output_dir.rglob("*.parquet"))
-
         matches = []
 
         for p in parquet_files:
@@ -265,20 +348,18 @@ def _find_cached_preprocessing(
         if seg_path is None and pat_path is None:
             return None
 
-        cached = {
+        if logger:
+            logger.info(
+                f"Found cached preprocessing by file scan for {pipeline_patient_id}"
+            )
+
+        return {
             "success": True,
             "seg_features_path": seg_path,
             "pat_features_path": pat_path,
             "sleep_summary": None,
             "from_cache": True,
         }
-
-        if logger:
-            logger.info(
-                f"Found cached preprocessing by file scan for {pipeline_patient_id}"
-            )
-
-        return cached
 
     except Exception as e:
         if logger:
@@ -429,12 +510,12 @@ def _patch_config(data_folder: str, model_folder: str):
     if not hasattr(config, "SEGMENT_OVERLAP_SEC"):
         config.SEGMENT_OVERLAP_SEC = 0
     if not hasattr(config, "RANDOM_SEED"):
-        config.RANDOM_SEED = 56
+        config.RANDOM_SEED = 42
     if not hasattr(config, "TARGET_COLUMN"):
         config.TARGET_COLUMN = LABEL_COLUMN
     if not hasattr(config, "enable_delta_power_entropy"):
         config.enable_delta_power_entropy = False
-        
+
     if not hasattr(config, "FAST_ANNOTATION_LOADING"):
         config.FAST_ANNOTATION_LOADING = True
 
@@ -510,13 +591,14 @@ def _maybe_create_labelled_demographics(
         Path(data_folder).parent / "icd_codes_CI.csv",
         Path(data_folder).parent / "ICD_codes_CI.csv",
     ]
+
     icd_path = next((p for p in candidates if p.exists()), None)
 
     if icd_path is None:
         logger.warning(
             f"{LABEL_COLUMN} is not present in {demographics_path}, and no "
-            "ICD file was found. Training will continue, but model training "
-            "will fall back if labels cannot be found later."
+            "ICD file was found. Training will continue, but labels may be "
+            "unavailable."
         )
         return demographics_path
 
@@ -527,7 +609,7 @@ def _maybe_create_labelled_demographics(
 
         logger.info(
             f"{LABEL_COLUMN} missing from demographics.csv. Creating labels "
-            f"with official create_labels.py using {icd_path}..."
+            f"with create_labels.py using {icd_path}..."
         )
         create_labels(
             str(demographics_path),
@@ -595,8 +677,8 @@ def _compute_prevalence_reference(
         return info
 
     labels = df[target_col].apply(_sanitize_label_value)
-
     valid = labels.notna() & ages.notna()
+
     if int(valid.sum()) == 0:
         if logger:
             logger.warning("No valid age/label pairs for prevalence reference.")
@@ -906,8 +988,6 @@ def _predict_feature_table(
     selected_features = model_dict.get("selected_features", feature_names)
 
     df = feature_table.copy()
-
-    # Remove duplicate columns and create a compact frame.
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
     patient_ids = (
@@ -921,10 +1001,6 @@ def _predict_feature_table(
             f"{len(missing_features)}/{len(feature_names)}"
         )
 
-    # Important:
-    # Do not insert missing columns one by one with df[f] = np.nan.
-    # That causes DataFrame fragmentation and the repeated pandas warning.
-    # reindex creates all missing columns at once.
     X_df = df.reindex(columns=feature_names)
     X = X_df.to_numpy(dtype=np.float32, copy=False)
 
@@ -992,13 +1068,12 @@ def _predict_feature_table(
 # =============================================================================
 # Compact feature loading for training
 # =============================================================================
+
 def _delta_power_entropy_enabled() -> bool:
     try:
         import config
         return bool(getattr(config, "enable_delta_power_entropy", True))
     except Exception:
-        # Backward-compatible default: if the flag is unavailable,
-        # preserve previous behavior.
         return True
 
 
@@ -1055,7 +1130,6 @@ def _keep_patient_feature_column(col: str) -> bool:
 
     if col.startswith("ORP_") or col in delta_power_entropy_cols:
         return _delta_power_entropy_enabled()
-
 
     key_patterns = [
         "hr_mean",
@@ -1248,7 +1322,6 @@ def _load_patient_level_features_streaming(
 
     for i, (pid, paths) in enumerate(successful_results.items(), start=1):
         row = None
-
         pat_path = paths.get("pat_features_path")
 
         if pat_path and Path(pat_path).exists():
@@ -1408,7 +1481,533 @@ def _load_patient_level_features_streaming(
 
 
 # =============================================================================
-# Training
+# Multi-model training and true HPO application
+# =============================================================================
+
+@contextmanager
+def _patched_create_model_for_best_params(
+    classification_module,
+    target_model_type: str,
+    best_params: Optional[Dict],
+    logger=None,
+):
+    """
+    classification.train_model.train_model() internally calls
+    classification.train_model._create_model(...).
+
+    The uploaded train_model.py supports HPO, but train_multiple_models()
+    only stores best_params; it does not retrain using them. This context
+    manager temporarily patches _create_model so that the tuned params are
+    applied before CV and final fitting inside train_model().
+    """
+    best_params = dict(best_params or {})
+
+    if not best_params:
+        yield
+        return
+
+    original_create_model = classification_module._create_model
+
+    def patched_create_model(model_type, *args, **kwargs):
+        model = original_create_model(model_type, *args, **kwargs)
+
+        if model_type == target_model_type:
+            try:
+                if hasattr(model, "get_params") and hasattr(model, "set_params"):
+                    valid_keys = set(model.get_params().keys())
+                    compatible_params = {
+                        k: v for k, v in best_params.items()
+                        if k in valid_keys
+                    }
+
+                    ignored_params = sorted(set(best_params) - set(compatible_params))
+
+                    if compatible_params:
+                        model.set_params(**compatible_params)
+
+                    if logger:
+                        logger.info(
+                            f"Applied tuned params to {model_type}: "
+                            f"{compatible_params}"
+                        )
+                        if ignored_params:
+                            logger.info(
+                                f"Ignored incompatible tuned params for "
+                                f"{model_type}: {ignored_params}"
+                            )
+            except Exception as e:
+                if logger:
+                    logger.warning(
+                        f"Could not apply tuned params to {model_type}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+        return model
+
+    classification_module._create_model = patched_create_model
+
+    try:
+        yield
+    finally:
+        classification_module._create_model = original_create_model
+
+
+def _run_hpo_for_model(
+    classification_module,
+    feature_table: pd.DataFrame,
+    model_type: str,
+    handle_imbalance: str,
+    expected_test_prevalence: Optional[float],
+    n_trials: int,
+    logger=None,
+) -> Optional[Dict]:
+    if model_type not in TUNABLE_MODEL_TYPES:
+        return None
+
+    try:
+        from sklearn.impute import SimpleImputer
+        from sklearn.preprocessing import StandardScaler
+
+        X, y, feature_names, _ = classification_module.prepare_training_data(
+            feature_table,
+            logger=logger,
+        )
+
+        if X is None or y is None:
+            if logger:
+                logger.warning(f"HPO skipped for {model_type}: no training data.")
+            return None
+
+        if len(np.unique(y)) < 2:
+            if logger:
+                logger.warning(f"HPO skipped for {model_type}: only one class.")
+            return None
+
+        imputer = SimpleImputer(strategy="median")
+        X_imp = imputer.fit_transform(X).astype(np.float32)
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_imp).astype(np.float32)
+
+        if logger:
+            logger.info(
+                f"Starting hyperparameter optimization for {model_type}: "
+                f"{n_trials} trials"
+            )
+
+        tune_result = classification_module.tune_hyperparameters(
+            X=X_scaled,
+            y=y,
+            model_type=model_type,
+            n_trials=n_trials,
+            handle_imbalance=handle_imbalance,
+            logger=logger,
+            expected_test_prevalence=expected_test_prevalence,
+        )
+
+        if logger:
+            logger.info(
+                f"HPO complete for {model_type}: "
+                f"best_score={tune_result.get('best_score', 'N/A')}, "
+                f"best_params={tune_result.get('best_params', {})}"
+            )
+
+        return tune_result
+
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"HPO failed for {model_type}: {type(e).__name__}: {e}"
+            )
+            logger.debug(traceback.format_exc())
+        return None
+
+
+def _train_single_candidate_model(
+    feature_table: pd.DataFrame,
+    model_type: str,
+    output_dir: Path,
+    expected_test_prevalence: Optional[float],
+    prevalence_info: Dict,
+    tune: bool,
+    n_tune_trials: int,
+    logger=None,
+) -> Dict:
+    classification_module = importlib.import_module("classification.train_model")
+
+    tune_result = None
+    best_params = {}
+
+    if tune and model_type in TUNABLE_MODEL_TYPES:
+        tune_result = _run_hpo_for_model(
+            classification_module=classification_module,
+            feature_table=feature_table,
+            model_type=model_type,
+            handle_imbalance="class_weight",
+            expected_test_prevalence=expected_test_prevalence,
+            n_trials=n_tune_trials,
+            logger=logger,
+        )
+
+        if isinstance(tune_result, dict):
+            best_params = tune_result.get("best_params", {}) or {}
+
+    if logger:
+        if best_params:
+            logger.info(
+                f"Training {model_type} with tuned hyperparameters."
+            )
+        else:
+            logger.info(
+                f"Training {model_type} with default hyperparameters."
+            )
+
+    with _patched_create_model_for_best_params(
+        classification_module=classification_module,
+        target_model_type=model_type,
+        best_params=best_params,
+        logger=logger,
+    ):
+        result = classification_module.train_model(
+            feature_table=feature_table,
+            model_type=model_type,
+            feature_selection=True,
+            handle_imbalance="class_weight",
+            expected_test_prevalence=expected_test_prevalence,
+            output_dir=output_dir,
+            logger=logger,
+        )
+
+    if not result:
+        return {}
+
+    if tune_result is not None:
+        result["tuning_result"] = tune_result
+        result.setdefault("training_config", {})
+        result["training_config"]["hyperparameter_tuning_enabled"] = True
+        result["training_config"]["hyperparameter_tuning_method"] = tune_result.get(
+            "method", "unknown"
+        )
+        result["training_config"]["hyperparameter_tuning_trials"] = int(
+            tune_result.get("n_trials", n_tune_trials)
+        )
+        result["training_config"]["tuned_best_score"] = tune_result.get(
+            "best_score", None
+        )
+        result["training_config"]["tuned_best_params"] = tune_result.get(
+            "best_params", {}
+        )
+        result["training_config"]["tuned_params_applied_to_final_model"] = True
+    else:
+        result.setdefault("training_config", {})
+        result["training_config"]["hyperparameter_tuning_enabled"] = False
+        result["training_config"]["tuned_params_applied_to_final_model"] = False
+
+    result = _attach_prevalence_info_to_model(
+        model_result=result,
+        prevalence_info=prevalence_info,
+        expected_global_prevalence=expected_test_prevalence,
+    )
+
+    return result
+
+
+def _evaluate_candidate_on_holdout(
+    model_result: Dict,
+    holdout_df: pd.DataFrame,
+    target_col: str,
+    verbose: bool,
+    logger=None,
+) -> Dict:
+    from sklearn.metrics import (
+        roc_auc_score,
+        average_precision_score,
+        accuracy_score,
+        f1_score,
+        balanced_accuracy_score,
+    )
+
+    metrics = {}
+
+    try:
+        y_hold = holdout_df[target_col].astype(int).values
+
+        pred_df = _predict_feature_table(
+            model_dict=model_result,
+            feature_table=holdout_df,
+            verbose=verbose,
+        )
+
+        proba = pred_df["probability"].values.astype(float)
+        binary = pred_df["prediction"].values.astype(int)
+
+        if len(np.unique(y_hold)) == 2:
+            metrics["holdout_auroc"] = float(roc_auc_score(y_hold, proba))
+            metrics["holdout_auprc"] = float(average_precision_score(y_hold, proba))
+        else:
+            metrics["holdout_auroc"] = np.nan
+            metrics["holdout_auprc"] = np.nan
+
+        metrics["holdout_accuracy"] = float(accuracy_score(y_hold, binary))
+        metrics["holdout_f1"] = float(f1_score(y_hold, binary, zero_division=0))
+        metrics["holdout_balanced_accuracy"] = float(
+            balanced_accuracy_score(y_hold, binary)
+        )
+
+        reward = _compute_official_style_reward(
+            y_true=y_hold,
+            y_pred=binary,
+            feature_table=holdout_df,
+            training_config=model_result.get("training_config", {}),
+        )
+        metrics["holdout_reward"] = (
+            float(reward) if np.isfinite(reward) else np.nan
+        )
+
+        cv_auroc = model_result.get("cv_results", {}).get("auroc_mean", np.nan)
+        if np.isfinite(cv_auroc) and np.isfinite(metrics["holdout_auroc"]):
+            metrics["cv_holdout_gap"] = float(cv_auroc - metrics["holdout_auroc"])
+        else:
+            metrics["cv_holdout_gap"] = np.nan
+
+        model_result.setdefault("cv_results", {}).update(metrics)
+
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"Holdout evaluation failed: {type(e).__name__}: {e}"
+            )
+        metrics["holdout_error"] = str(e)
+
+    return metrics
+
+
+def _metric_or_neg_inf(value):
+    try:
+        value = float(value)
+        if np.isfinite(value):
+            return value
+    except Exception:
+        pass
+    return -np.inf
+
+
+def _candidate_selection_tuple(result: Dict, prefer_holdout: bool = True) -> Tuple:
+    cv = result.get("cv_results", {}) if isinstance(result, dict) else {}
+
+    if prefer_holdout:
+        primary_reward = cv.get("holdout_reward", np.nan)
+        primary_auroc = cv.get("holdout_auroc", np.nan)
+        primary_auprc = cv.get("holdout_auprc", np.nan)
+    else:
+        primary_reward = cv.get("reward_mean", np.nan)
+        primary_auroc = cv.get("auroc_mean", np.nan)
+        primary_auprc = cv.get("average_precision_mean", np.nan)
+
+    cv_reward = cv.get("reward_mean", np.nan)
+    cv_auroc = cv.get("auroc_mean", np.nan)
+    cv_auprc = cv.get("average_precision_mean", np.nan)
+
+    overfit_gap = cv.get("overfit_gap_auroc", np.nan)
+    overfit_penalty = -_metric_or_neg_inf(overfit_gap)
+
+    return (
+        _metric_or_neg_inf(primary_reward),
+        _metric_or_neg_inf(primary_auroc),
+        _metric_or_neg_inf(primary_auprc),
+        _metric_or_neg_inf(cv_reward),
+        _metric_or_neg_inf(cv_auroc),
+        _metric_or_neg_inf(cv_auprc),
+        overfit_penalty,
+    )
+
+
+def _select_best_candidate(
+    results: Dict[str, Dict],
+    prefer_holdout: bool,
+    logger=None,
+) -> Tuple[Optional[str], Optional[Dict]]:
+    valid = {
+        name: result
+        for name, result in results.items()
+        if isinstance(result, dict)
+        and result
+        and "error" not in result
+        and "model" in result
+        and "cv_results" in result
+    }
+
+    if not valid:
+        return None, None
+
+    best_name, best_result = max(
+        valid.items(),
+        key=lambda item: _candidate_selection_tuple(
+            item[1],
+            prefer_holdout=prefer_holdout,
+        ),
+    )
+
+    if logger:
+        cv = best_result.get("cv_results", {})
+        logger.info("=" * 60)
+        logger.info(
+            f"BEST CANDIDATE SELECTED: {best_name}"
+        )
+        logger.info(
+            f"  holdout_reward={cv.get('holdout_reward', 'N/A')}, "
+            f"holdout_auroc={cv.get('holdout_auroc', 'N/A')}, "
+            f"cv_reward={cv.get('reward_mean', 'N/A')}, "
+            f"cv_auroc={cv.get('auroc_mean', 'N/A')}"
+        )
+        logger.info("=" * 60)
+
+    return best_name, best_result
+
+
+def _log_candidate_comparison(
+    results: Dict[str, Dict],
+    logger,
+    title: str,
+):
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info(title)
+    logger.info("=" * 80)
+    logger.info(
+        f"{'model':<18} {'h_reward':>10} {'h_auc':>10} {'h_ap':>10} "
+        f"{'cv_reward':>10} {'cv_auc':>10} {'cv_ap':>10} {'tuned':>8}"
+    )
+    logger.info("-" * 80)
+
+    rows = []
+
+    for name, result in results.items():
+        if not isinstance(result, dict) or "error" in result:
+            logger.info(f"{name:<18} ERROR: {result.get('error', 'unknown')}")
+            continue
+
+        cv = result.get("cv_results", {})
+        tc = result.get("training_config", {})
+
+        rows.append(
+            {
+                "model": name,
+                "holdout_reward": cv.get("holdout_reward", np.nan),
+                "holdout_auroc": cv.get("holdout_auroc", np.nan),
+                "holdout_auprc": cv.get("holdout_auprc", np.nan),
+                "cv_reward": cv.get("reward_mean", np.nan),
+                "cv_auroc": cv.get("auroc_mean", np.nan),
+                "cv_auprc": cv.get("average_precision_mean", np.nan),
+                "tuned": tc.get("hyperparameter_tuning_enabled", False),
+            }
+        )
+
+    rows.sort(
+        key=lambda r: (
+            _metric_or_neg_inf(r["holdout_reward"]),
+            _metric_or_neg_inf(r["holdout_auroc"]),
+            _metric_or_neg_inf(r["cv_reward"]),
+            _metric_or_neg_inf(r["cv_auroc"]),
+        ),
+        reverse=True,
+    )
+
+    for r in rows:
+        logger.info(
+            f"{r['model']:<18} "
+            f"{_format_metric(r['holdout_reward']):>10} "
+            f"{_format_metric(r['holdout_auroc']):>10} "
+            f"{_format_metric(r['holdout_auprc']):>10} "
+            f"{_format_metric(r['cv_reward']):>10} "
+            f"{_format_metric(r['cv_auroc']):>10} "
+            f"{_format_metric(r['cv_auprc']):>10} "
+            f"{str(bool(r['tuned'])):>8}"
+        )
+
+    logger.info("=" * 80)
+
+
+def _format_metric(x):
+    try:
+        x = float(x)
+        if np.isfinite(x):
+            return f"{x:.4f}"
+    except Exception:
+        pass
+    return "N/A"
+
+
+def _train_candidate_models(
+    feature_table: pd.DataFrame,
+    model_types: List[str],
+    output_dir: Path,
+    expected_test_prevalence: Optional[float],
+    prevalence_info: Dict,
+    tune: bool,
+    n_tune_trials: int,
+    logger=None,
+) -> Dict[str, Dict]:
+    results = {}
+
+    if logger:
+        logger.info("=" * 70)
+        logger.info(
+            f"MULTI-MODEL TRAINING: {len(model_types)} candidate models"
+        )
+        logger.info(
+            f"Models: {', '.join(model_types)}"
+        )
+        logger.info(
+            f"HPO enabled: {tune}, trials per tunable model: {n_tune_trials}"
+        )
+        logger.info("=" * 70)
+
+    for model_type in model_types:
+        if logger:
+            logger.info("")
+            logger.info("─" * 70)
+            logger.info(f"TRAINING CANDIDATE MODEL: {model_type}")
+            logger.info("─" * 70)
+
+        try:
+            result = _train_single_candidate_model(
+                feature_table=feature_table,
+                model_type=model_type,
+                output_dir=output_dir,
+                expected_test_prevalence=expected_test_prevalence,
+                prevalence_info=prevalence_info,
+                tune=tune,
+                n_tune_trials=n_tune_trials,
+                logger=logger,
+            )
+
+            if not result:
+                results[model_type] = {
+                    "error": "training returned empty result"
+                }
+            else:
+                results[model_type] = result
+
+        except Exception as e:
+            if logger:
+                logger.error(
+                    f"Training failed for {model_type}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                logger.debug(traceback.format_exc())
+
+            results[model_type] = {
+                "error": f"{type(e).__name__}: {e}"
+            }
+
+        gc.collect()
+
+    return results
+
+
+# =============================================================================
+# Training entrypoint
 # =============================================================================
 
 def train_model(data_folder, model_folder, verbose):
@@ -1441,8 +2040,21 @@ def train_model(data_folder, model_folder, verbose):
             "Falling back to 0.10."
         )
 
+    model_types = _get_candidate_model_types()
+    enable_hpo = _env_bool("TEAM_ENABLE_HPO", True)
+    n_tune_trials = max(1, _env_int("TEAM_HPO_TRIALS", 25))
+    final_train_all_models = _env_bool("TEAM_FINAL_TRAIN_ALL_MODELS", True)
+
+    logger.info("=" * 70)
+    logger.info("TEAM TRAINING CONFIGURATION")
+    logger.info("=" * 70)
+    logger.info(f"Candidate models: {model_types}")
+    logger.info(f"Hyperparameter optimization enabled: {enable_hpo}")
+    logger.info(f"HPO trials per tunable model: {n_tune_trials}")
+    logger.info(f"Final train all models: {final_train_all_models}")
+    logger.info("=" * 70)
+
     from main import process_single_patient
-    from classification.train_model import train_model as classification_train_model
 
     logger.info("Finding the Challenge data...")
 
@@ -1510,26 +2122,6 @@ def train_model(data_folder, model_folder, verbose):
         f"{len(cached_subjects)}/{num_records} already preprocessed, "
         f"{len(records_to_process)} still need preprocessing."
     )
-
-    if verbose and records_to_process:
-        pending_preview = [
-            x["pipeline_patient_id"] for x in records_to_process[:50]
-        ]
-        logger.info(
-            "Subjects still needing preprocessing"
-            + (" first 50" if len(records_to_process) > 50 else "")
-            + ": "
-            + ", ".join(pending_preview)
-        )
-
-    if verbose and cached_subjects:
-        cached_preview = cached_subjects[:50]
-        logger.info(
-            "Subjects skipped because cached"
-            + (" first 50" if len(cached_subjects) > 50 else "")
-            + ": "
-            + ", ".join(cached_preview)
-        )
 
     configured_workers = int(getattr(config, "NUM_WORKERS", 1))
     configured_workers = max(1, configured_workers)
@@ -1671,13 +2263,6 @@ def train_model(data_folder, model_folder, verbose):
     )
 
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import (
-        roc_auc_score,
-        average_precision_score,
-        accuracy_score,
-        f1_score,
-        balanced_accuracy_score,
-    )
 
     class_counts = patient_level_valid[target_col].value_counts()
     can_holdout = (
@@ -1686,7 +2271,9 @@ def train_model(data_folder, model_folder, verbose):
         and int(class_counts.min()) >= 2
     )
 
-    model_result = None
+    holdout_selected_model_type = None
+    holdout_selected_result = None
+    holdout_results = {}
 
     if can_holdout:
         try:
@@ -1694,7 +2281,7 @@ def train_model(data_folder, model_folder, verbose):
                 patient_level_valid,
                 test_size=0.20,
                 stratify=patient_level_valid[target_col].astype(int),
-                random_state=int(getattr(config, "RANDOM_SEED", 56)),
+                random_state=int(getattr(config, "RANDOM_SEED", 42)),
             )
 
             logger.info(
@@ -1704,157 +2291,173 @@ def train_model(data_folder, model_folder, verbose):
                 f"(prev={holdout_df[target_col].mean():.3f})"
             )
 
-            model_result = classification_train_model(
+            holdout_results = _train_candidate_models(
                 feature_table=train_df,
+                model_types=model_types,
                 output_dir=config.MODEL_DIR,
                 expected_test_prevalence=expected_global_prevalence,
+                prevalence_info=prevalence_info,
+                tune=enable_hpo,
+                n_tune_trials=n_tune_trials,
                 logger=logger if verbose else None,
             )
 
-            model_result = _attach_prevalence_info_to_model(
-                model_result=model_result,
-                prevalence_info=prevalence_info,
-                expected_global_prevalence=expected_global_prevalence,
+            for name, result in holdout_results.items():
+                if not isinstance(result, dict) or "error" in result or "model" not in result:
+                    continue
+
+                _evaluate_candidate_on_holdout(
+                    model_result=result,
+                    holdout_df=holdout_df,
+                    target_col=target_col,
+                    verbose=verbose,
+                    logger=logger if verbose else None,
+                )
+
+            _log_candidate_comparison(
+                holdout_results,
+                logger=logger,
+                title="INTERNAL HOLDOUT MODEL COMPARISON",
             )
 
-            if model_result:
-                y_hold = holdout_df[target_col].astype(int).values
-
-                if len(np.unique(y_hold)) == 2:
-                    holdout_pred_df = _predict_feature_table(
-                        model_dict=model_result,
-                        feature_table=holdout_df,
-                        verbose=verbose,
-                    )
-
-                    proba_hold = holdout_pred_df["probability"].values.astype(float)
-                    binary_hold = holdout_pred_df["prediction"].values.astype(int)
-
-                    holdout_auroc = roc_auc_score(y_hold, proba_hold)
-                    holdout_auprc = average_precision_score(y_hold, proba_hold)
-                    holdout_accuracy = accuracy_score(y_hold, binary_hold)
-                    holdout_f1 = f1_score(y_hold, binary_hold, zero_division=0)
-                    holdout_bal_acc = balanced_accuracy_score(y_hold, binary_hold)
-
-                    holdout_reward = _compute_official_style_reward(
-                        y_true=y_hold,
-                        y_pred=binary_hold,
-                        feature_table=holdout_df,
-                        training_config=model_result.get("training_config", {}),
-                    )
-
-                    cv_auroc = model_result.get("cv_results", {}).get(
-                        "auroc_mean", np.nan
-                    )
-                    gap = (
-                        float(cv_auroc) - float(holdout_auroc)
-                        if np.isfinite(cv_auroc)
-                        else np.nan
-                    )
-
-                    logger.info("=" * 60)
-                    logger.info("HONEST HOLDOUT EVALUATION")
-                    if np.isfinite(cv_auroc):
-                        logger.info(f"  CV AUROC:       {cv_auroc:.4f}")
-                    else:
-                        logger.info("  CV AUROC:       N/A")
-                    logger.info(f"  Holdout AUROC:  {holdout_auroc:.4f}")
-                    logger.info(f"  Holdout AUPRC:  {holdout_auprc:.4f}")
-                    logger.info(f"  Holdout Acc:    {holdout_accuracy:.4f}")
-                    logger.info(f"  Holdout F1:     {holdout_f1:.4f}")
-                    logger.info(f"  Holdout BalAcc: {holdout_bal_acc:.4f}")
-
-                    if np.isfinite(holdout_reward):
-                        logger.info(f"  Holdout Reward: {holdout_reward:.4f}")
-                    else:
-                        logger.info("  Holdout Reward: N/A")
-
-                    if np.isfinite(gap):
-                        logger.info(
-                            f"  CV-Holdout gap: {gap:+.4f}  "
-                            f"{'overfitting?' if gap > 0.05 else 'healthy'}"
-                        )
-                    logger.info("=" * 60)
-
-                    model_result.setdefault("cv_results", {}).update(
-                        {
-                            "holdout_auroc": float(holdout_auroc),
-                            "holdout_auprc": float(holdout_auprc),
-                            "holdout_accuracy": float(holdout_accuracy),
-                            "holdout_f1": float(holdout_f1),
-                            "holdout_balanced_accuracy": float(holdout_bal_acc),
-                            "cv_holdout_gap": (
-                                float(gap) if np.isfinite(gap) else np.nan
-                            ),
-                            "holdout_reward": (
-                                float(holdout_reward)
-                                if np.isfinite(holdout_reward)
-                                else np.nan
-                            ),
-                        }
-                    )
+            holdout_selected_model_type, holdout_selected_result = _select_best_candidate(
+                holdout_results,
+                prefer_holdout=True,
+                logger=logger,
+            )
 
         except Exception as e:
             logger.warning(
-                f"Internal holdout training/evaluation failed: "
+                f"Internal holdout multi-model training/evaluation failed: "
                 f"{type(e).__name__}: {e}. Continuing with full-data fit."
             )
-            model_result = None
+            logger.debug(traceback.format_exc())
+            holdout_selected_model_type = None
+            holdout_selected_result = None
+
     else:
         logger.info(
             "Skipping internal holdout because the dataset/class counts are too small."
         )
 
-    logger.info("Fitting final model on 100% of valid labelled training data...")
+    logger.info("=" * 70)
+    logger.info("FITTING FINAL MODEL(S) ON 100% OF VALID LABELLED TRAINING DATA")
+    logger.info("=" * 70)
+
+    if final_train_all_models:
+        final_model_types = list(model_types)
+    elif holdout_selected_model_type:
+        final_model_types = [holdout_selected_model_type]
+    else:
+        final_model_types = list(model_types)
 
     try:
-        final_result = classification_train_model(
+        final_results = _train_candidate_models(
             feature_table=patient_level_valid,
+            model_types=final_model_types,
             output_dir=config.MODEL_DIR,
             expected_test_prevalence=expected_global_prevalence,
+            prevalence_info=prevalence_info,
+            tune=enable_hpo,
+            n_tune_trials=n_tune_trials,
             logger=logger if verbose else None,
         )
     except Exception as e:
-        logger.error(f"Final training failed: {type(e).__name__}: {e}")
-        final_result = None
+        logger.error(f"Final multi-model training failed: {type(e).__name__}: {e}")
+        logger.debug(traceback.format_exc())
+        final_results = {}
 
-    if final_result:
-        if model_result and model_result.get("cv_results"):
-            holdout_keys = [
-                "holdout_auroc",
-                "holdout_auprc",
-                "holdout_accuracy",
-                "holdout_f1",
-                "holdout_balanced_accuracy",
-                "holdout_reward",
-                "cv_holdout_gap",
-            ]
-
-            final_result.setdefault("cv_results", {}).update(
-                {
-                    k: model_result.get("cv_results", {}).get(k)
-                    for k in holdout_keys
-                    if k in model_result.get("cv_results", {})
-                }
-            )
-
-        model_result = final_result
-
-    if not model_result:
-        logger.error("Training failed. Saving fallback model.")
+    if not final_results:
+        logger.error("Final training produced no results. Saving fallback model.")
         _save_fallback_model(model_folder)
         return
 
-    model_result = _attach_prevalence_info_to_model(
-        model_result=model_result,
+    _log_candidate_comparison(
+        final_results,
+        logger=logger,
+        title="FINAL FULL-DATA MODEL COMPARISON",
+    )
+
+    selected_final_type = None
+    selected_final_result = None
+
+    if holdout_selected_model_type and holdout_selected_model_type in final_results:
+        candidate = final_results.get(holdout_selected_model_type)
+
+        if (
+            isinstance(candidate, dict)
+            and "error" not in candidate
+            and "model" in candidate
+        ):
+            selected_final_type = holdout_selected_model_type
+            selected_final_result = candidate
+            logger.info(
+                f"Using holdout-selected model type for final save: "
+                f"{selected_final_type}"
+            )
+
+    if selected_final_result is None:
+        selected_final_type, selected_final_result = _select_best_candidate(
+            final_results,
+            prefer_holdout=False,
+            logger=logger,
+        )
+
+    if not selected_final_result:
+        logger.error("Could not select a final model. Saving fallback model.")
+        _save_fallback_model(model_folder)
+        return
+
+    selected_final_result = _attach_prevalence_info_to_model(
+        model_result=selected_final_result,
         prevalence_info=prevalence_info,
         expected_global_prevalence=expected_global_prevalence,
     )
 
-    save_model(model_folder, model_result)
+    selected_final_result.setdefault("training_config", {})
+    selected_final_result["training_config"]["candidate_model_types"] = model_types
+    selected_final_result["training_config"]["selected_model_type"] = selected_final_type
+    selected_final_result["training_config"]["selection_source"] = (
+        "internal_holdout_model_type_then_full_data_refit"
+        if holdout_selected_model_type
+        else "full_data_cv"
+    )
+    selected_final_result["training_config"]["team_enable_hpo"] = bool(enable_hpo)
+    selected_final_result["training_config"]["team_hpo_trials"] = int(n_tune_trials)
+    selected_final_result["training_config"]["team_final_train_all_models"] = bool(
+        final_train_all_models
+    )
 
-    cv = model_result.get("cv_results", {})
-    logger.info(f"Training complete. CV AUROC={cv.get('auroc_mean', 'N/A')}")
+    if holdout_selected_result and holdout_selected_result.get("cv_results"):
+        holdout_keys = [
+            "holdout_auroc",
+            "holdout_auprc",
+            "holdout_accuracy",
+            "holdout_f1",
+            "holdout_balanced_accuracy",
+            "holdout_reward",
+            "cv_holdout_gap",
+        ]
+
+        selected_final_result.setdefault("cv_results", {}).update(
+            {
+                k: holdout_selected_result.get("cv_results", {}).get(k)
+                for k in holdout_keys
+                if k in holdout_selected_result.get("cv_results", {})
+            }
+        )
+
+    save_model(model_folder, selected_final_result)
+
+    cv = selected_final_result.get("cv_results", {})
+    logger.info("=" * 70)
+    logger.info("Training complete.")
+    logger.info(f"Saved final model type: {selected_final_type}")
+    logger.info(f"Final CV AUROC: {cv.get('auroc_mean', 'N/A')}")
+    logger.info(f"Final CV Reward: {cv.get('reward_mean', 'N/A')}")
+    logger.info(f"Holdout AUROC: {cv.get('holdout_auroc', 'N/A')}")
+    logger.info(f"Holdout Reward: {cv.get('holdout_reward', 'N/A')}")
+    logger.info("=" * 70)
     logger.info("Done.")
 
 
@@ -1886,9 +2489,16 @@ def load_model(model_folder, verbose):
 
     if verbose:
         mt = model_dict.get("training_config", {}).get("model_type", "unknown")
+        selected = model_dict.get("training_config", {}).get(
+            "selected_model_type",
+            mt,
+        )
         nf = len(model_dict.get("selected_features", []))
         fb = model_dict.get("fallback", False)
-        print(f"Model loaded: type={mt}, features={nf}, fallback={fb}")
+        print(
+            f"Model loaded: type={mt}, selected={selected}, "
+            f"features={nf}, fallback={fb}"
+        )
 
     return model_dict
 
@@ -1938,20 +2548,6 @@ def _get_inference_feature_output_dir(
     data_folder: str,
     tmp_worker_dir: str,
 ) -> Path:
-    """
-    Fixed inference cache directory.
-
-    IMPORTANT:
-    This intentionally keeps the cache path unchanged:
-
-        <model_folder>/preprocessed_test_cache/features
-
-    In your Docker container this is expected to be:
-
-        challenge/model/preprocessed_test_cache/features
-
-    No data-key subfolder is used.
-    """
     runtime_model_folder = None
 
     if isinstance(model, dict):
@@ -2013,14 +2609,6 @@ def _ensure_holdout_preprocessed_parallel(
     feature_output_dir: Path,
     verbose: bool,
 ):
-    """
-    Preprocess all holdout patients once, in parallel, using config.NUM_WORKERS.
-
-    Unlike the earlier version, this function does NOT blindly trust an old
-    holdout_preprocessing_complete.json marker. It always scans the fixed cache
-    directory first. If all current holdout subjects are cached, it returns.
-    If some are missing, it processes only the missing ones in parallel.
-    """
     _patch_config(data_folder, tmp_model_dir)
 
     import config
@@ -2040,9 +2628,6 @@ def _ensure_holdout_preprocessed_parallel(
     if num_records == 0:
         raise FileNotFoundError("No holdout data were provided.")
 
-    # Fast path:
-    # If a previous pass already completed for this cache directory and the
-    # demographics row count matches, do not scan all cached subjects again.
     if marker is not None:
         marker_num_records = marker.get("num_records", None)
         marker_cache_dir = marker.get("cache_dir", None)
@@ -2072,7 +2657,6 @@ def _ensure_holdout_preprocessed_parallel(
                 )
             return
 
-
     segment_length_sec = getattr(config, "SEGMENT_LENGTH_SEC", 30)
     overlap_sec = getattr(config, "SEGMENT_OVERLAP_SEC", 0)
 
@@ -2095,24 +2679,11 @@ def _ensure_holdout_preprocessed_parallel(
             feature_output_dir=feature_output_dir,
             pipeline_patient_id=pipeline_patient_id,
             record_name=record_name,
-            # Do not log every cache hit during the global scan.
-            # Otherwise verbose mode prints one line per cached patient per run_model call.
             logger=None,
         )
 
-
         if cached is not None:
             cached_subjects.append(pipeline_patient_id)
-
-            # If an old cache was found only by filename scan, ensure the
-            # manifest is updated so later lookups are fast.
-            #_remember_preprocessing_result(
-            #    feature_output_dir=feature_output_dir,
-            #    pipeline_patient_id=pipeline_patient_id,
-            #    record_name=record_name,
-            #    result=cached,
-            #    logger=logger if verbose else None,
-            #)
             continue
 
         records_to_process.append(
@@ -2133,16 +2704,10 @@ def _ensure_holdout_preprocessed_parallel(
 
     if len(records_to_process) == 0:
         if verbose:
-            if marker is not None:
-                logger.info(
-                    f"Holdout marker exists and all subjects are cached: "
-                    f"{len(cached_subjects)}/{num_records}."
-                )
-            else:
-                logger.info(
-                    f"All holdout subjects already cached without marker: "
-                    f"{len(cached_subjects)}/{num_records}."
-                )
+            logger.info(
+                f"All holdout subjects already cached: "
+                f"{len(cached_subjects)}/{num_records}."
+            )
 
         _save_holdout_preprocess_marker(
             feature_output_dir,
@@ -2316,7 +2881,9 @@ def _manual_add_demographics(
         return patient_features
 
     merge_cols = ["patient_id"] + [
-        c for c in demo.columns if c != "patient_id" and c not in patient_features.columns
+        c
+        for c in demo.columns
+        if c != "patient_id" and c not in patient_features.columns
     ]
 
     return patient_features.merge(demo[merge_cols], on="patient_id", how="left")
@@ -2394,9 +2961,6 @@ def run_model(model, record, data_folder, verbose):
             tmp_worker_dir=tmp_worker_dir,
         )
 
-        # run_model.py loads `model` once and then calls run_model(...) once per patient.
-        # Therefore, do the expensive global holdout cache/preprocessing check only once
-        # per run_model.py execution.
         preprocess_state_key = (
             f"{Path(data_folder).resolve()}::"
             f"{Path(feature_output_dir).resolve()}"
@@ -2413,7 +2977,6 @@ def run_model(model, record, data_folder, verbose):
         else:
             if verbose:
                 print("  - Global holdout preprocessing/cache check already done; skipping.")
-
 
         result = _find_cached_preprocessing(
             feature_output_dir=feature_output_dir,
@@ -2594,6 +3157,7 @@ def _save_fallback_model(model_folder):
         "selected_features": ["dummy_feature"],
         "training_config": {
             "model_type": "fallback",
+            "selected_model_type": "fallback",
             "decision_threshold": 0.5,
             "expected_test_prevalence": None,
             "expected_test_prevalence_source": "fallback",
@@ -2602,6 +3166,8 @@ def _save_fallback_model(model_folder):
             "prevalence_reference_labels": [],
             "prevalence_age_gap": 2,
             "decision_threshold_strategy": "fallback",
+            "hyperparameter_tuning_enabled": False,
+            "tuned_params_applied_to_final_model": False,
         },
         "cv_results": {},
         "fallback": True,
