@@ -49,6 +49,32 @@ for d in [OUTPUT_DIR, FEATURE_DIR, MODEL_DIR, LOG_DIR, PLOT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ==============================================================================
+# ANNOTATION LOADING
+# ==============================================================================
+FAST_ANNOTATION_LOADING = True
+
+# Mögliche Werte:
+#   "algorithmic_only"     -> lade Algo, Human nur optional als Fallback
+#   "prefer_algorithmic"   -> lade Algo, falls nicht vorhanden Human
+#   "all_external"         -> lade Human + Algo wie bisher
+#   "human_only"           -> lade nur Human, Algo optional als Fallback
+#
+# Für die Challenge-Testdaten ist "algorithmic_only" am konsistentesten,
+# weil dort später nur algorithmische Annotationen verfügbar sind.
+ANNOTATION_SOURCE_MODE = "algorithmic_only"
+
+# Falls im Training ein Patient keine algorithmischen Annotationen hat:
+FALLBACK_TO_HUMAN_IF_NO_ALGO = True
+
+# Nur wenn weder Algo noch Human gefunden wurden, das große physiologische EDF
+# nach eingebetteten Annotationen durchsuchen.
+SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND = True
+
+# Debug optional
+ANNOTATION_FAST_DEBUG = False
+
+
+# ==============================================================================
 # SIGNALVERARBEITUNG
 # ==============================================================================
 SEGMENT_LENGTH_SEC = 300           # 5 Minuten
@@ -146,7 +172,7 @@ RSA_ENABLED = True
 # ==============================================================================
 # LOGGING
 # ==============================================================================
-LOG_LEVEL = "INFO"                 # "DEBUG", "INFO", "WARNING", "ERROR"
+LOG_LEVEL = "DEBUG"                 # "DEBUG", "INFO", "WARNING", "ERROR"
 LOG_TO_FILE = True                 # Log in Datei schreiben
 LOG_TO_CONSOLE = True              # Log auf Konsole ausgeben
 LOG_ROTATION = "10 MB"             # Log-Datei Rotation
@@ -155,12 +181,12 @@ LOG_RETENTION = "30 days"          # Log-Dateien aufbewahren
 # ==============================================================================
 # VISUALISIERUNG
 # ==============================================================================
-PLOT_ENABLED = False
+PLOT_ENABLED = True
 PLOT_FORMAT = "png"
 PLOT_DPI = 150
-PLOT_PER_PATIENT = False
-PLOT_COHORT = False
-PLOT_MAX_PATIENTS = 20
+PLOT_PER_PATIENT = True
+PLOT_COHORT = True
+PLOT_MAX_PATIENTS = 4
 
 # ==============================================================================
 # KANALNAMEN (für io_utils.py)
@@ -211,6 +237,28 @@ EEG_FILTER = {
 EEG_AMPLITUDE_MAX_UV = 200.0    # Maximale physiologische Amplitude (µV)
 EEG_AMPLITUDE_MIN_UV = 0.5      # Minimale Amplitude (Flatliner-Erkennung)
 EEG_CORRELATION_THRESHOLD = 0.7 # Mindestkorrelation für Kanal-Mittelung
+
+# ==============================================================================
+# DELTA POWER ENTROPY / ORP / CSI
+# ==============================================================================
+# If False:
+#   - skip compute_delta_power_entropy(...)
+#   - do not add Delta_Power_Entropy, ORP_*, Artifact_Fraction, CSI to patient features
+#   - do not keep these columns during compact training feature loading
+enable_delta_power_entropy = False
+
+DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
+    "Delta_Power_Entropy",
+    "ORP_Mean",
+    "Artifact_Fraction",
+    "ORP_NREM",
+    "ORP_std_NREM",
+    "ORP_REM",
+    "ORP_Wake",
+    "ORP_APeak",
+    "ORP_A9",
+    "CSI",
+]
 
 # ==============================================================================
 # PARALLEL COMPUTING

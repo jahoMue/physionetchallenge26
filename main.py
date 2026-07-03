@@ -51,6 +51,8 @@ from config import (
     PLOT_DIR, PLOT_ENABLED, PLOT_PER_PATIENT,
     PLOT_COHORT, PLOT_MAX_PATIENTS, PLOT_FORMAT, PLOT_DPI,
     NUM_WORKERS,
+    enable_delta_power_entropy,
+    DELTA_POWER_ENTROPY_FEATURE_COLUMNS,
 )
 
 
@@ -217,9 +219,15 @@ def process_single_patient(
                             f"fs={fs} Hz, Dauer={total_duration_sec/60:.1f} min")
         patient_logger.info(f"Kanäle: {sig_names}")
         
+        t_ann0 = time.perf_counter()
+
         annotations = load_annotations(
             patient_dir, record_name=record_name, patient_id=patient_id
         )
+
+        t_ann = time.perf_counter() - t_ann0
+        patient_logger.info(f"[TIMING] load_annotations: {t_ann:.2f}s")
+
         
         if annotations:
             patient_logger.info(f"Annotationen geladen: {list(annotations.keys())}")
@@ -348,30 +356,79 @@ def process_single_patient(
                 stats.update("total_obstructive_apneas",
                              summary.get("obstructive_apnea_count", 0))
         
-        # --- Delta Power Entropy ---
+        # --- Delta Power Entropy / ORP / Sleep Depth Features ---
+        # These are expensive because compute_delta_power_entropy() performs
+        # many 5-second window PSD / ORP operations.
         delta_entropy = np.nan
-        try:        
-            stages_raw = annotation_data["stages_raw"]
-            events_raw = annotation_data.get("events_raw")
-            (
-            delta_entropy, num_chan, mean_orp, orp_per_window, artifact_fraction,
-            orp_nrem, orp_std_nrem, orp_rem, orp_wake, orp_apeak, orp_a9, csi
-            ) = compute_delta_power_entropy(
-                eeg_preprocessed=eeg_preprocessed,
-                sfreq=eeg_fs,
-                stages_raw=stages_raw,
-                events_raw=events_raw,
-                logger=logger,  # Optional
-            )
-            patient_logger.info(
-            f"Delta-power entropy (sleep period only) from {num_chan} channel(s): {delta_entropy:.4f} bits"
-            )
-            if not np.isnan(mean_orp):
-                patient_logger.info(f"Mean ORP (sleep period): {mean_orp:.4f}")
+        num_chan = 0
+        mean_orp = np.nan
+        orp_per_window = None
+        artifact_fraction = np.nan
+        orp_nrem = np.nan
+        orp_std_nrem = np.nan
+        orp_rem = np.nan
+        orp_wake = np.nan
+        orp_apeak = np.nan
+        orp_a9 = np.nan
+        csi = np.nan
 
-        except Exception as e:
+        if enable_delta_power_entropy:
+            try:
+                if annotation_data is None:
+                    raise ValueError("annotation_data is None")
+
+                stages_raw = annotation_data.get("stages_raw")
+                events_raw = annotation_data.get("events_raw")
+
+                if stages_raw is None or len(stages_raw) == 0:
+                    raise ValueError("No valid sleep-stage annotations available")
+
+                if not eeg_preprocessed:
+                    raise ValueError("No preprocessed EEG channels available")
+
+                (
+                    delta_entropy,
+                    num_chan,
+                    mean_orp,
+                    orp_per_window,
+                    artifact_fraction,
+                    orp_nrem,
+                    orp_std_nrem,
+                    orp_rem,
+                    orp_wake,
+                    orp_apeak,
+                    orp_a9,
+                    csi,
+                ) = compute_delta_power_entropy(
+                    eeg_preprocessed=eeg_preprocessed,
+                    sfreq=eeg_fs,
+                    stages_raw=stages_raw,
+                    events_raw=events_raw,
+                    logger=patient_logger,
+                )
+
+                patient_logger.info(
+                    f"Delta-power entropy sleep period only from "
+                    f"{num_chan} channel(s): {delta_entropy:.4f} bits"
+                )
+
+                if np.isfinite(mean_orp):
+                    patient_logger.info(f"Mean ORP sleep period: {mean_orp:.4f}")
+
+            except Exception as e:
+                if patient_logger:
+                    patient_logger.warning(
+                        "[Sleep-Depth Integration] Skipped calculation of advanced "
+                        f"sleep-depth parameters: {type(e).__name__}: {e}"
+                    )
+        else:
             if patient_logger:
-                patient_logger.warning(f"[Sleep-Depth Integration] Skipped Calculation of Advanced Sleep Depth Parameters: {e}")
+                patient_logger.info(
+                    "[Sleep-Depth Integration] enable_delta_power_entropy=False; "
+                    "skipping Delta_Power_Entropy / ORP / CSI calculation."
+                )
+
+
         
         # ==============================================================
         # SCHRITT 4: SEGMENTIERUNG (unchanged)
@@ -521,19 +578,30 @@ def process_single_patient(
             for k, v in cap_features.items():
                 patient_features.at[0, k] = v
 
-        patient_features.at[0, 'Delta_Power_Entropy'] = delta_entropy
-        patient_features.at[0, 'ORP_Mean'] = mean_orp
-        patient_features.at[0, 'Artifact_Fraction'] = artifact_fraction
-        patient_features.at[0, 'ORP_NREM'] = orp_nrem
-        patient_features.at[0, 'ORP_std_NREM'] = orp_std_nrem
-        patient_features.at[0, 'ORP_REM'] = orp_rem
-        patient_features.at[0, 'ORP_Wake'] = orp_wake
-        patient_features.at[0, 'ORP_APeak'] = orp_apeak
-        patient_features.at[0, 'ORP_A9'] = orp_a9
-        patient_features.at[0, 'CSI'] = csi
+        if enable_delta_power_entropy:
+            patient_features.at[0, "Delta_Power_Entropy"] = delta_entropy
+            patient_features.at[0, "ORP_Mean"] = mean_orp
+            patient_features.at[0, "Artifact_Fraction"] = artifact_fraction
+            patient_features.at[0, "ORP_NREM"] = orp_nrem
+            patient_features.at[0, "ORP_std_NREM"] = orp_std_nrem
+            patient_features.at[0, "ORP_REM"] = orp_rem
+            patient_features.at[0, "ORP_Wake"] = orp_wake
+            patient_features.at[0, "ORP_APeak"] = orp_apeak
+            patient_features.at[0, "ORP_A9"] = orp_a9
+            patient_features.at[0, "CSI"] = csi
+        else:
+            # Defensive cleanup in case an upstream function or old logic
+            # injected one of these columns.
+            cols_to_drop = [
+                c for c in DELTA_POWER_ENTROPY_FEATURE_COLUMNS
+                if c in patient_features.columns
+            ]
+            if cols_to_drop:
+                patient_features = patient_features.drop(columns=cols_to_drop)
 
-        result["segment_features"] = segment_features
-        result["patient_features"] = patient_features
+
+        # result["segment_features"] = segment_features
+        # result["patient_features"] = patient_features
         
         # ==============================================================
         # NEW: SAVE FEATURES TO DISK INSTEAD OF RETURNING THEM

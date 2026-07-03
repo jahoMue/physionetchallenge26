@@ -32,8 +32,8 @@ from config import (
 # NUMERIC ENCODING MAPS (PhysioNet Challenge 2026)
 # ==============================================================================
 
-# Sleep stage numeric encoding -> label
 NUMERIC_STAGE_MAP = {
+    0: None,   # Unknown / not scored
     1: "N3",
     2: "N2",
     3: "N1",
@@ -41,6 +41,16 @@ NUMERIC_STAGE_MAP = {
     5: "W",
     9: None,  # Unavailable
 }
+
+STAGE_TO_NUMERIC_MAP = {
+    "N3": 1,
+    "N2": 2,
+    "N1": 3,
+    "REM": 4,
+    "W": 5,
+    "Unknown": 0,
+}
+
 
 # Respiratory event numeric encoding -> standardized event type
 NUMERIC_RESP_EVENT_MAP = {
@@ -81,6 +91,32 @@ RESP_TO_INTEREST_MAP = {
 # ==============================================================================
 # SCHLAFSTADIEN
 # ==============================================================================
+def _validate_stage_encoding_consistency(logger=None):
+    """
+    Internal sanity check for PhysioNet 2026 sleep-stage encoding.
+    """
+    expected = {
+        1: "N3",
+        2: "N2",
+        3: "N1",
+        4: "REM",
+        5: "W",
+        9: None,
+    }
+
+    mismatches = []
+    for code, expected_label in expected.items():
+        actual = NUMERIC_STAGE_MAP.get(code)
+        if actual != expected_label:
+            mismatches.append((code, expected_label, actual))
+
+    if mismatches and logger:
+        logger.warning(
+            "Sleep-stage encoding mismatch detected: "
+            + str(mismatches)
+        )
+
+    return len(mismatches) == 0
 
 def parse_sleep_stages(
     annotations: Dict,
@@ -106,7 +142,8 @@ def parse_sleep_stages(
         if logger:
             logger.warning("Keine Annotationen vorhanden.")
         return None
-    
+    _validate_stage_encoding_consistency(logger)
+
     stages_list = []
     
     # Versuche verschiedene Annotationsformate zu parsen
@@ -147,8 +184,10 @@ def _parse_stages_from_dataframe(
     Parst Schlafstadien aus einem DataFrame (TSV/CSV).
     Unterstützt sowohl numerische Kodierung als auch Text-Annotationen.
     """
-    # Spalten normalisieren
+    # Spalten normalisieren; copy to avoid mutating the original annotation table.
+    df = df.copy()
     df.columns = [c.lower().strip() for c in df.columns]
+
     
     # Mögliche Spaltennamen für Onset/Start
     onset_col = None
@@ -304,13 +343,22 @@ def _map_annotation_to_stage(annotation: str) -> Optional[str]:
     str or None
         "W", "N1", "N2", "N3", "REM", oder None wenn kein Stadium erkannt.
     """
-    ann = annotation.lower().strip().replace(" ", "")
-    
-    # First try numeric encoding (handles cases where numeric values
-    # are passed as strings)
+    ann = str(annotation).lower().strip().replace(" ", "").replace("_", "").replace("-", "")
+
+    # Explicitly ignore unknown/unavailable/not-scored labels.
+    if ann in {
+        "", "unknown", "unavailable", "notavailable", "notscored",
+        "unscored", "movement", "artifact", "artefact",
+        "sleepstage?", "sleepstageunknown", "stageunknown",
+        "sleepstage9", "stage9",
+    }:
+        return None
+
+    # First try numeric encoding.
     numeric_result = _map_numeric_to_stage(ann)
     if numeric_result is not None:
         return numeric_result
+
     
     # Direkte Mappings
     direct_map = {
@@ -349,9 +397,14 @@ def _map_annotation_to_stage(annotation: str) -> Optional[str]:
 
 
 def _stage_to_numeric(stage_label: str) -> int:
-    """Konvertiert Schlafstadium-Label in numerischen Wert."""
-    mapping = {"W": 5, "N1": 3, "N2": 2, "N3": 1, "REM": 4, "Unknown": 0}
-    return mapping.get(stage_label, 0)
+    """
+    Convert canonical stage label to PhysioNet 2026 numeric code.
+
+    Encoding:
+      N3=1, N2=2, N1=3, REM=4, W=5, Unknown=0
+    """
+    return STAGE_TO_NUMERIC_MAP.get(stage_label, 0)
+
 
 
 # ==============================================================================

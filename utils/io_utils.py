@@ -43,7 +43,146 @@ from config import (
     RESP_CHANNEL_NAMES, SLEEP_STAGE_ENCODING,
     SIGNAL_DTYPE,
 )
+try:
+    from config import FAST_ANNOTATION_LOADING
+except Exception:
+    FAST_ANNOTATION_LOADING = True
 
+try:
+    from config import ANNOTATION_SOURCE_MODE
+except Exception:
+    ANNOTATION_SOURCE_MODE = "algorithmic_only"
+
+try:
+    from config import FALLBACK_TO_HUMAN_IF_NO_ALGO
+except Exception:
+    FALLBACK_TO_HUMAN_IF_NO_ALGO = True
+
+try:
+    from config import SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND
+except Exception:
+    SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND = True
+
+try:
+    from config import ANNOTATION_FAST_DEBUG
+except Exception:
+    ANNOTATION_FAST_DEBUG = False
+
+# ==============================================================================
+# PHYSIONET 2026 ANNOTATION ENCODINGS
+# ==============================================================================
+
+# Challenge sleep-stage numeric encoding:
+#   0 = Unknown / not scored
+#   1 = N3
+#   2 = N2
+#   3 = N1
+#   4 = REM
+#   5 = Wake
+#   9 = Unavailable
+#
+# This must stay consistent with config.SLEEP_STAGE_ENCODING and
+# preprocessing/preprocess_annotations.py.
+CHALLENGE_NUMERIC_STAGE_MAP = {
+    0: "Unknown",
+    1: "N3",
+    2: "N2",
+    3: "N1",
+    4: "REM",
+    5: "W",
+    9: "Unknown",
+}
+
+
+def _stage_label_to_annotation_description(stage_label: str) -> str:
+    """
+    Convert canonical stage labels to MNE/AASM-like annotation descriptions.
+
+    Downstream preprocess_annotations.py already understands descriptions like:
+      "Sleep stage W", "Sleep stage N1", "Sleep stage N2",
+      "Sleep stage N3", "Sleep stage R".
+    """
+    if stage_label is None:
+        return "Unknown"
+
+    stage_label = str(stage_label).strip()
+
+    if stage_label == "W":
+        return "Sleep stage W"
+    if stage_label == "N1":
+        return "Sleep stage N1"
+    if stage_label == "N2":
+        return "Sleep stage N2"
+    if stage_label == "N3":
+        return "Sleep stage N3"
+    if stage_label == "REM":
+        return "Sleep stage R"
+
+    return "Unknown"
+
+def select_two_eeg_derivations(eeg_channels: dict, logger=None) -> dict:
+    """
+    Restrict the detected EEG channels to at most TWO derivations,
+    following the clinical priority order:
+        F4-M1, C4-M1  (preferred)
+        -> O2-M1 -> F3-M2 -> C3-M2 -> O1-M2  (backups)
+
+    Works on the standardized keys returned by find_eeg_channels()
+    (e.g. "F4"), which already cover both "F4" and "F4-M1" raw labels
+    via EEG_CHANNEL_MAPPING.
+    """
+    selected = {}
+    for name in EEG_DERIVATION_PRIORITY:
+        if name in eeg_channels and eeg_channels[name] is not None:
+            selected[name] = eeg_channels[name]
+        if len(selected) == 2:
+            break
+
+    if logger:
+        if len(selected) < 2:
+            logger.warning(
+                f"EEG-Ableitungsauswahl: Nur {len(selected)} Ableitung(en) "
+                f"verfügbar: {list(selected.keys())} "
+                f"(im Record gefunden: {list(eeg_channels.keys())})"
+            )
+        else:
+            logger.info(
+                f"EEG-Ableitungsauswahl: Verwende {list(selected.keys())} "
+                f"(verfügbar: {list(eeg_channels.keys())})"
+            )
+    return selected
+
+
+def _map_numeric_to_stage(value) -> str:
+    """
+    Map numeric sleep-stage values to standardized annotation descriptions
+    using the PhysioNet Challenge 2026 encoding.
+
+    Challenge encoding:
+      0 = Unknown
+      1 = N3
+      2 = N2
+      3 = N1
+      4 = REM
+      5 = Wake
+      9 = Unavailable / Unknown
+
+    Returns
+    -------
+    str
+        A text annotation such as "Sleep stage N3", "Sleep stage R",
+        "Sleep stage W", or "Unknown".
+    """
+    try:
+        if pd.isna(value):
+            return "Unknown"
+
+        numeric_val = int(round(float(value)))
+    except Exception:
+        return "Unknown"
+
+    stage_label = CHALLENGE_NUMERIC_STAGE_MAP.get(numeric_val, "Unknown")
+    return _stage_label_to_annotation_description(stage_label)
 
 # ==============================================================================
 # DEMOGRAPHICS
@@ -159,6 +298,152 @@ def load_record(
 # ==============================================================================
 # ANNOTATIONEN LADEN
 # ==============================================================================
+def _is_trivial_annotation_description(desc: str) -> bool:
+    desc = str(desc).strip().lower()
+    return desc in {
+        "",
+        "sleep onset",
+        "recording start",
+        "lights off",
+        "lights on",
+        "recording end",
+    }
+
+
+def _label_is_relevant_annotation_channel(label: str) -> bool:
+    label = str(label).lower().strip()
+
+    if "prob" in label:
+        return False
+
+    return any(
+        key in label
+        for key in (
+            "stage",
+            "sleep",
+            "hypno",
+            "arousal",
+            "arsl",
+            "resp",
+            "limb",
+        )
+    )
+
+
+def _load_annotations_from_edf_fast(edf_path: Path) -> Optional[pd.DataFrame]:
+    """
+    Fast path für Challenge-Annotation-EDFs.
+
+    Ziel:
+    - zuerst echte EDF+/TAL-Annotationen ohne Signaldaten lesen
+    - dann nur relevante numerische Annotation-Signalkanäle lesen
+    - kein MNE Raw, kein raw.get_data() über alle Kanäle
+    - Fallback auf alte robuste Methode
+    """
+    try:
+        import pyedflib
+    except Exception:
+        return _load_annotations_from_edf(edf_path)
+
+    # ------------------------------------------------------------------
+    # 1. EDF+/TAL-Annotationen lesen, falls vorhanden
+    # ------------------------------------------------------------------
+    try:
+        f = pyedflib.EdfReader(str(edf_path))
+        try:
+            annotations = f.readAnnotations()
+        finally:
+            f.close()
+
+        if annotations is not None and len(annotations) >= 3:
+            onsets, durations, descriptions = annotations[0], annotations[1], annotations[2]
+
+            records = []
+            for i in range(len(onsets)):
+                desc = str(descriptions[i]).strip() if i < len(descriptions) else ""
+                if _is_trivial_annotation_description(desc):
+                    continue
+
+                records.append({
+                    "onset": float(onsets[i]),
+                    "duration": float(durations[i]) if i < len(durations) else 0.0,
+                    "description": desc,
+                })
+
+            if records:
+                return pd.DataFrame(records)
+
+    except Exception as e:
+        if ANNOTATION_FAST_DEBUG:
+            print(f"[ANN_FAST_DEBUG] EDF+/TAL failed for {edf_path.name}: {e}")
+
+    # ------------------------------------------------------------------
+    # 2. Challenge-style numerische Annotation-Kanäle lesen
+    # ------------------------------------------------------------------
+    all_annotations = []
+
+    try:
+        f = pyedflib.EdfReader(str(edf_path))
+        try:
+            n_signals = f.signals_in_file
+            labels = [f.getLabel(i).lower().strip() for i in range(n_signals)]
+
+            if ANNOTATION_FAST_DEBUG:
+                print(f"[ANN_FAST_DEBUG] {edf_path.name} labels={labels}")
+
+            for i, label in enumerate(labels):
+                if not _label_is_relevant_annotation_channel(label):
+                    continue
+
+                fs = float(f.getSampleFrequency(i))
+                if fs <= 0:
+                    continue
+
+                try:
+                    sig = f.readSignal(i).astype(SIGNAL_DTYPE, copy=False)
+                except Exception:
+                    continue
+
+                ann_df = None
+
+                # Sleep stages
+                if "stage" in label or "sleep" in label or "hypno" in label:
+                    ann_df = _parse_stage_channel(sig, fs, label)
+
+                # Arousals
+                elif "arousal" in label or "arsl" in label:
+                    ann_df = _parse_binary_event_channel(
+                        sig, fs, label, event_type="arousal"
+                    )
+
+                # Respiratory events
+                elif "resp" in label:
+                    ann_df = _parse_multiclass_event_channel(sig, fs, label)
+
+                # Limb movements
+                elif "limb" in label:
+                    ann_df = _parse_binary_event_channel(
+                        sig, fs, label, event_type="limb_movement"
+                    )
+
+                if ann_df is not None and len(ann_df) > 0:
+                    all_annotations.append(ann_df)
+
+        finally:
+            f.close()
+
+    except Exception as e:
+        if ANNOTATION_FAST_DEBUG:
+            print(f"[ANN_FAST_DEBUG] Signal-channel fast read failed for {edf_path.name}: {e}")
+
+    if all_annotations:
+        return pd.concat(all_annotations, ignore_index=True)
+
+    # ------------------------------------------------------------------
+    # 3. Fallback auf bisherige robuste Methode
+    # ------------------------------------------------------------------
+    return _load_annotations_from_edf(edf_path)
+
 
 def load_annotations(
     patient_dir: Path,
@@ -166,7 +451,13 @@ def load_annotations(
     patient_id: str = None
 ) -> Optional[Dict]:
     """
-    Lädt Schlaf-Annotationen aus den separaten Annotations-Verzeichnissen.
+    Lädt Schlaf-Annotationen aus separaten Annotations-Verzeichnissen.
+
+    Optimierte Strategie:
+    - Algorithmische Annotationen können bevorzugt oder exklusiv geladen werden.
+    - Das ist für Challenge-Testdaten wichtig, weil dort später nur algorithmische
+      Annotationen verfügbar sind.
+    - Embedded-Fallback wird nur verwendet, wenn keine externe Annotation gefunden wurde.
     """
     annotations = {}
 
@@ -184,40 +475,109 @@ def load_annotations(
         else:
             return None
 
-    # --- Human Annotations (EDF + .annot) ---
-    human_dir = HUMAN_ANNOTATIONS_DIR / site_id
-    if human_dir.exists():
-        for edf_file in sorted(human_dir.glob(f"{rec_name}*.edf")):
-            ann_key = f"human_{edf_file.stem}"
-            try:
-                ann_df = _load_annotations_from_edf(edf_file)
-                if ann_df is not None and len(ann_df) > 0:
-                    annotations[ann_key] = ann_df
-            except Exception as e:
-                print(f"[DEBUG] Failed to load human EDF annotation {edf_file.name}: {e}")
+    mode = str(ANNOTATION_SOURCE_MODE).lower().strip()
 
-        for annot_file in sorted(human_dir.glob(f"{rec_name}*.annot")):
-            ann_key = f"human_{annot_file.stem}"
-            try:
-                ann_df = _parse_annot_file(annot_file)
-                if ann_df is not None and len(ann_df) > 0:
-                    annotations[ann_key] = ann_df
-            except Exception as e:
-                print(f"[DEBUG] Failed to load .annot file {annot_file.name}: {e}")
+    def _load_edf_file(edf_file: Path) -> Optional[pd.DataFrame]:
+        if FAST_ANNOTATION_LOADING:
+            return _load_annotations_from_edf_fast(edf_file)
+        return _load_annotations_from_edf(edf_file)
 
-    # --- Algorithmic Annotations (EDF only) ---
-    algo_dir = ALGORITHMIC_ANNOTATIONS_DIR / site_id
-    if algo_dir.exists():
-        for edf_file in sorted(algo_dir.glob(f"{rec_name}*.edf")):
-            ann_key = f"algo_{edf_file.stem}"
-            try:
-                ann_df = _load_annotations_from_edf(edf_file)
-                if ann_df is not None and len(ann_df) > 0:
-                    annotations[ann_key] = ann_df
-            except Exception as e:
-                print(f"[DEBUG] Failed to load algo EDF annotation {edf_file.name}: {e}")
+    def _load_algorithmic_annotations():
+        algo_dir = ALGORITHMIC_ANNOTATIONS_DIR / site_id
+        loaded = 0
 
-    # --- Fallback: Embedded annotations in the physiological EDF ---
+        if algo_dir.exists():
+            for edf_file in sorted(algo_dir.glob(f"{rec_name}*.edf")):
+                ann_key = f"algo_{edf_file.stem}"
+                try:
+                    ann_df = _load_edf_file(edf_file)
+                    if ann_df is not None and len(ann_df) > 0:
+                        annotations[ann_key] = ann_df
+                        loaded += 1
+                except Exception as e:
+                    print(
+                        f"[DEBUG] Failed to load algo EDF annotation "
+                        f"{edf_file.name}: {e}"
+                    )
+
+        return loaded
+
+    def _load_human_annotations():
+        human_dir = HUMAN_ANNOTATIONS_DIR / site_id
+        loaded = 0
+
+        if human_dir.exists():
+            # Human EDF
+            for edf_file in sorted(human_dir.glob(f"{rec_name}*.edf")):
+                ann_key = f"human_{edf_file.stem}"
+                try:
+                    ann_df = _load_edf_file(edf_file)
+                    if ann_df is not None and len(ann_df) > 0:
+                        annotations[ann_key] = ann_df
+                        loaded += 1
+                except Exception as e:
+                    print(
+                        f"[DEBUG] Failed to load human EDF annotation "
+                        f"{edf_file.name}: {e}"
+                    )
+
+            # Human .annot
+            for annot_file in sorted(human_dir.glob(f"{rec_name}*.annot")):
+                ann_key = f"human_{annot_file.stem}"
+                try:
+                    ann_df = _parse_annot_file(annot_file)
+                    if ann_df is not None and len(ann_df) > 0:
+                        annotations[ann_key] = ann_df
+                        loaded += 1
+                except Exception as e:
+                    print(f"[DEBUG] Failed to load .annot file {annot_file.name}: {e}")
+
+        return loaded
+
+    # ------------------------------------------------------------------
+    # Source selection
+    # ------------------------------------------------------------------
+    if mode == "algorithmic_only":
+        n_algo = _load_algorithmic_annotations()
+
+        if n_algo == 0 and FALLBACK_TO_HUMAN_IF_NO_ALGO:
+            _load_human_annotations()
+
+    elif mode == "prefer_algorithmic":
+        n_algo = _load_algorithmic_annotations()
+
+        if n_algo == 0:
+            _load_human_annotations()
+
+    elif mode == "human_only":
+        n_human = _load_human_annotations()
+
+        if n_human == 0:
+            _load_algorithmic_annotations()
+
+    elif mode == "all_external":
+        # Alte fachliche Strategie, aber mit schnellem EDF-Reader und
+        # ohne unnötigen embedded fallback.
+        _load_human_annotations()
+        _load_algorithmic_annotations()
+
+    else:
+        # Sicherer Default für Challenge-Test-Konsistenz
+        n_algo = _load_algorithmic_annotations()
+
+        if n_algo == 0 and FALLBACK_TO_HUMAN_IF_NO_ALGO:
+            _load_human_annotations()
+
+    # ------------------------------------------------------------------
+    # Wenn externe Annotationen gefunden wurden, nicht noch das große
+    # physiologische EDF durchsuchen.
+    # ------------------------------------------------------------------
+    if annotations and SKIP_EMBEDDED_ANNOTATIONS_IF_EXTERNAL_FOUND:
+        return annotations
+
+    # ------------------------------------------------------------------
+    # Embedded fallback nur wenn keine externe Annotation gefunden wurde
+    # ------------------------------------------------------------------
     phys_edf = patient_dir / f"{rec_name}.edf"
     if phys_edf.exists():
         try:
@@ -227,15 +587,8 @@ def load_annotations(
         except Exception:
             pass
 
-    # --- DEBUG: Log result ---
-    #print(f"[DEBUG] load_annotations result: {len(annotations)} annotation sets loaded")
-    #for key, df in annotations.items():
-    #    print(f"  {key}: {len(df)} entries")
-    #    if len(df) > 0:
-    #        print(f"    Columns: {list(df.columns)}")
-    #        print(f"    First descriptions: {df['description'].head(5).tolist()}")
-
     return annotations if annotations else None
+
 
 
 def _load_annotations_from_edf(edf_path: Path) -> Optional[pd.DataFrame]:
@@ -448,10 +801,18 @@ def _parse_stage_channel(
     probability encoding. We round to nearest integer and map to 
     standard sleep stage labels.
     
-    Common encodings:
-    - 0=Wake, 1=N1, 2=N2, 3=N3, 5=REM (AASM)
-    - 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM
-    - 0=Wake, 1=S1, 2=S2, 3=S3, 4=S4, 5=REM (R&K)
+        PhysioNet Challenge 2026 encoding:
+    - 0 = Unknown / not scored
+    - 1 = N3
+    - 2 = N2
+    - 3 = N1
+    - 4 = REM
+    - 5 = Wake
+    - 9 = Unavailable
+
+    The function outputs AASM-like text descriptions such as
+    "Sleep stage N3" and "Sleep stage R", which are then parsed by
+    preprocess_annotations.py into canonical labels.
     """
     epoch_sec = 30  # Standard sleep epoch
     epoch_samples = int(epoch_sec * fs)
@@ -470,14 +831,18 @@ def _parse_stage_channel(
         end_sample = start_sample + epoch_samples
         epoch_data = signal[start_sample:end_sample]
         
-        # Get the dominant value in this epoch
-        # Round to nearest integer since values may have float noise
-        rounded = np.round(epoch_data).astype(int)
-        values, counts = np.unique(rounded, return_counts=True)
-        dominant_value = values[np.argmax(counts)]
-        
-        # Map to stage label
-        stage_label = _map_numeric_to_stage(dominant_value)
+        epoch_data = epoch_data[np.isfinite(epoch_data)]
+
+        if len(epoch_data) == 0:
+            stage_label = "Unknown"
+        else:
+            rounded = np.round(epoch_data).astype(int)
+            values, counts = np.unique(rounded, return_counts=True)
+            dominant_value = values[np.argmax(counts)]
+
+            # Map using PhysioNet 2026 encoding.
+            stage_label = _map_numeric_to_stage(dominant_value)
+
         
         records.append({
             "onset": float(epoch_idx * epoch_sec),
@@ -646,53 +1011,7 @@ def _parse_multiclass_event_channel(
         return pd.DataFrame(records)
     return None
 
-def _map_numeric_to_stage(value: int) -> str:
-    """
-    Maps numeric values to sleep stage labels.
-    Handles multiple common encoding schemes.
-    """
-    # Try multiple encodings
-    # Encoding 1: AASM with REM=5
-    aasm_5 = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        5: "Sleep stage R",
-    }
-    
-    # Encoding 2: AASM with REM=4
-    aasm_4 = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage R",
-    }
-    
-    # Encoding 3: R&K
-    rk = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage N3",  # S4 -> N3
-        5: "Sleep stage R",
-    }
-    
-    # Try AASM with REM=5 first (most common in modern datasets)
-    if value in aasm_5:
-        return aasm_5[value]
-    
-    # Then AASM with REM=4
-    if value in aasm_4:
-        return aasm_4[value]
-    
-    # Movement/artifact
-    if value in [6, 7, 8, 9]:
-        return "Sleep stage W"  # Treat as wake
-    
-    return "Unknown"
+
 def _extract_annotations_from_pyedflib(f, signal_labels: list) -> Optional[pd.DataFrame]:
     """
     Extracts annotations from signal data using pyedflib.
@@ -755,44 +1074,6 @@ def _extract_annotations_from_pyedflib(f, signal_labels: list) -> Optional[pd.Da
         return None
     except Exception:
         return None
-
-
-def _map_numeric_to_stage(value: float) -> str:
-    """
-    Maps numeric values to sleep stage labels.
-    Handles multiple common encoding schemes.
-    """
-    # Round to nearest integer
-    val = int(round(value))
-    
-    # AASM standard encoding (most common)
-    # 0=Wake, 1=N1, 2=N2, 3=N3, 4=REM, 5=Unknown/Movement
-    aasm_map = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage R",
-        5: "Sleep stage W",  # Movement/Unknown -> Wake
-    }
-    
-    # R&K encoding
-    # 0=Wake, 1=S1, 2=S2, 3=S3, 4=S4, 5=REM
-    rk_map = {
-        0: "Sleep stage W",
-        1: "Sleep stage N1",
-        2: "Sleep stage N2",
-        3: "Sleep stage N3",
-        4: "Sleep stage N3",  # S4 -> N3
-        5: "Sleep stage R",
-    }
-    
-    # Try AASM first (most common in modern datasets)
-    if val in aasm_map:
-        return aasm_map[val]
-    
-    return "Unknown"
-
 
 
 # ==============================================================================
