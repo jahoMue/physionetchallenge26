@@ -2042,7 +2042,7 @@ def train_model(data_folder, model_folder, verbose):
 
     model_types = _get_candidate_model_types()
     enable_hpo = _env_bool("TEAM_ENABLE_HPO", True)
-    n_tune_trials = max(1, _env_int("TEAM_HPO_TRIALS", 25))
+    n_tune_trials = max(1, _env_int("TEAM_HPO_TRIALS", 10))
     final_train_all_models = _env_bool("TEAM_FINAL_TRAIN_ALL_MODELS", True)
 
     logger.info("=" * 70)

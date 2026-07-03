@@ -824,7 +824,7 @@ def _model_based_feature_selection(
         learning_rate=0.1,
         random_state=RANDOM_SEED,
         verbose=-1,
-        n_jobs=-1,
+        n_jobs=8,
     )
 
     model.fit(X_imp, y)
@@ -886,7 +886,7 @@ def _create_model(
             random_state=RANDOM_SEED,
             eval_metric="auc",
             # use_label_encoder=False,
-            n_jobs=-1,
+            n_jobs=8,
             early_stopping_rounds=None,
         )
 
@@ -904,7 +904,7 @@ def _create_model(
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             verbose=-1,
-            n_jobs=-1,
+            n_jobs=8,
         )
 
     elif model_type == "random_forest":
@@ -916,7 +916,7 @@ def _create_model(
             max_features="sqrt",
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
-            n_jobs=-1,
+            n_jobs=8,
         )
 
     elif model_type == "logistic_regression":
@@ -983,7 +983,7 @@ def _create_voting_ensemble(
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            n_jobs=-1,
+            n_jobs=8,
         )),
         ("lgbm", lgb.LGBMClassifier(
             n_estimators=150,
@@ -998,7 +998,7 @@ def _create_voting_ensemble(
             metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
-            n_jobs=-1,
+            n_jobs=8,
         )),
         ("rf", RandomForestClassifier(
             n_estimators=200,
@@ -1007,14 +1007,14 @@ def _create_voting_ensemble(
             min_samples_leaf=5,
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
-            n_jobs=-1,
+            n_jobs=8,
         )),
     ]
 
     return VotingClassifier(
         estimators=estimators,
         voting="soft",
-        n_jobs=-1,
+        n_jobs=8,
     )
 
 
@@ -1036,7 +1036,7 @@ def _create_stacking_ensemble(
             scale_pos_weight=scale_pos_weight if use_class_weight else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            n_jobs=-1,
+            n_jobs=8,
         )),
         ("lgbm", lgb.LGBMClassifier(
             n_estimators=100,
@@ -1051,7 +1051,7 @@ def _create_stacking_ensemble(
             metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
-            n_jobs=-1,
+            n_jobs=8,
         )),
         ("rf", RandomForestClassifier(
             n_estimators=150,
@@ -1059,7 +1059,7 @@ def _create_stacking_ensemble(
             min_samples_leaf=5,
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
-            n_jobs=-1,
+            n_jobs=8,
         )),
     ]
 
@@ -1073,7 +1073,7 @@ def _create_stacking_ensemble(
         ),
         cv=3,
         stack_method="predict_proba",
-        n_jobs=-1,
+        n_jobs=8,
     )
 
 
@@ -1371,7 +1371,7 @@ def _cross_validate_model(
                 cv=cv,
                 scoring=scoring,
                 return_train_score=True,
-                n_jobs=-1,
+                n_jobs=8,
             )
 
             cv_results = {}
@@ -1650,7 +1650,7 @@ def _tune_with_optuna(
                 "random_state": RANDOM_SEED,
                 "eval_metric": "auc",
                 # "use_label_encoder": False,
-                "n_jobs": -1,
+                "n_jobs": 8,
             }
             model = xgb.XGBClassifier(**params)
 
@@ -1669,7 +1669,7 @@ def _tune_with_optuna(
                 "metric": "auc",
                 "random_state": RANDOM_SEED,
                 "verbose": -1,
-                "n_jobs": -1,
+                "n_jobs": 8,
             }
             model = lgb.LGBMClassifier(**params)
 
@@ -1684,7 +1684,7 @@ def _tune_with_optuna(
                 ),
                 "class_weight": class_weight_dict,
                 "random_state": RANDOM_SEED,
-                "n_jobs": -1,
+                "n_jobs": 8,
             }
             model = RandomForestClassifier(**params)
 
@@ -1692,7 +1692,7 @@ def _tune_with_optuna(
             raise ValueError(f"Tuning nicht unterstützt für: {model_type}")
 
         scores = cross_val_score(
-            model, X, y, cv=cv, scoring="roc_auc", n_jobs=-1
+            model, X, y, cv=cv, scoring="roc_auc", n_jobs=8
         )
         return np.mean(scores)
 
@@ -1749,7 +1749,7 @@ def _tune_with_randomized_search(
             scale_pos_weight=scale_pos_weight if use_cw else 1.0,
             random_state=RANDOM_SEED,
             eval_metric="auc",
-            n_jobs=-1,
+            n_jobs=8,
         )
         param_distributions = {
             "n_estimators": randint(50, 300),
@@ -1769,7 +1769,7 @@ def _tune_with_randomized_search(
             metric="auc",
             random_state=RANDOM_SEED,
             verbose=-1,
-            n_jobs=-1,
+            n_jobs=8,
         )
         param_distributions = {
             "n_estimators": randint(50, 300),
@@ -1787,7 +1787,7 @@ def _tune_with_randomized_search(
         model = RandomForestClassifier(
             class_weight=class_weight_dict,
             random_state=RANDOM_SEED,
-            n_jobs=-1,
+            n_jobs=8,
         )
         param_distributions = {
             "n_estimators": randint(50, 300),
@@ -1813,7 +1813,7 @@ def _tune_with_randomized_search(
         cv=cv,
         scoring="roc_auc",
         random_state=RANDOM_SEED,
-        n_jobs=-1,
+        n_jobs=8,
         verbose=0,
     )
 
