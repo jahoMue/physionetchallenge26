@@ -703,7 +703,7 @@ def select_features(
     if n_features is None:
         n_features = min(
             int(np.sqrt(X.shape[0]) * 3),
-            min(100, X.shape[1])
+            min(75, X.shape[1])
         )
         n_features = max(n_features, 10)
 
