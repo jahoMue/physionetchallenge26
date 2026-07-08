@@ -108,6 +108,58 @@ class ModelSelector:
     def fit_transform(self, X, y=None):
         return self.transform(X)
 
+
+def _compute_auroc_age_fast(y_true, y_prob, ages, gap=2):
+    """Vectorized age-conditioned AUROC matching official evaluate_model.py logic.
+
+    For every (positive, negative) pair where |age_pos - age_neg| <= gap:
+        count whether P(pos) > P(neg)
+    AUROC_age = correct_pairs / total_pairs
+    """
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    ages = np.asarray(ages, dtype=float)
+
+    idx_pos = np.where(y_true == 1)[0]
+    idx_neg = np.where(y_true == 0)[0]
+
+    if len(idx_pos) == 0 or len(idx_neg) == 0:
+        return np.nan
+
+    ages_pos = ages[idx_pos]
+    ages_neg = ages[idx_neg]
+    probs_pos = y_prob[idx_pos]
+    probs_neg = y_prob[idx_neg]
+
+    # Check if arrays are small enough for full vectorized approach
+    if len(idx_pos) * len(idx_neg) <= 50_000_000:
+        # Broadcast: shape (n_pos, n_neg)
+        age_diff = np.abs(ages_pos[:, None] - ages_neg[None, :])
+        within_gap = age_diff <= gap
+
+        prob_diff = probs_pos[:, None] - probs_neg[None, :]
+
+        numer = float(np.sum((prob_diff > 0) & within_gap) + 0.5 * np.sum((prob_diff == 0) & within_gap))
+        denom = float(np.sum(within_gap))
+    else:
+        # Chunked approach for very large datasets to avoid memory issues
+        numer = 0.0
+        denom = 0.0
+        chunk_size = max(1, 50_000_000 // len(idx_neg))
+        for start in range(0, len(idx_pos), chunk_size):
+            end = min(start + chunk_size, len(idx_pos))
+            age_diff = np.abs(ages_pos[start:end, None] - ages_neg[None, :])
+            within_gap_chunk = age_diff <= gap
+            prob_diff = probs_pos[start:end, None] - probs_neg[None, :]
+            numer += float(np.sum((prob_diff > 0) & within_gap_chunk) + 0.5 * np.sum((prob_diff == 0) & within_gap_chunk))
+            denom += float(np.sum(within_gap_chunk))
+
+    if denom == 0:
+        return np.nan
+
+    return numer / denom
+
+
 def _prior_probability_shift(
     p: np.ndarray,
     train_prevalence: float,
@@ -565,7 +617,7 @@ def train_model(
         "cv_folds": CV_FOLDS,
         "random_seed": RANDOM_SEED,
         "timestamp": datetime.now().isoformat(),
-        "primary_cv_metric": "reward_mean",
+        "primary_cv_metric": "auroc_age_mean",
         "secondary_cv_metric": "auroc_mean",
 
     }
@@ -625,17 +677,48 @@ def prepare_training_data(
         float(x) if np.isfinite(x) else np.nan
         for x in age_values
     ]
-    age_values = _extract_age_values_from_prepared_df(df)
-    info["age_values"] = [
-        float(x) if np.isfinite(x) else np.nan
-        for x in age_values
-    ]
 
     info["n_patients_with_target"] = len(df)
     info["removed_patients"] = info["n_patients_original"] - len(df)
 
     if logger:
         logger.info(f"Patienten mit Target: {len(df)}/{info['n_patients_original']}")
+
+    # --- Age-interaction features for age-conditioned AUROC ---
+    # Age is now INCLUDED as a model feature (removed from exclude_cols)
+    # so that tree models can learn age-conditional biomarker patterns.
+    age_col_used = None
+    for _ac in ["demo_age", "Age"]:
+        if _ac in df.columns:
+            age_col_used = _ac
+            break
+
+    if age_col_used is not None:
+        age_vals = pd.to_numeric(df[age_col_used], errors="coerce")
+        # Polynomial: age²
+        df["demo_age_sq"] = age_vals ** 2
+
+        # Key age-interaction features for cognitive impairment
+        _key_interaction_features = [
+            "all_delta_alpha_ratio_mean",
+            "all_theta_alpha_ratio_mean",
+            "all_slowing_ratio_mean",
+            "all_spectral_entropy_mean",
+            "all_hrv_rmssd_mean",
+            "nrem_delta_power_rel_mean",
+            "all_dar_mean",
+            "all_sample_entropy_mean",
+        ]
+        for feat in _key_interaction_features:
+            if feat in df.columns:
+                interaction_name = f"{feat}_x_age"
+                df[interaction_name] = df[feat] * age_vals
+
+        if logger:
+            n_interactions = sum(1 for f in _key_interaction_features if f in df.columns)
+            logger.info(
+                f"Added age-interaction features: {n_interactions} interactions + demo_age_sq"
+            )
 
     exclude_cols = [
         "patient_id", "segment_idx", target_col,
@@ -644,7 +727,7 @@ def prepare_training_data(
         "SiteID", "BDSPPatientID", "CreationTime",
         "BidsFolder", "SessionID", "Last_Known_Visit_Date",
         "Time_to_Last_Visit",
-        "Age", "Sex", "Race", "Ethnicity", "BMI",
+        "Sex", "Race", "Ethnicity", "BMI",
         "demo_time_to_event", "demo_time_to_last_visit",
     ]
 
@@ -1115,12 +1198,14 @@ def _cross_validate_model_leakage_free(
     metrics = {
         "reward": [],
         "auroc": [],
+        "auroc_age": [],
         "average_precision": [],
         "f1": [],
         "balanced_accuracy": [],
         "accuracy": [],
         "reward_train": [],
         "auroc_train": [],
+        "auroc_age_train": [],
         "f1_train": [],
     }
 
@@ -1261,6 +1346,24 @@ def _cross_validate_model_leakage_free(
                 )
             )
 
+            # Age-conditioned AUROC — the official ranking metric.
+            # Use RAW probabilities (before prior shift) because
+            # within same-age pairs the shift is identical and thus
+            # preserves ranking, while at ±2-year boundaries it can
+            # introduce distortions.
+            if ages is not None and len(ages) == len(y):
+                auroc_age_val = _compute_auroc_age_fast(
+                    y_val.astype(int), p_val_raw, ages_val, gap=2
+                )
+                if np.isfinite(auroc_age_val):
+                    metrics["auroc_age"].append(auroc_age_val)
+
+                auroc_age_train = _compute_auroc_age_fast(
+                    y_train.astype(int), p_train_raw, ages_train, gap=2
+                )
+                if np.isfinite(auroc_age_train):
+                    metrics["auroc_age_train"].append(auroc_age_train)
+
             metrics["auroc_train"].append(roc_auc_score(y_train, p_train))
             metrics["f1_train"].append(
                 f1_score(y_train, y_train_pred, zero_division=0)
@@ -1273,8 +1376,14 @@ def _cross_validate_model_leakage_free(
                 )
             )
 
+            auroc_age_str = (
+                f"{metrics['auroc_age'][-1]:.4f}"
+                if metrics['auroc_age']
+                else "N/A"
+            )
             logger.info(
                     f"Fold {fold_idx + 1}/{CV_FOLDS}: "
+                    f"AUROC_age={auroc_age_str}, "
                     f"Reward={metrics['reward'][-1]:.4f}, "
                     f"AUROC={metrics['auroc'][-1]:.4f}, "
                     f"AUPRC={metrics['average_precision'][-1]:.4f}, "
@@ -1584,22 +1693,29 @@ def tune_hyperparameters(
     n_trials: int = 50,
     handle_imbalance: str = "class_weight",
     logger=None,
-    expected_test_prevalence: Optional[float] = 0.10
+    expected_test_prevalence: Optional[float] = 0.10,
+    ages: Optional[np.ndarray] = None,
 ) -> Dict:
     if logger:
         logger.info(f"Hyperparameter-Tuning: {model_type}, {n_trials} Trials")
+        if ages is not None:
+            logger.info("  HPO objective: age-conditioned AUROC (gap=2)")
+        else:
+            logger.info("  HPO objective: standard AUROC (no ages available)")
 
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         return _tune_with_optuna(
-            X, y, model_type, n_trials, handle_imbalance, logger, expected_test_prevalence
+            X, y, model_type, n_trials, handle_imbalance, logger,
+            expected_test_prevalence, ages=ages,
         )
     except ImportError:
         if logger:
             logger.info("Optuna nicht verfügbar, verwende RandomizedSearch")
         return _tune_with_randomized_search(
-            X, y, model_type, n_trials, handle_imbalance, logger, expected_test_prevalence
+            X, y, model_type, n_trials, handle_imbalance, logger,
+            expected_test_prevalence, ages=ages,
         )
 
 
@@ -1610,9 +1726,13 @@ def _tune_with_optuna(
     n_trials: int,
     handle_imbalance: str,
     logger=None,
-    expected_test_prevalence: Optional[float] = 0.10
+    expected_test_prevalence: Optional[float] = 0.10,
+    ages: Optional[np.ndarray] = None,
 ) -> Dict:
     import optuna
+    from sklearn.base import clone as sklearn_clone
+
+    use_auroc_age = ages is not None and len(ages) == len(y)
 
     class_counts = np.bincount(y.astype(int))
     scale_pos_weight = (
@@ -1630,10 +1750,7 @@ def _tune_with_optuna(
     class_weight_dict = {0: 1.0, 1: scale_pos_weight} if use_cw else None
 
     def objective(trial):
-        if expected_test_prevalence is not None:
-            cv = PrevalenceAdjustedKFold(n_splits=CV_FOLDS, expected_prevalence=expected_test_prevalence, random_state=RANDOM_SEED)
-        else:
-            cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+        cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
         if model_type == "xgboost":
             params = {
@@ -1649,10 +1766,9 @@ def _tune_with_optuna(
                 "scale_pos_weight": scale_pos_weight if use_cw else 1.0,
                 "random_state": RANDOM_SEED,
                 "eval_metric": "auc",
-                # "use_label_encoder": False,
                 "n_jobs": 8,
             }
-            model = xgb.XGBClassifier(**params)
+            trial_model = xgb.XGBClassifier(**params)
 
         elif model_type == "lightgbm":
             params = {
@@ -1671,7 +1787,7 @@ def _tune_with_optuna(
                 "verbose": -1,
                 "n_jobs": 8,
             }
-            model = lgb.LGBMClassifier(**params)
+            trial_model = lgb.LGBMClassifier(**params)
 
         elif model_type == "random_forest":
             params = {
@@ -1686,15 +1802,39 @@ def _tune_with_optuna(
                 "random_state": RANDOM_SEED,
                 "n_jobs": 8,
             }
-            model = RandomForestClassifier(**params)
+            trial_model = RandomForestClassifier(**params)
 
         else:
             raise ValueError(f"Tuning nicht unterstützt für: {model_type}")
 
-        scores = cross_val_score(
-            model, X, y, cv=cv, scoring="roc_auc", n_jobs=8
-        )
-        return np.mean(scores)
+        # Manual CV loop to support age-conditioned AUROC scoring
+        fold_scores = []
+        for train_idx, val_idx in cv.split(X, y):
+            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+
+            if len(np.unique(y_train_fold)) < 2 or len(np.unique(y_val_fold)) < 2:
+                continue
+
+            fold_model = sklearn_clone(trial_model)
+            fold_model.fit(X_train_fold, y_train_fold)
+            p_val = fold_model.predict_proba(X_val_fold)[:, 1]
+
+            if use_auroc_age:
+                ages_val = ages[val_idx]
+                score = _compute_auroc_age_fast(
+                    y_val_fold.astype(int), p_val, ages_val, gap=2
+                )
+            else:
+                score = roc_auc_score(y_val_fold, p_val)
+
+            if np.isfinite(score):
+                fold_scores.append(score)
+
+        if not fold_scores:
+            return 0.0
+
+        return float(np.mean(fold_scores))
 
     study = optuna.create_study(
         direction="maximize",
@@ -1705,15 +1845,17 @@ def _tune_with_optuna(
     best_params = study.best_params
     best_score = study.best_value
 
+    metric_name = "Age-conditioned AUROC" if use_auroc_age else "AUROC"
     if logger:
-        logger.info(f"Bestes AUROC: {best_score:.4f}")
-        logger.info(f"Beste Parameter: {best_params}")
+        logger.info(f"Best {metric_name}: {best_score:.4f}")
+        logger.info(f"Best params: {best_params}")
 
     return {
         "best_params": best_params,
         "best_score": best_score,
         "n_trials": n_trials,
         "method": "optuna",
+        "scoring_metric": "auroc_age" if use_auroc_age else "roc_auc",
     }
 
 
@@ -1724,10 +1866,14 @@ def _tune_with_randomized_search(
     n_trials: int,
     handle_imbalance: str,
     logger=None,
-    expected_test_prevalence: Optional[float] = 0.10
+    expected_test_prevalence: Optional[float] = 0.10,
+    ages: Optional[np.ndarray] = None,
 ) -> Dict:
     from sklearn.model_selection import RandomizedSearchCV
+    from sklearn.base import clone as sklearn_clone
     from scipy.stats import uniform, randint, loguniform
+
+    use_auroc_age = ages is not None and len(ages) == len(y)
 
     class_counts = np.bincount(y.astype(int))
     scale_pos_weight = (
@@ -1801,34 +1947,85 @@ def _tune_with_randomized_search(
             logger.warning(f"RandomizedSearch nicht konfiguriert für {model_type}")
         return {"best_params": {}, "best_score": 0, "method": "none"}
 
-    if expected_test_prevalence is not None:
-        cv = PrevalenceAdjustedKFold(n_splits=CV_FOLDS, expected_prevalence=expected_test_prevalence, random_state=RANDOM_SEED)
+    if use_auroc_age:
+        # Manual random search with age-conditioned AUROC scoring
+        cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+        rng = np.random.RandomState(RANDOM_SEED)
+
+        best_score = -np.inf
+        best_params = {}
+
+        for trial_i in range(n_trials):
+            sampled_params = {
+                k: v.rvs(random_state=rng) if hasattr(v, 'rvs') else v
+                for k, v in param_distributions.items()
+            }
+            trial_model = sklearn_clone(model).set_params(**sampled_params)
+
+            fold_scores = []
+            for train_idx, val_idx in cv.split(X, y):
+                X_tr, X_va = X[train_idx], X[val_idx]
+                y_tr, y_va = y[train_idx], y[val_idx]
+
+                if len(np.unique(y_tr)) < 2 or len(np.unique(y_va)) < 2:
+                    continue
+
+                trial_model_fold = sklearn_clone(trial_model)
+                trial_model_fold.fit(X_tr, y_tr)
+                p_va = trial_model_fold.predict_proba(X_va)[:, 1]
+
+                score = _compute_auroc_age_fast(
+                    y_va.astype(int), p_va, ages[val_idx], gap=2
+                )
+                if np.isfinite(score):
+                    fold_scores.append(score)
+
+            if fold_scores:
+                mean_score = float(np.mean(fold_scores))
+                if mean_score > best_score:
+                    best_score = mean_score
+                    best_params = sampled_params
+
+        if logger:
+            logger.info(f"Best Age-conditioned AUROC: {best_score:.4f}")
+            logger.info(f"Best params: {best_params}")
+
+        return {
+            "best_params": best_params,
+            "best_score": float(best_score) if np.isfinite(best_score) else 0.0,
+            "n_trials": n_trials,
+            "method": "manual_randomized_search",
+            "scoring_metric": "auroc_age",
+        }
+
     else:
+        # Standard RandomizedSearchCV with standard AUROC
         cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
-    search = RandomizedSearchCV(
-        model,
-        param_distributions=param_distributions,
-        n_iter=n_trials,
-        cv=cv,
-        scoring="roc_auc",
-        random_state=RANDOM_SEED,
-        n_jobs=8,
-        verbose=0,
-    )
+        search = RandomizedSearchCV(
+            model,
+            param_distributions=param_distributions,
+            n_iter=n_trials,
+            cv=cv,
+            scoring="roc_auc",
+            random_state=RANDOM_SEED,
+            n_jobs=8,
+            verbose=0,
+        )
 
-    search.fit(X, y)
+        search.fit(X, y)
 
-    if logger:
-        logger.info(f"Bestes AUROC: {search.best_score_:.4f}")
-        logger.info(f"Beste Parameter: {search.best_params_}")
+        if logger:
+            logger.info(f"Best AUROC: {search.best_score_:.4f}")
+            logger.info(f"Best params: {search.best_params_}")
 
-    return {
-        "best_params": search.best_params_,
-        "best_score": float(search.best_score_),
-        "n_trials": n_trials,
-        "method": "randomized_search",
-    }
+        return {
+            "best_params": search.best_params_,
+            "best_score": float(search.best_score_),
+            "n_trials": n_trials,
+            "method": "randomized_search",
+            "scoring_metric": "roc_auc",
+        }
 
 
 # ==============================================================================
