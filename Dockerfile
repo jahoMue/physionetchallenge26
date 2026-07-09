@@ -14,12 +14,12 @@ RUN pip install -r requirements.txt
 ARG GDRIVE_FILE_ID="1i9ekH3G_UCJr6bRykRhEq98fqbIVFyM_"
 
 RUN mkdir -p /challenge/model \
-    && python -m gdown --id "${GDRIVE_FILE_ID}" -O /tmp/model.zip \
+    && python -m gdown "${GDRIVE_FILE_ID}" -O /tmp/model.zip \
     && python - <<'PY'
 import zipfile
 
 zip_path = "/tmp/model.zip"
-extract_dir = "/challenge/model"
+extract_dir = "/challenge"
 
 with zipfile.ZipFile(zip_path, "r") as z:
     z.extractall(extract_dir)
