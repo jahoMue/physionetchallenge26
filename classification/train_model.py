@@ -159,6 +159,34 @@ def _compute_auroc_age_fast(y_true, y_prob, ages, gap=2):
 
     return numer / denom
 
+def _compute_age_sample_weights(
+    y: np.ndarray,
+    ages: np.ndarray,
+    class_weight_dict: dict = None
+) -> np.ndarray:
+    import numpy as np
+    weights = np.ones(len(y), dtype=float)
+    if class_weight_dict is not None:
+        for c, w in class_weight_dict.items():
+            weights[y == c] = w
+
+    if ages is not None and len(ages) == len(y):
+        bins = np.arange(0, 120, 10)
+        age_bins = np.digitize(ages, bins)
+        bin_counts = np.bincount(age_bins)
+        
+        bin_counts_safe = np.where(bin_counts == 0, 1, bin_counts)
+        max_count = np.max(bin_counts)
+        age_weights = max_count / bin_counts_safe
+        
+        for i, ab in enumerate(age_bins):
+            if np.isfinite(ages[i]):
+                weights[i] *= np.sqrt(age_weights[ab])
+            
+    if len(weights) > 0 and np.mean(weights) > 0:
+        weights = weights / np.mean(weights)
+        
+    return weights
 
 def _prior_probability_shift(
     p: np.ndarray,
@@ -580,7 +608,18 @@ def train_model(
     else:
         X_resampled, y_resampled = X_processed, y
 
-    model.fit(X_resampled, y_resampled)
+    fit_kwargs = {}
+    if handle_imbalance == "class_weight":
+        cwd = None
+        if hasattr(model, 'class_weight'):
+            cwd = model.class_weight
+        sample_weights = _compute_age_sample_weights(y_resampled, age_values, cwd)
+        fit_kwargs["sample_weight"] = sample_weights
+
+    try:
+        model.fit(X_resampled, y_resampled, **fit_kwargs)
+    except Exception:
+        model.fit(X_resampled, y_resampled)
 
     if logger:
         logger.info("Finales Modell auf allen Daten trainiert.")
@@ -1272,7 +1311,38 @@ def _cross_validate_model_leakage_free(
             X_fit, y_fit = X_train, y_train
 
         try:
-            fold_model.fit(X_fit, y_fit)
+            fit_kwargs = {}
+            if handle_imbalance == "class_weight":
+                ages_t = ages[train_idx] if ages is not None else None
+                cwd = None
+                if hasattr(fold_model, 'class_weight'):
+                    cwd = fold_model.class_weight
+                fit_kwargs["sample_weight"] = _compute_age_sample_weights(y_fit, ages_t, cwd)
+
+            if ages is not None and model_type in ["xgboost", "lightgbm"]:
+                ages_val = ages[val_idx]
+                if model_type == "lightgbm":
+                    def lgb_eval_metric(y_t, y_p):
+                        score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
+                        return 'auroc_age', score if np.isfinite(score) else 0.5, True
+                    import lightgbm as lgb
+                    fit_kwargs["eval_set"] = [(X_val, y_val)]
+                    fit_kwargs["eval_metric"] = lgb_eval_metric
+                    fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+                elif model_type == "xgboost":
+                    def xgb_eval_metric(y_p, dtrain):
+                        y_t = dtrain.get_label()
+                        score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
+                        return 'auroc_age', score if np.isfinite(score) else 0.5
+                    fit_kwargs["eval_set"] = [(X_val, y_val)]
+                    fit_kwargs["eval_metric"] = xgb_eval_metric
+                    fold_model.set_params(early_stopping_rounds=20)
+                    fit_kwargs["verbose"] = False
+                    
+            try:
+                fold_model.fit(X_fit, y_fit, **fit_kwargs)
+            except Exception:
+                fold_model.fit(X_fit, y_fit)
 
             # Raw model probabilities.
             p_val_raw = fold_model.predict_proba(X_val)[:, 1]
@@ -1817,7 +1887,35 @@ def _tune_with_optuna(
                 continue
 
             fold_model = sklearn_clone(trial_model)
-            fold_model.fit(X_train_fold, y_train_fold)
+            fit_kwargs = {}
+            if handle_imbalance == "class_weight":
+                ages_t = ages[train_idx] if ages is not None else None
+                fit_kwargs["sample_weight"] = _compute_age_sample_weights(y_train_fold, ages_t, class_weight_dict)
+
+            if use_auroc_age and model_type in ["xgboost", "lightgbm"]:
+                ages_val = ages[val_idx]
+                if model_type == "lightgbm":
+                    def lgb_eval_metric(y_t, y_p):
+                        score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
+                        return 'auroc_age', score if np.isfinite(score) else 0.5, True
+                    import lightgbm as lgb
+                    fit_kwargs["eval_set"] = [(X_val_fold, y_val_fold)]
+                    fit_kwargs["eval_metric"] = lgb_eval_metric
+                    fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+                elif model_type == "xgboost":
+                    def xgb_eval_metric(y_p, dtrain):
+                        y_t = dtrain.get_label()
+                        score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
+                        return 'auroc_age', score if np.isfinite(score) else 0.5
+                    fit_kwargs["eval_set"] = [(X_val_fold, y_val_fold)]
+                    fit_kwargs["eval_metric"] = xgb_eval_metric
+                    fold_model.set_params(early_stopping_rounds=20)
+                    fit_kwargs["verbose"] = False
+
+            try:
+                fold_model.fit(X_train_fold, y_train_fold, **fit_kwargs)
+            except Exception:
+                fold_model.fit(X_train_fold, y_train_fold)
             p_val = fold_model.predict_proba(X_val_fold)[:, 1]
 
             if use_auroc_age:
@@ -1971,7 +2069,35 @@ def _tune_with_randomized_search(
                     continue
 
                 trial_model_fold = sklearn_clone(trial_model)
-                trial_model_fold.fit(X_tr, y_tr)
+                fit_kwargs = {}
+                if handle_imbalance == "class_weight":
+                    ages_t = ages[train_idx] if ages is not None else None
+                    fit_kwargs["sample_weight"] = _compute_age_sample_weights(y_tr, ages_t, class_weight_dict)
+
+                if use_auroc_age and model_type in ["xgboost", "lightgbm"]:
+                    ages_val = ages[val_idx]
+                    if model_type == "lightgbm":
+                        def lgb_eval_metric(y_t, y_p):
+                            score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
+                            return 'auroc_age', score if np.isfinite(score) else 0.5, True
+                        import lightgbm as lgb
+                        fit_kwargs["eval_set"] = [(X_va, y_va)]
+                        fit_kwargs["eval_metric"] = lgb_eval_metric
+                        fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+                    elif model_type == "xgboost":
+                        def xgb_eval_metric(y_p, dtrain):
+                            y_t = dtrain.get_label()
+                            score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
+                            return 'auroc_age', score if np.isfinite(score) else 0.5
+                        fit_kwargs["eval_set"] = [(X_va, y_va)]
+                        fit_kwargs["eval_metric"] = xgb_eval_metric
+                        trial_model_fold.set_params(early_stopping_rounds=20)
+                        fit_kwargs["verbose"] = False
+                        
+                try:
+                    trial_model_fold.fit(X_tr, y_tr, **fit_kwargs)
+                except Exception:
+                    trial_model_fold.fit(X_tr, y_tr)
                 p_va = trial_model_fold.predict_proba(X_va)[:, 1]
 
                 score = _compute_auroc_age_fast(
