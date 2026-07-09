@@ -1056,11 +1056,20 @@ def _predict_feature_table(
     probabilities = np.clip(probabilities, 0.0, 1.0)
     predictions = (probabilities >= thresholds).astype(int)
 
+    # Return RAW probabilities for the probability output.
+    # Age-conditioned AUROC (the ranking metric) evaluates ranking
+    # within ±2-year age windows. The prior shift is identical within
+    # same-age groups so it preserves ranking, but at boundaries it
+    # can introduce distortions. Raw probabilities are the safer choice.
+    # The binary prediction still uses prior-shifted + age-specific
+    # thresholds for the reward metric.
+    raw_probabilities_clipped = np.clip(raw_probabilities, 0.0, 1.0)
+
     return pd.DataFrame(
         {
             "patient_id": patient_ids,
             "prediction": predictions.astype(int),
-            "probability": probabilities.astype(float),
+            "probability": raw_probabilities_clipped.astype(float),
         }
     )
 
@@ -1223,6 +1232,12 @@ def _keep_patient_feature_column(col: str) -> bool:
             or "cycle_rel_change" in col
         ):
             return True
+
+    # Age-interaction features and age polynomial for age-conditioned AUROC
+    if col == "demo_age_sq":
+        return True
+    if col.endswith("_x_age"):
+        return True
 
     return False
 
@@ -1568,7 +1583,7 @@ def _run_hpo_for_model(
         from sklearn.impute import SimpleImputer
         from sklearn.preprocessing import StandardScaler
 
-        X, y, feature_names, _ = classification_module.prepare_training_data(
+        X, y, feature_names, prep_info = classification_module.prepare_training_data(
             feature_table,
             logger=logger,
         )
@@ -1595,6 +1610,14 @@ def _run_hpo_for_model(
                 f"{n_trials} trials"
             )
 
+        # Extract ages from the prepare_training_data info dict.
+        # The info dict already contains age_values aligned to y.
+        hpo_ages = None
+        if isinstance(prep_info, dict) and "age_values" in prep_info:
+            _raw_ages = np.asarray(prep_info["age_values"], dtype=float)
+            if len(_raw_ages) == len(y) and np.sum(np.isfinite(_raw_ages)) > 0:
+                hpo_ages = _raw_ages
+
         tune_result = classification_module.tune_hyperparameters(
             X=X_scaled,
             y=y,
@@ -1603,6 +1626,7 @@ def _run_hpo_for_model(
             handle_imbalance=handle_imbalance,
             logger=logger,
             expected_test_prevalence=expected_test_prevalence,
+            ages=hpo_ages,
         )
 
         if logger:
@@ -1748,6 +1772,24 @@ def _evaluate_candidate_on_holdout(
             metrics["holdout_auroc"] = np.nan
             metrics["holdout_auprc"] = np.nan
 
+        # Age-conditioned AUROC — the official ranking metric
+        holdout_ages = _extract_age_series(holdout_df)
+        if holdout_ages is not None and len(np.unique(y_hold)) == 2:
+            try:
+                from classification.train_model import _compute_auroc_age_fast
+                auroc_age_val = _compute_auroc_age_fast(
+                    y_hold, proba,
+                    holdout_ages.to_numpy(dtype=float),
+                    gap=2,
+                )
+                metrics["holdout_auroc_age"] = (
+                    float(auroc_age_val) if np.isfinite(auroc_age_val) else np.nan
+                )
+            except Exception:
+                metrics["holdout_auroc_age"] = np.nan
+        else:
+            metrics["holdout_auroc_age"] = np.nan
+
         metrics["holdout_accuracy"] = float(accuracy_score(y_hold, binary))
         metrics["holdout_f1"] = float(f1_score(y_hold, binary, zero_division=0))
         metrics["holdout_balanced_accuracy"] = float(
@@ -1796,14 +1838,18 @@ def _candidate_selection_tuple(result: Dict, prefer_holdout: bool = True) -> Tup
     cv = result.get("cv_results", {}) if isinstance(result, dict) else {}
 
     if prefer_holdout:
+        # Age-conditioned AUROC is the primary ranking metric
+        primary_auroc_age = cv.get("holdout_auroc_age", np.nan)
         primary_reward = cv.get("holdout_reward", np.nan)
         primary_auroc = cv.get("holdout_auroc", np.nan)
         primary_auprc = cv.get("holdout_auprc", np.nan)
     else:
+        primary_auroc_age = cv.get("auroc_age_mean", np.nan)
         primary_reward = cv.get("reward_mean", np.nan)
         primary_auroc = cv.get("auroc_mean", np.nan)
         primary_auprc = cv.get("average_precision_mean", np.nan)
 
+    cv_auroc_age = cv.get("auroc_age_mean", np.nan)
     cv_reward = cv.get("reward_mean", np.nan)
     cv_auroc = cv.get("auroc_mean", np.nan)
     cv_auprc = cv.get("average_precision_mean", np.nan)
@@ -1812,9 +1858,11 @@ def _candidate_selection_tuple(result: Dict, prefer_holdout: bool = True) -> Tup
     overfit_penalty = -_metric_or_neg_inf(overfit_gap)
 
     return (
+        _metric_or_neg_inf(primary_auroc_age),
         _metric_or_neg_inf(primary_reward),
         _metric_or_neg_inf(primary_auroc),
         _metric_or_neg_inf(primary_auprc),
+        _metric_or_neg_inf(cv_auroc_age),
         _metric_or_neg_inf(cv_reward),
         _metric_or_neg_inf(cv_auroc),
         _metric_or_neg_inf(cv_auprc),
@@ -1855,8 +1903,10 @@ def _select_best_candidate(
             f"BEST CANDIDATE SELECTED: {best_name}"
         )
         logger.info(
-            f"  holdout_reward={cv.get('holdout_reward', 'N/A')}, "
+            f"  holdout_auroc_age={cv.get('holdout_auroc_age', 'N/A')}, "
+            f"holdout_reward={cv.get('holdout_reward', 'N/A')}, "
             f"holdout_auroc={cv.get('holdout_auroc', 'N/A')}, "
+            f"cv_auroc_age={cv.get('auroc_age_mean', 'N/A')}, "
             f"cv_reward={cv.get('reward_mean', 'N/A')}, "
             f"cv_auroc={cv.get('auroc_mean', 'N/A')}"
         )
@@ -1871,14 +1921,14 @@ def _log_candidate_comparison(
     title: str,
 ):
     logger.info("")
-    logger.info("=" * 80)
+    logger.info("=" * 90)
     logger.info(title)
-    logger.info("=" * 80)
+    logger.info("=" * 90)
     logger.info(
-        f"{'model':<18} {'h_reward':>10} {'h_auc':>10} {'h_ap':>10} "
-        f"{'cv_reward':>10} {'cv_auc':>10} {'cv_ap':>10} {'tuned':>8}"
+        f"{'model':<18} {'h_auc_age':>10} {'h_reward':>10} {'h_auc':>10} {'h_ap':>10} "
+        f"{'cv_auc_age':>10} {'cv_reward':>10} {'cv_auc':>10} {'tuned':>8}"
     )
-    logger.info("-" * 80)
+    logger.info("-" * 90)
 
     rows = []
 
@@ -1893,9 +1943,11 @@ def _log_candidate_comparison(
         rows.append(
             {
                 "model": name,
+                "holdout_auroc_age": cv.get("holdout_auroc_age", np.nan),
                 "holdout_reward": cv.get("holdout_reward", np.nan),
                 "holdout_auroc": cv.get("holdout_auroc", np.nan),
                 "holdout_auprc": cv.get("holdout_auprc", np.nan),
+                "cv_auroc_age": cv.get("auroc_age_mean", np.nan),
                 "cv_reward": cv.get("reward_mean", np.nan),
                 "cv_auroc": cv.get("auroc_mean", np.nan),
                 "cv_auprc": cv.get("average_precision_mean", np.nan),
@@ -1905,8 +1957,10 @@ def _log_candidate_comparison(
 
     rows.sort(
         key=lambda r: (
+            _metric_or_neg_inf(r["holdout_auroc_age"]),
             _metric_or_neg_inf(r["holdout_reward"]),
             _metric_or_neg_inf(r["holdout_auroc"]),
+            _metric_or_neg_inf(r["cv_auroc_age"]),
             _metric_or_neg_inf(r["cv_reward"]),
             _metric_or_neg_inf(r["cv_auroc"]),
         ),
@@ -1916,16 +1970,17 @@ def _log_candidate_comparison(
     for r in rows:
         logger.info(
             f"{r['model']:<18} "
+            f"{_format_metric(r['holdout_auroc_age']):>10} "
             f"{_format_metric(r['holdout_reward']):>10} "
             f"{_format_metric(r['holdout_auroc']):>10} "
             f"{_format_metric(r['holdout_auprc']):>10} "
+            f"{_format_metric(r['cv_auroc_age']):>10} "
             f"{_format_metric(r['cv_reward']):>10} "
             f"{_format_metric(r['cv_auroc']):>10} "
-            f"{_format_metric(r['cv_auprc']):>10} "
             f"{str(bool(r['tuned'])):>8}"
         )
 
-    logger.info("=" * 80)
+    logger.info("=" * 90)
 
 
 def _format_metric(x):

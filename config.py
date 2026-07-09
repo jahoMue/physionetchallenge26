@@ -33,7 +33,8 @@ DATA_DIR = PHYSIOLOGICAL_DATA_DIR
 
 # Ausgabe-Verzeichnisse
 OUTPUT_DIR = PROJECT_DIR / "output"
-FEATURE_DIR = OUTPUT_DIR / "features"
+# FEATURE_DIR = OUTPUT_DIR / "features"
+FEATURE_DIR = PROJECT_DIR / "features"
 MODEL_DIR = OUTPUT_DIR / "models"
 LOG_DIR = OUTPUT_DIR / "logs"
 PLOT_DIR = OUTPUT_DIR / "plots"

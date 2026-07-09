@@ -4,6 +4,34 @@ This repository contains the source code for Team IBMT's submission to the Physi
 
 ---
 
+## 🐳 Docker Workflow
+
+To ensure reproducibility and run the complete evaluation pipeline (training, testing, and evaluation), you can use the provided Docker container. The Docker image downloads necessary dependencies and model artifacts.
+
+1. **Open a terminal in the current folder** where the `Dockerfile` is located.
+2. **Build the Docker image:**
+   ```bash
+   docker build -t physionet26 .
+   ```
+3. **Run the container interactively**, mounting your local data directories (adjust the local paths as needed for your machine):
+   ```bash
+   docker run -it \
+     -v "C:\Users\Biosig 3\Documents\Richard\Physionet26Data\model:/challenge/model" \
+     -v "C:\Users\Biosig 3\Documents\Richard\Physionet26Data\holdout_data:/challenge/holdout_data" \
+     -v "C:\Users\Biosig 3\Documents\Richard\Physionet26Data\holdout_outputs:/challenge/holdout_outputs" \
+     -v "C:\Users\Biosig 3\Documents\Richard\Physionet26Data\training_data:/challenge/training_data" \
+     physionet26 bash
+   ```
+4. **Run the pipeline inside the container:** Once inside the bash shell of the container, execute the following commands to fix potential Windows line-endings in the script, make it executable, and run the pipeline:
+   ```bash
+   sed -i 's/\r$//' run_pipeline.sh
+   chmod +x run_pipeline.sh
+   ./run_pipeline.sh
+   ```
+   *The `run_pipeline.sh` script sequentially executes `train_model.py`, `run_model.py`, and `evaluate_model.py`.*
+
+---
+
 ## 📂 Data Storage & Configuration
 
 The project expects the dataset to follow the standard PhysioNet Challenge structure:
@@ -91,10 +119,19 @@ python evaluate_model.py -d labels.csv -o predictions.csv -s scores.csv
 
 ## 🧩 Architecture Summary
 
-* **`train_model.py`, `run_model.py`, `evaluate_model.py`**: Standard challenge entry points.
+* **Challenge Entry Points**: `train_model.py`, `run_model.py`, `evaluate_model.py`, and `helper_code.py`.
 * **`team_code.py`**: The "adapter" connecting the standard challenge entry points to the Team IBMT custom code. Handles dynamic config overrides and parallel processing orchestration.
-* **`main.py`**: Developer orchestration script. Defines high-level routines (`run_preprocessing_pipeline`, `run_training_pipeline`, etc.).
+* **`main.py` & Scripts**:
+  * `main.py`: Developer orchestration script. Defines high-level routines (`run_preprocessing_pipeline`, `run_training_pipeline`, etc.).
+  * `preprocess_training_only.py`, `generate_preprocessing_manifest.py`, `create_labels.py`: Data preparation and manifest generation tools.
+  * `calc_shap_values.py`: Tool for calculating SHAP values to explain model predictions.
+  * `leaderboard.py`: Scripts associated with leaderboard score calculations.
 * **`config.py`**: Central configuration registry for file paths, biological parameters (e.g., filters, segment overlap), and toggles.
-* **`preprocessing/`**: Raw EDF signal (EEG, ECG, Respiration) and annotation cleaning.
-* **`feature_extraction/`**: Extracting statistical, morphological, and spectral features on isolated overlapping windows.
-* **`classification/`**: Building, tuning, and evaluating the final predictive models.
+* **`Dockerfile` & `run_pipeline.sh`**: Docker containerization configuration and full pipeline bash script.
+* **Directories**:
+  * **`preprocessing/`**: Raw EDF signal (EEG, ECG, Respiration) and annotation cleaning.
+  * **`feature_extraction/`**: Extracting statistical, morphological, and spectral features on isolated overlapping windows.
+  * **`classification/`**: Building, tuning, and evaluating the final predictive models.
+  * **`CAP_classification/` & `segmentation/`**: Specialized modules for Cyclic Alternating Pattern and segmentation tasks.
+  * **`utils/`**: General helper functions.
+  * **`feature_table/`**: Directory for storing extracted feature datasets.

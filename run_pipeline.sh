@@ -3,6 +3,8 @@
 
 set -e  # Exit immediately if any command fails
 
+# mv features model/
+
 python train_model.py -d training_data -m model -v
 
 python run_model.py -d holdout_data -m model -o holdout_outputs -v
