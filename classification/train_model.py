@@ -1325,7 +1325,6 @@ def _cross_validate_model_leakage_free(
                     def lgb_eval_metric(y_t, y_p):
                         score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
                         return 'auroc_age', score if np.isfinite(score) else 0.5, True
-                    import lightgbm as lgb
                     fit_kwargs["eval_set"] = [(X_val, y_val)]
                     fit_kwargs["eval_metric"] = lgb_eval_metric
                     fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
@@ -1335,13 +1334,14 @@ def _cross_validate_model_leakage_free(
                         score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
                         return 'auroc_age', score if np.isfinite(score) else 0.5
                     fit_kwargs["eval_set"] = [(X_val, y_val)]
-                    fit_kwargs["eval_metric"] = xgb_eval_metric
-                    fold_model.set_params(early_stopping_rounds=20)
+                    fold_model.set_params(early_stopping_rounds=20, eval_metric=xgb_eval_metric)
                     fit_kwargs["verbose"] = False
                     
             try:
                 fold_model.fit(X_fit, y_fit, **fit_kwargs)
             except Exception:
+                if model_type == "xgboost":
+                    fold_model.set_params(early_stopping_rounds=None)
                 fold_model.fit(X_fit, y_fit)
 
             # Raw model probabilities.
@@ -1898,7 +1898,6 @@ def _tune_with_optuna(
                     def lgb_eval_metric(y_t, y_p):
                         score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
                         return 'auroc_age', score if np.isfinite(score) else 0.5, True
-                    import lightgbm as lgb
                     fit_kwargs["eval_set"] = [(X_val_fold, y_val_fold)]
                     fit_kwargs["eval_metric"] = lgb_eval_metric
                     fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
@@ -1908,13 +1907,14 @@ def _tune_with_optuna(
                         score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
                         return 'auroc_age', score if np.isfinite(score) else 0.5
                     fit_kwargs["eval_set"] = [(X_val_fold, y_val_fold)]
-                    fit_kwargs["eval_metric"] = xgb_eval_metric
-                    fold_model.set_params(early_stopping_rounds=20)
+                    fold_model.set_params(early_stopping_rounds=20, eval_metric=xgb_eval_metric)
                     fit_kwargs["verbose"] = False
 
             try:
                 fold_model.fit(X_train_fold, y_train_fold, **fit_kwargs)
             except Exception:
+                if model_type == "xgboost":
+                    fold_model.set_params(early_stopping_rounds=None)
                 fold_model.fit(X_train_fold, y_train_fold)
             p_val = fold_model.predict_proba(X_val_fold)[:, 1]
 
@@ -2080,7 +2080,6 @@ def _tune_with_randomized_search(
                         def lgb_eval_metric(y_t, y_p):
                             score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
                             return 'auroc_age', score if np.isfinite(score) else 0.5, True
-                        import lightgbm as lgb
                         fit_kwargs["eval_set"] = [(X_va, y_va)]
                         fit_kwargs["eval_metric"] = lgb_eval_metric
                         fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
@@ -2090,13 +2089,14 @@ def _tune_with_randomized_search(
                             score = _compute_auroc_age_fast(y_t, y_p, ages_val, gap=2)
                             return 'auroc_age', score if np.isfinite(score) else 0.5
                         fit_kwargs["eval_set"] = [(X_va, y_va)]
-                        fit_kwargs["eval_metric"] = xgb_eval_metric
-                        trial_model_fold.set_params(early_stopping_rounds=20)
+                        trial_model_fold.set_params(early_stopping_rounds=20, eval_metric=xgb_eval_metric)
                         fit_kwargs["verbose"] = False
                         
                 try:
                     trial_model_fold.fit(X_tr, y_tr, **fit_kwargs)
                 except Exception:
+                    if model_type == "xgboost":
+                        trial_model_fold.set_params(early_stopping_rounds=None)
                     trial_model_fold.fit(X_tr, y_tr)
                 p_va = trial_model_fold.predict_proba(X_va)[:, 1]
 
