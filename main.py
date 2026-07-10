@@ -53,6 +53,7 @@ from config import (
     NUM_WORKERS,
     enable_delta_power_entropy,
     DELTA_POWER_ENTROPY_FEATURE_COLUMNS,
+    CALCULATE_ONLY_SELECTED_FEATURES,
 )
 
 
@@ -283,6 +284,10 @@ def process_single_patient(
 
         eeg_fs_value = None
         for channel_name, channel_idx in eeg_channels.items():
+            if CALCULATE_ONLY_SELECTED_FEATURES and channel_name not in ["F3", "F4", "C3", "C4"]:
+                patient_logger.info(f"EEG [{channel_name}]: Skipping scaling filter (not selected).")
+                continue
+            
             eeg_signal, eeg_fs = extract_signal(record, channel_idx)
             eeg_fs_value = eeg_fs
             try:
@@ -311,6 +316,9 @@ def process_single_patient(
         )
 
         for channel_name, channel_idx in eeg_channels.items():
+            if CALCULATE_ONLY_SELECTED_FEATURES and channel_name not in ["F3", "F4", "C3", "C4"]:
+                patient_logger.info(f"EEG [{channel_name}]: Skipping preprocessing (not selected).")
+                continue
             eeg_signal, eeg_fs = extract_signal(record, channel_idx)
             is_bad = channel_name in globally_bad_channels
             eeg_result = preprocess_eeg_signal(

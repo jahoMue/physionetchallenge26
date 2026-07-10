@@ -48,7 +48,17 @@ from config import (
     ORP_LUT_DIR, ORP_SYMBOLVALUES_DIR,
     EEG_AMPLITUDE_MAX_UV, EEG_AMPLITUDE_MIN_UV,
     SIGNAL_DTYPE,
+    CALCULATE_ONLY_SELECTED_FEATURES, SELECTED_FEATURES_FILE,
 )
+
+import json
+SELECTED_EEG_FEATURES = set()
+if CALCULATE_ONLY_SELECTED_FEATURES and SELECTED_FEATURES_FILE.exists():
+    try:
+        with open(SELECTED_FEATURES_FILE, 'r') as f:
+            SELECTED_EEG_FEATURES = set(json.load(f).get('selected_features', []))
+    except Exception as e:
+        print(f"Warning: Could not load {SELECTED_FEATURES_FILE}: {e}")
 
 from feature_extraction.features_eeg_spindle_so import (
     extract_spindle_so_coupling_features,
@@ -119,9 +129,11 @@ def extract_eeg_features_segment(
     features.update(_compute_spectral_features(segment_data, fs, prefix))
     features.update(_compute_sleep_specific_features(segment_data, fs, prefix))
     features.update(_compute_hjorth_parameters(segment_data, fs, prefix))
-    features.update(_compute_entropy_features(segment_data, prefix))
-    features.update(_compute_complexity_features(segment_data, fs, prefix))
-    features.update(_compute_temporal_features(segment_data, fs, prefix))
+    
+    if not CALCULATE_ONLY_SELECTED_FEATURES:
+        features.update(_compute_entropy_features(segment_data, prefix))
+        features.update(_compute_complexity_features(segment_data, fs, prefix))
+        features.update(_compute_temporal_features(segment_data, fs, prefix))
 
     features.update(
         extract_spindle_so_coupling_features(
@@ -134,6 +146,17 @@ def extract_eeg_features_segment(
         )
     )
     
+    if CALCULATE_ONLY_SELECTED_FEATURES and SELECTED_EEG_FEATURES:
+        # Keep necessary metadata like 'segment_idx', 'prefix_quality_ok', 'prefix_strategy'
+        filtered_features = {}
+        for k, v in features.items():
+            if k == 'segment_idx' or k.endswith('_quality_ok') or k.endswith('_strategy') or k.endswith('_sqi'):
+                filtered_features[k] = v
+            else:
+                if any(sel_feat.endswith(k) for sel_feat in SELECTED_EEG_FEATURES):
+                    filtered_features[k] = v
+        features = filtered_features
+
     if logger:
         logger.debug(f"Segment {segment_idx} [{region}]: "
                      f"{len(features)} EEG-Features extrahiert.")

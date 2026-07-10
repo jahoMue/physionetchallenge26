@@ -24,8 +24,18 @@ from config import (
     SEGMENT_LENGTH_SEC, HRV_MIN_RR_INTERVALS,
     HRV_RR_MIN_MS, HRV_RR_MAX_MS,
     ECG_SQI_THRESHOLD, RSA_ENABLED,
-    EEG_FREQUENCY_BANDS
+    EEG_FREQUENCY_BANDS,
+    CALCULATE_ONLY_SELECTED_FEATURES, SELECTED_FEATURES_FILE
 )
+
+import json
+SELECTED_ECG_FEATURES = set()
+if CALCULATE_ONLY_SELECTED_FEATURES and SELECTED_FEATURES_FILE.exists():
+    try:
+        with open(SELECTED_FEATURES_FILE, 'r') as f:
+            SELECTED_ECG_FEATURES = set(json.load(f).get('selected_features', []))
+    except Exception as e:
+        print(f"Warning: Could not load {SELECTED_FEATURES_FILE}: {e}")
 
 # Suppress NeuroKit warnings for short segments
 import warnings
@@ -144,7 +154,10 @@ def extract_ecg_features_segment(
     features.update(_compute_hr_stats(valid_rr))
     features.update(_compute_hrv_time_domain(valid_rr, fs))
     features.update(_compute_hrv_frequency_domain(valid_rr, fs))
-    features.update(_compute_hrv_nonlinear(valid_rr))
+    
+    if not CALCULATE_ONLY_SELECTED_FEATURES:
+        features.update(_compute_hrv_nonlinear(valid_rr))
+        
     features.update(_compute_rr_artifact_stats(rr_intervals, rr_valid_mask))
     
     # --- RSA (Respiratorische Sinus-Arrhythmie) ---
@@ -153,7 +166,17 @@ def extract_ecg_features_segment(
             rpeaks_local, fs, resp_signal, resp_fs, logger
         )
         features.update(rsa_features)
-    
+        
+    if CALCULATE_ONLY_SELECTED_FEATURES and SELECTED_ECG_FEATURES:
+        filtered_features = {}
+        for k, v in features.items():
+            if k == 'segment_idx' or k.endswith('_quality_ok') or k == 'ecg_sqi':
+                filtered_features[k] = v
+            else:
+                if any(sel_feat.endswith(k) for sel_feat in SELECTED_ECG_FEATURES):
+                    filtered_features[k] = v
+        features = filtered_features
+
     if logger:
         logger.debug(f"Segment {segment_idx}: {len(features)} ECG-Features extrahiert.")
     

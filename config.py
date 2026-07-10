@@ -18,6 +18,12 @@ CAP_MODEL_DIR = r'./CAP_classification/cap_lstm.onnx'
 ORP_LUT_DIR = r'./feature_extraction/LookUpTable.txt'
 ORP_SYMBOLVALUES_DIR = r'./feature_extraction/SymbolValues.txt'
 
+# ==============================================================================
+# FEATURE SELECTION
+# ==============================================================================
+CALCULATE_ONLY_SELECTED_FEATURES = True
+SELECTED_FEATURES_FILE = PROJECT_DIR / "feature_names.json"
+
 
 # Training-Set Verzeichnis
 TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
