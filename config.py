@@ -191,7 +191,7 @@ LOG_RETENTION = "30 days"          # Log-Dateien aufbewahren
 # ==============================================================================
 # VISUALISIERUNG
 # ==============================================================================
-PLOT_ENABLED = True
+PLOT_ENABLED = False
 PLOT_FORMAT = "png"
 PLOT_DPI = 150
 PLOT_PER_PATIENT = True
