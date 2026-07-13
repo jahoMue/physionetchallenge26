@@ -32,3 +32,6 @@ leaderboard*
 
 # misc
 investigate_holdout_models.py
+
+# logs
+*.log

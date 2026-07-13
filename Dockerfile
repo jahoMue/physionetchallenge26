@@ -11,7 +11,7 @@ WORKDIR /challenge
 RUN pip install -r requirements.txt
 
 ## Download Google Drive zip and extract into /challenge/model
-ARG GDRIVE_FILE_ID="1i9ekH3G_UCJr6bRykRhEq98fqbIVFyM_"
+ARG GDRIVE_FILE_ID=1i9ekH3G_UCJr6bRykRhEq98fqbIVFyM_
 
 RUN mkdir -p /challenge/model \
     && python -m gdown "${GDRIVE_FILE_ID}" -O /tmp/model.zip \

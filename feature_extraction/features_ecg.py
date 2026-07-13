@@ -1246,14 +1246,17 @@ def extract_ecg_features_all_segments(
         # Zusammenfassung der wichtigsten Features
         if n_computed > 0:
             valid = df[df["ecg_quality_ok"]]
-            logger.info(f"  HR mean: {valid['hr_mean'].mean():.1f} ± "
-                         f"{valid['hr_mean'].std():.1f} bpm")
-            logger.info(f"  SDNN mean: {valid['hrv_sdnn'].mean():.1f} ± "
-                         f"{valid['hrv_sdnn'].std():.1f} ms")
-            logger.info(f"  RMSSD mean: {valid['hrv_rmssd'].mean():.1f} ± "
-                         f"{valid['hrv_rmssd'].std():.1f} ms")
+            if 'hr_mean' in valid.columns:
+                logger.info(f"  HR mean: {valid['hr_mean'].mean():.1f} ± "
+                             f"{valid['hr_mean'].std():.1f} bpm")
+            if 'hrv_sdnn' in valid.columns:
+                logger.info(f"  SDNN mean: {valid['hrv_sdnn'].mean():.1f} ± "
+                             f"{valid['hrv_sdnn'].std():.1f} ms")
+            if 'hrv_rmssd' in valid.columns:
+                logger.info(f"  RMSSD mean: {valid['hrv_rmssd'].mean():.1f} ± "
+                             f"{valid['hrv_rmssd'].std():.1f} ms")
             
-            if RSA_ENABLED and not valid["rsa_p2t_mean"].isna().all():
+            if RSA_ENABLED and 'rsa_p2t_mean' in valid.columns and not valid["rsa_p2t_mean"].isna().all():
                 n_rsa = valid["rsa_p2t_mean"].notna().sum()
                 logger.info(f"  RSA berechnet für {n_rsa}/{n_computed} Segmente")
     
