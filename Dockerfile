@@ -10,9 +10,10 @@ WORKDIR /challenge
 ## Include the following line if you have a requirements.txt file.
 RUN pip install -r requirements.txt
 
-## Download Google Drive zip and extract into /challenge/model
-ARG GDRIVE_FILE_ID=1i9ekH3G_UCJr6bRykRhEq98fqbIVFyM_
+ARG MODEL_URL="https://datashare.tu-dresden.de/s/rFdMM7HkzpirjLW/download"
 
 RUN mkdir -p /challenge/model \
-    && python -m gdown "${GDRIVE_FILE_ID}" -O /tmp/model.zip \
-    && python -c "import zipfile; zipfile.ZipFile('/tmp/model.zip', 'r').extractall('/challenge')"
+    && curl -fL --retry 5 --retry-delay 20 --retry-all-errors \
+       -o /tmp/model.zip "${MODEL_URL}" \
+    && python -c "import zipfile; z=zipfile.ZipFile('/tmp/model.zip', 'r'); bad=z.testzip(); assert bad is None, f'Bad file in zip: {bad}'; z.extractall('/challenge')" \
+    && rm -f /tmp/model.zip
