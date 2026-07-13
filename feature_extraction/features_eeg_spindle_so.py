@@ -29,6 +29,8 @@ from config import (
     COUPLING_ANALYSIS_ENABLED,
     COUPLING_MIN_SPINDLES,
     COUPLING_MIN_SOS,
+    SPINDLE_DETECTION_ENABLED,
+    SO_DETECTION_ENABLED,
 )
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -108,9 +110,12 @@ def extract_spindle_so_coupling_features(
     prefix_coup = f"eeg_{region}_coup"
 
     features = {}
-    features.update(_get_empty_spindle_features(prefix_sp))
-    features.update(_get_empty_so_features(prefix_so))
-    features.update(_get_empty_coupling_features(prefix_coup))
+    if SPINDLE_DETECTION_ENABLED:
+        features.update(_get_empty_spindle_features(prefix_sp))
+    if SO_DETECTION_ENABLED:
+        features.update(_get_empty_so_features(prefix_so))
+    if SPINDLE_DETECTION_ENABLED and SO_DETECTION_ENABLED:
+        features.update(_get_empty_coupling_features(prefix_coup))
 
     if segment_data is None or len(segment_data) == 0:
         return features
@@ -166,40 +171,42 @@ def extract_spindle_so_coupling_features(
     # 1. SPINDLE DETECTION
     # ------------------------------------------------------------------
     sp_summary = None
-    if _has_sufficient_band_power(data_f64, fs, SPINDLE_FREQ_RANGE, 0.005):
-        try:
-            sp_summary = _detect_spindles(data_f64, fs, logger)
-        except Exception as e:
-            if logger:
-                logger.debug(
-                    f"Segment {segment_idx} [{region}]: Spindle detection failed: {e}"
-                )
+    if SPINDLE_DETECTION_ENABLED:
+        if _has_sufficient_band_power(data_f64, fs, SPINDLE_FREQ_RANGE, 0.005):
+            try:
+                sp_summary = _detect_spindles(data_f64, fs, logger)
+            except Exception as e:
+                if logger:
+                    logger.debug(
+                        f"Segment {segment_idx} [{region}]: Spindle detection failed: {e}"
+                    )
 
-    features.update(
-        _compute_spindle_features(sp_summary, duration_sec, fs, prefix_sp)
-    )
+        features.update(
+            _compute_spindle_features(sp_summary, duration_sec, fs, prefix_sp)
+        )
 
     # ------------------------------------------------------------------
     # 2. SLOW OSCILLATION DETECTION
     # ------------------------------------------------------------------
     so_summary = None
-    if _has_sufficient_band_power(data_f64, fs, SO_FREQ_RANGE, 0.01):
-        try:
-            so_summary = _detect_slow_oscillations(data_f64, fs, logger)
-        except Exception as e:
-            if logger:
-                logger.debug(
-                    f"Segment {segment_idx} [{region}]: SO detection failed: {e}"
-                )
+    if SO_DETECTION_ENABLED:
+        if _has_sufficient_band_power(data_f64, fs, SO_FREQ_RANGE, 0.01):
+            try:
+                so_summary = _detect_slow_oscillations(data_f64, fs, logger)
+            except Exception as e:
+                if logger:
+                    logger.debug(
+                        f"Segment {segment_idx} [{region}]: SO detection failed: {e}"
+                    )
 
-    features.update(
-        _compute_so_features(so_summary, duration_sec, prefix_so)
-    )
+        features.update(
+            _compute_so_features(so_summary, duration_sec, prefix_so)
+        )
 
     # ------------------------------------------------------------------
     # 3. SO-SPINDLE COUPLING
     # ------------------------------------------------------------------
-    if COUPLING_ANALYSIS_ENABLED:
+    if SPINDLE_DETECTION_ENABLED and SO_DETECTION_ENABLED and COUPLING_ANALYSIS_ENABLED:
         try:
             features.update(
                 _compute_coupling_features(

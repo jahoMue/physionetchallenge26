@@ -120,6 +120,9 @@ EEG_HOMOLOG_PAIRS = {
 # ==============================================================================
 # SPINDLE & SLOW OSCILLATION DETECTION (YASA-based)
 # ==============================================================================
+SPINDLE_DETECTION_ENABLED = True        # Enable sleep spindle detection
+SO_DETECTION_ENABLED = True             # Enable slow wave oscillation (SO) detection
+
 SPINDLE_FREQ_RANGE = (12.0, 16.0)       # Hz
 SPINDLE_FREQ_SLOW = (12.0, 14.0)        # Slow spindles
 SPINDLE_FREQ_FAST = (14.0, 16.0)        # Fast spindles

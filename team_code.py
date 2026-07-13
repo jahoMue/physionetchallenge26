@@ -471,8 +471,81 @@ def _setup_logger(verbose: bool):
 # Config patching
 # =============================================================================
 
+def _migrate_preextracted_features(src_dir: Path, dst_dir: Path):
+    if not src_dir.exists() or src_dir.resolve() == dst_dir.resolve():
+        return
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    manifest_data = {}
+    
+    # Read manifest from source if exists
+    src_manifest_path = src_dir / PREPROCESS_MANIFEST_FILENAME
+    if src_manifest_path.exists():
+        try:
+            with open(src_manifest_path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                manifest_data = data
+        except Exception:
+            pass
+
+    # Move files
+    for item in src_dir.iterdir():
+        if item.is_file():
+            target = dst_dir / item.name
+            if not target.exists() or target.stat().st_size == 0:
+                try:
+                    shutil.move(str(item), str(target))
+                except Exception:
+                    try:
+                        shutil.copy2(str(item), str(target))
+                    except Exception:
+                        pass
+            else:
+                # File already exists at target, clean up source
+                try:
+                    os.remove(item)
+                except Exception:
+                    pass
+
+    # Update manifest with new paths and save it in dst_dir
+    if manifest_data:
+        dst_manifest_path = dst_dir / PREPROCESS_MANIFEST_FILENAME
+        existing_manifest = {}
+        if dst_manifest_path.exists():
+            try:
+                with open(dst_manifest_path, "r") as f:
+                    existing_manifest = json.load(f)
+            except Exception:
+                pass
+        
+        for key, entry in manifest_data.items():
+            if isinstance(entry, dict):
+                for p_key in ["seg_features_path", "pat_features_path"]:
+                    old_path = entry.get(p_key)
+                    if old_path:
+                        entry[p_key] = str((dst_dir / Path(old_path).name).resolve())
+                existing_manifest[key] = entry
+                
+        try:
+            tmp_path = dst_manifest_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(existing_manifest, f, indent=2)
+            os.replace(tmp_path, dst_manifest_path)
+        except Exception:
+            pass
+
+
 def _patch_config(data_folder: str, model_folder: str):
     import config
+
+    # Keep track of the default features directory before overriding it
+    old_feature_dir = None
+    if hasattr(config, "FEATURE_DIR") and config.FEATURE_DIR:
+        try:
+            old_feature_dir = Path(config.FEATURE_DIR).resolve()
+        except Exception:
+            pass
 
     data_path = Path(data_folder).resolve()
     model_path = Path(model_folder).resolve()
@@ -500,6 +573,12 @@ def _patch_config(data_folder: str, model_folder: str):
         config.PLOT_DIR,
     ]:
         d.mkdir(parents=True, exist_ok=True)
+
+    # Migrate pre-extracted features to the new FEATURE_DIR if needed
+    if old_feature_dir and old_feature_dir.exists():
+        new_feature_dir = Path(config.FEATURE_DIR).resolve()
+        if old_feature_dir != new_feature_dir:
+            _migrate_preextracted_features(old_feature_dir, new_feature_dir)
 
     config.PLOT_ENABLED = False
 

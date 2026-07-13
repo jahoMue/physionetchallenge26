@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 
-
 set -e  # Exit immediately if any command fails
-
-# mv features model/
 
 python train_model.py -d training_data -m model -v
 

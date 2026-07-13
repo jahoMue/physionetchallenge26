@@ -2,49 +2,124 @@ import numpy as np
 from scipy.stats import entropy
 from scipy.ndimage import uniform_filter1d
 from CAP_classification.extract_eeg_bands import extract_eeg_bands
+import numba
 
-def get_hjorth_activity(signal, fs, window_sec):
-    window_len = int(window_sec * fs)
-    step = int(fs)  # 1s Schritt (66% Overlap bei 3s Fenster)
-    n_steps = int((len(signal) - window_len) // step + 1)
-    activity = np.array([np.var(signal[i*step:i*step+window_len]) for i in range(n_steps)])
-    return activity
+@numba.njit
+def _numba_hist_density_precise(data, bins_num):
+    n = len(data)
+    min_val = data[0]
+    max_val = data[0]
+    for i in range(1, n):
+        v = data[i]
+        if v < min_val: min_val = v
+        if v > max_val: max_val = v
+    if min_val == max_val:
+        max_val += 1e-12
+        
+    bin_edges = np.linspace(min_val, max_val, bins_num + 1)
+    counts = np.zeros(bins_num, dtype=np.int32)
+    
+    for i in range(n):
+        val = data[i]
+        idx = np.searchsorted(bin_edges, val) - 1
+        if idx >= bins_num:
+            idx = bins_num - 1
+        elif idx < 0:
+            idx = 0
+        counts[idx] += 1
+        
+    bin_width = bin_edges[1] - bin_edges[0]
+    norm = n * bin_width
+    density = np.zeros(bins_num, dtype=np.float64)
+    for i in range(bins_num):
+        density[i] = counts[i] / norm
+    return density
 
-def get_shannon_entropy(signal, fs, window_sec):
-    window_len = int(window_sec * fs)
+@numba.njit
+def get_shannon_entropy_numba(signal, fs_val, window_sec):
+    window_len = int(window_sec * fs_val)
     step = window_len // 2
     n_steps = int((len(signal) - window_len) // step + 1)
-    entropy_arr = []
+    entropy_arr = np.zeros(n_steps, dtype=np.float64)
     for i in range(n_steps):
-        seg = signal[i*step:i*step+window_len]
-        hist, _ = np.histogram(seg, bins=32, density=True)
-        hist = hist + 1e-12  # Vermeide log(0)
-        entropy_arr.append(entropy(hist, base=2))
-    return np.array(entropy_arr)
+        seg = signal[i*step : i*step + window_len]
+        hist = _numba_hist_density_precise(seg, 32) + 1e-12
+        hist_sum = np.sum(hist)
+        ent_val = 0.0
+        for j in range(32):
+            p = hist[j] / hist_sum
+            if p > 0.0:
+                ent_val -= p * np.log2(p)
+        entropy_arr[i] = ent_val
+    return entropy_arr
 
-def get_teo(signal, fs):
-    teo_full = signal[1:-1]**2 - signal[:-2]*signal[2:]
+@numba.njit
+def get_hjorth_activity_numba(signal, fs_val, window_sec):
+    window_len = int(window_sec * fs_val)
+    step = int(fs_val)
+    n_steps = int((len(signal) - window_len) // step + 1)
+    activity = np.zeros(n_steps, dtype=np.float64)
+    for i in range(n_steps):
+        activity[i] = np.var(signal[i*step : i*step + window_len])
+    return activity
+
+@numba.njit
+def get_teo_numba(signal, fs_val):
+    fs = int(fs_val)
+    n = len(signal)
+    if n < 3:
+        return np.zeros(0, dtype=np.float64)
+    teo_full = np.zeros(n - 2, dtype=np.float32)
+    for i in range(n - 2):
+        teo_full[i] = signal[i+1]**2 - signal[i]*signal[i+2]
     n_sec = int(len(teo_full) // fs)
-    fs = int(fs)
-    teo = np.array([np.mean(teo_full[i*fs:(i+1)*fs]) for i in range(n_sec)])
+    teo = np.zeros(n_sec, dtype=np.float64)
+    for i in range(n_sec):
+        teo[i] = np.mean(teo_full[i*fs : (i+1)*fs])
     return teo
 
-def get_power_band_feature(signal, fs, smoothing):
+@numba.njit
+def _get_power_band_numba_core(signal, fs_val):
+    fs = int(fs_val)
     n_sec = int(len(signal) // fs)
-    fs = int(fs)
-    power = np.array([np.sum(signal[i*fs:(i+1)*fs]**2) / fs for i in range(n_sec)])
+    power = np.zeros(n_sec, dtype=np.float64)
+    for i in range(n_sec):
+        val_sum = 0.0
+        for j in range(fs):
+            val_sum += signal[i*fs + j]**2
+        power[i] = val_sum / fs
+    return power
+
+@numba.njit
+def _get_eeg_var_vals_numba(signal, fs_val):
+    fs = int(fs_val)
+    n_sec = int(len(signal) // fs)
+    var_vals = np.zeros(n_sec, dtype=np.float64)
+    for i in range(n_sec):
+        var_vals[i] = np.var(signal[i*fs : (i+1)*fs])
+    return var_vals
+
+# Public wrappers matching original API names:
+def get_hjorth_activity(signal, fs, window_sec):
+    return get_hjorth_activity_numba(signal, fs, window_sec)
+
+def get_shannon_entropy(signal, fs, window_sec):
+    return get_shannon_entropy_numba(signal, fs, window_sec)
+
+def get_teo(signal, fs):
+    return get_teo_numba(signal, fs)
+
+def get_power_band_feature(signal, fs, smoothing):
+    power = _get_power_band_numba_core(signal, fs)
     if smoothing:
         power = uniform_filter1d(power, size=5)
     return power
 
 def get_eeg_var_diff(signal, fs):
-    n_sec = int(len(signal) // fs)
-    fs = int(fs)
-    var_vals = np.array([np.var(signal[i*fs:(i+1)*fs]) for i in range(n_sec)])
+    var_vals = _get_eeg_var_vals_numba(signal, fs)
     if len(var_vals) == 0:
-        return np.zeros(0, dtype=float)  # Leeres 1D-Array zurückgeben
-    var_diff = np.diff(var_vals, prepend=var_vals[0])
-    return var_diff
+        return np.zeros(0, dtype=float)
+    return np.diff(var_vals, prepend=var_vals[0])
 
 def _strfind(arr: np.ndarray, pattern: np.ndarray) -> np.ndarray:
     """

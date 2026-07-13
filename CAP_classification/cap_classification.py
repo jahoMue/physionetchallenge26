@@ -3,6 +3,14 @@ import onnxruntime as ort
 from CAP_classification.post_processing import label_reconstruction, post_processing_multi_class, cap_sequences, get_output_statistics
 from config import CAP_MODEL_DIR
 
+_GLOBAL_ORT_SESSION = None
+
+def _get_ort_session():
+    global _GLOBAL_ORT_SESSION
+    if _GLOBAL_ORT_SESSION is None:
+        _GLOBAL_ORT_SESSION = ort.InferenceSession(CAP_MODEL_DIR)
+    return _GLOBAL_ORT_SESSION
+
 def cap_classification(input_list, eeg, flags):
     """
     input_list: Liste von Feature-Fenstern (L x 30)
@@ -11,7 +19,7 @@ def cap_classification(input_list, eeg, flags):
     lstm_predict_fn: Funktion, die ein Input-Array (seq_len, features) nimmt und Vorhersagen zurückgibt
     """
 
-    ort_session = ort.InferenceSession(CAP_MODEL_DIR)
+    ort_session = _get_ort_session()
 
     # Normalisierung (medianiqr)
     def medianiqr_norm(x):

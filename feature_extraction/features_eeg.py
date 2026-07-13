@@ -49,6 +49,7 @@ from config import (
     EEG_AMPLITUDE_MAX_UV, EEG_AMPLITUDE_MIN_UV,
     SIGNAL_DTYPE,
     CALCULATE_ONLY_SELECTED_FEATURES, SELECTED_FEATURES_FILE,
+    SPINDLE_DETECTION_ENABLED,
 )
 
 import json
@@ -149,11 +150,21 @@ def extract_eeg_features_segment(
     if CALCULATE_ONLY_SELECTED_FEATURES and SELECTED_EEG_FEATURES:
         # Keep necessary metadata like 'segment_idx', 'prefix_quality_ok', 'prefix_strategy'
         filtered_features = {}
+        
+        # Pre-clean selected features by stripping aggregation suffixes
+        clean_selected = set()
+        for f in SELECTED_EEG_FEATURES:
+            for s in ('_mean', '_std', '_median', '_iqr'):
+                if f.endswith(s):
+                    f = f[:-len(s)]
+                    break
+            clean_selected.add(f)
+
         for k, v in features.items():
             if k == 'segment_idx' or k.endswith('_quality_ok') or k.endswith('_strategy') or k.endswith('_sqi'):
                 filtered_features[k] = v
             else:
-                if any(sel_feat.endswith(k) for sel_feat in SELECTED_EEG_FEATURES):
+                if any(sel_feat.endswith(k) for sel_feat in clean_selected):
                     filtered_features[k] = v
         features = filtered_features
 
@@ -402,35 +413,38 @@ def _compute_sleep_specific_features(
     )
     
     # --- Schlafspindel-Aktivität ---
-    # Sigma-Band (12-16 Hz), besonders 12-14 Hz (langsame Spindeln)
-    # und 14-16 Hz (schnelle Spindeln)
-    slow_spindle_mask = (freqs >= 12.0) & (freqs <= 14.0)
-    fast_spindle_mask = (freqs >= 14.0) & (freqs <= 16.0)
-    
-    features[f"{prefix}_slow_spindle_power"] = (
-        float(np.trapz(psd[slow_spindle_mask], freqs[slow_spindle_mask]))
-        if slow_spindle_mask.any() else np.nan
-    )
-    features[f"{prefix}_fast_spindle_power"] = (
-        float(np.trapz(psd[fast_spindle_mask], freqs[fast_spindle_mask]))
-        if fast_spindle_mask.any() else np.nan
-    )
-    features[f"{prefix}_spindle_power_total"] = (
-        float(band_powers.get("sigma", 0))
-    )
-    
-    # Spindel-Prominenz: Sigma relativ zu benachbarten Bändern
-    theta_power = band_powers.get("theta", 0)
-    sigma_power = band_powers.get("sigma", 0)
-    beta_power = band_powers.get("beta", 0)
-    neighbor_mean = (theta_power + beta_power) / 2 if (theta_power + beta_power) > 0 else 1
-    features[f"{prefix}_spindle_prominence"] = (
-        sigma_power / neighbor_mean if neighbor_mean > 0 else np.nan
-    )
+    if SPINDLE_DETECTION_ENABLED:
+        # Sigma-Band (12-16 Hz), besonders 12-14 Hz (langsame Spindeln)
+        # und 14-16 Hz (schnelle Spindeln)
+        slow_spindle_mask = (freqs >= 12.0) & (freqs <= 14.0)
+        fast_spindle_mask = (freqs >= 14.0) & (freqs <= 16.0)
+        
+        features[f"{prefix}_slow_spindle_power"] = (
+            float(np.trapz(psd[slow_spindle_mask], freqs[slow_spindle_mask]))
+            if slow_spindle_mask.any() else np.nan
+        )
+        features[f"{prefix}_fast_spindle_power"] = (
+            float(np.trapz(psd[fast_spindle_mask], freqs[fast_spindle_mask]))
+            if fast_spindle_mask.any() else np.nan
+        )
+        features[f"{prefix}_spindle_power_total"] = (
+            float(band_powers.get("sigma", 0))
+        )
+        
+        # Spindel-Prominenz: Sigma relativ zu benachbarten Bändern
+        theta_power = band_powers.get("theta", 0)
+        sigma_power = band_powers.get("sigma", 0)
+        beta_power = band_powers.get("beta", 0)
+        neighbor_mean = (theta_power + beta_power) / 2 if (theta_power + beta_power) > 0 else 1
+        features[f"{prefix}_spindle_prominence"] = (
+            sigma_power / neighbor_mean if neighbor_mean > 0 else np.nan
+        )
     
     # --- Band-Ratios (wichtig für Cognitive Impairment) ---
     delta_power = band_powers.get("delta", 0)
+    theta_power = band_powers.get("theta", 0)
     alpha_power = band_powers.get("alpha", 0)
+    beta_power = band_powers.get("beta", 0)
     
     # Alpha/Theta Ratio (Wachheit/Aufmerksamkeit)
     features[f"{prefix}_alpha_theta_ratio"] = (
@@ -473,13 +487,9 @@ def _compute_sleep_specific_features(
 
 def _get_empty_sleep_features(prefix: str) -> Dict:
     """Leere schlafspezifische Features."""
-    return {
+    feats = {
         f"{prefix}_swa_power": np.nan,
         f"{prefix}_swa_power_log": np.nan,
-        f"{prefix}_slow_spindle_power": np.nan,
-        f"{prefix}_fast_spindle_power": np.nan,
-        f"{prefix}_spindle_power_total": np.nan,
-        f"{prefix}_spindle_prominence": np.nan,
         f"{prefix}_alpha_theta_ratio": np.nan,
         f"{prefix}_theta_alpha_ratio": np.nan,
         f"{prefix}_delta_alpha_ratio": np.nan,
@@ -488,6 +498,14 @@ def _get_empty_sleep_features(prefix: str) -> Dict:
         f"{prefix}_dar": np.nan,
         f"{prefix}_dtabr": np.nan,
     }
+    if SPINDLE_DETECTION_ENABLED:
+        feats.update({
+            f"{prefix}_slow_spindle_power": np.nan,
+            f"{prefix}_fast_spindle_power": np.nan,
+            f"{prefix}_spindle_power_total": np.nan,
+            f"{prefix}_spindle_prominence": np.nan,
+        })
+    return feats
 
 
 # ==============================================================================
