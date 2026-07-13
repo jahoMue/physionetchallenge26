@@ -2598,11 +2598,16 @@ def _is_writable_dir(path: Path) -> bool:
         return False
 
 
+_GLOBAL_FALLBACK_CACHE_DIR = None
+_IS_FIRST_INFERENCE_CALL = True
+
+
 def _get_inference_feature_output_dir(
     model: dict,
     data_folder: str,
     tmp_worker_dir: str,
 ) -> Path:
+    global _GLOBAL_FALLBACK_CACHE_DIR, _IS_FIRST_INFERENCE_CALL
     runtime_model_folder = None
 
     if isinstance(model, dict):
@@ -2618,9 +2623,19 @@ def _get_inference_feature_output_dir(
         if _is_writable_dir(fixed_dir):
             return fixed_dir
 
-    fallback_dir = Path(tmp_worker_dir) / "features"
-    fallback_dir.mkdir(parents=True, exist_ok=True)
-    return fallback_dir
+    if _GLOBAL_FALLBACK_CACHE_DIR is None:
+        model_name = "default"
+        if isinstance(model, dict) and model.get("__model_folder"):
+            model_name = Path(model["__model_folder"]).name
+        _GLOBAL_FALLBACK_CACHE_DIR = Path(tempfile.gettempdir()) / f"physionet_run_cache_{model_name}" / "features"
+
+    if _IS_FIRST_INFERENCE_CALL:
+        import shutil
+        shutil.rmtree(_GLOBAL_FALLBACK_CACHE_DIR, ignore_errors=True)
+        _GLOBAL_FALLBACK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _IS_FIRST_INFERENCE_CALL = False
+
+    return _GLOBAL_FALLBACK_CACHE_DIR
 
 
 def _holdout_preprocess_marker_path(feature_output_dir: Path) -> Path:
@@ -2794,84 +2809,80 @@ def _ensure_holdout_preprocessed_parallel(
     newly_processed = 0
     failed_subjects = []
 
-    for batch_start in range(0, len(records_to_process), batch_size):
-        batch_end = min(batch_start + batch_size, len(records_to_process))
-        batch = records_to_process[batch_start:batch_end]
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
+        for item in records_to_process:
+            pipeline_patient_id = item["pipeline_patient_id"]
+            patient_dir = item["patient_dir"]
+            record_name = item["record_name"]
 
-            for item in batch:
-                pipeline_patient_id = item["pipeline_patient_id"]
-                patient_dir = item["patient_dir"]
-                record_name = item["record_name"]
+            if not patient_dir.exists():
+                if verbose:
+                    logger.warning(
+                        f"Patient directory not found: {patient_dir}. Skipping."
+                    )
+                failed_subjects.append(pipeline_patient_id)
+                continue
 
-                if not patient_dir.exists():
-                    if verbose:
-                        logger.warning(
-                            f"Patient directory not found: {patient_dir}. Skipping."
-                        )
-                    failed_subjects.append(pipeline_patient_id)
-                    continue
+            future = executor.submit(
+                _preprocess_one_patient_worker,
+                data_folder=data_folder,
+                tmp_model_dir=tmp_model_dir,
+                pipeline_patient_id=pipeline_patient_id,
+                patient_dir_str=str(patient_dir),
+                record_name=record_name,
+                segment_length_sec=segment_length_sec,
+                overlap_sec=overlap_sec,
+                feature_output_dir_str=str(feature_output_dir),
+            )
 
-                future = executor.submit(
-                    _preprocess_one_patient_worker,
-                    data_folder=data_folder,
-                    tmp_model_dir=tmp_model_dir,
-                    pipeline_patient_id=pipeline_patient_id,
-                    patient_dir_str=str(patient_dir),
-                    record_name=record_name,
-                    segment_length_sec=segment_length_sec,
-                    overlap_sec=overlap_sec,
-                    feature_output_dir_str=str(feature_output_dir),
-                )
+            futures[future] = item
 
-                futures[future] = item
+        for future in as_completed(futures):
+            item = futures[future]
+            pid = item["pipeline_patient_id"]
+            record_name = item["record_name"]
 
-            for future in as_completed(futures):
-                item = futures[future]
-                pid = item["pipeline_patient_id"]
-                record_name = item["record_name"]
+            try:
+                result = future.result()
 
-                try:
-                    result = future.result()
+                if result and result.get("success"):
+                    newly_processed += 1
 
-                    if result and result.get("success"):
-                        newly_processed += 1
-
-                        _remember_preprocessing_result(
-                            feature_output_dir=feature_output_dir,
-                            pipeline_patient_id=pid,
-                            record_name=record_name,
-                            result=result,
-                            logger=logger if verbose else None,
-                        )
-                    else:
-                        failed_subjects.append(pid)
-                        if verbose:
-                            logger.warning(f"Holdout preprocessing failed for {pid}")
-
-                except Exception as e:
+                    _remember_preprocessing_result(
+                        feature_output_dir=feature_output_dir,
+                        pipeline_patient_id=pid,
+                        record_name=record_name,
+                        result=result,
+                        logger=logger if verbose else None,
+                    )
+                else:
                     failed_subjects.append(pid)
                     if verbose:
-                        logger.error(
-                            f"Error preprocessing holdout subject {pid}: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        logger.error(traceback.format_exc())
+                        logger.warning(f"Holdout preprocessing failed for {pid}")
 
-        gc.collect()
+            except Exception as e:
+                failed_subjects.append(pid)
+                if verbose:
+                    logger.error(
+                        f"Error preprocessing holdout subject {pid}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    logger.error(traceback.format_exc())
 
-        if verbose:
-            elapsed = time.time() - total_start
-            logger.info(
-                f"Holdout preprocessing progress: "
-                f"{batch_end}/{len(records_to_process)} uncached subjects scanned, "
-                f"{newly_processed} newly processed, "
-                f"{len(cached_subjects)} initially cached, "
-                f"{len(failed_subjects)} failed, "
-                f"{elapsed:.0f}s elapsed."
-            )
+            gc.collect()
+
+            if verbose:
+                elapsed = time.time() - total_start
+                logger.info(
+                    f"Holdout preprocessing progress: "
+                    f"{newly_processed + len(failed_subjects)}/{len(records_to_process)} completed/failed, "
+                    f"{newly_processed} newly processed, "
+                    f"{len(cached_subjects)} initially cached, "
+                    f"{len(failed_subjects)} failed, "
+                    f"{elapsed:.0f}s elapsed."
+                )
 
     _save_holdout_preprocess_marker(
         feature_output_dir,
