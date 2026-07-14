@@ -79,6 +79,7 @@ def extract_eeg_features_segment(
     sqi: float = 0.0,
     segment_idx: int = 0,
     strategy: str = "unknown",
+    dominant_stage: str = "unknown",
     logger=None
 ) -> Dict:
     """
@@ -143,6 +144,7 @@ def extract_eeg_features_segment(
             region=region,
             sqi=sqi,
             segment_idx=segment_idx,
+            sleep_stage=dominant_stage,
             logger=logger,
         )
     )
@@ -1540,6 +1542,7 @@ def _get_empty_eeg_features(segment_idx: int, prefix: str) -> Dict:
 def extract_eeg_features_all_segments(
     eeg_segments: Dict[str, list],
     eeg_strategies: Optional[Dict] = None,
+    stages_per_segment: Optional[pd.DataFrame] = None,
     logger=None
 ) -> pd.DataFrame:
     """
@@ -1551,6 +1554,8 @@ def extract_eeg_features_all_segments(
         Dictionary mit Regionen als Keys und Listen von SignalSegment als Values.
     eeg_strategies : Dict, optional
         Kanalstrategien pro Region (aus preprocess_eeg.py).
+    stages_per_segment : pd.DataFrame, optional
+        DataFrame mit Schlafstadien pro Segment (für YASA Sleep-Filtering).
     logger : loguru.Logger, optional
     
     Returns
@@ -1588,6 +1593,17 @@ def extract_eeg_features_all_segments(
                 prefix = f"eeg_{region}"
                 features = _get_empty_eeg_features(i, prefix)
             else:
+                # Look up dominant sleep stage for this segment index
+                dominant_stage = "unknown"
+                if stages_per_segment is not None and not stages_per_segment.empty:
+                    if "dominant_stage" in stages_per_segment.columns:
+                        if "segment_idx" in stages_per_segment.columns:
+                            row = stages_per_segment.loc[stages_per_segment["segment_idx"] == i]
+                            if not row.empty:
+                                dominant_stage = str(row["dominant_stage"].values[0])
+                        elif i < len(stages_per_segment):
+                            dominant_stage = str(stages_per_segment.iloc[i]["dominant_stage"])
+
                 features = extract_eeg_features_segment(
                     segment_data=seg.data,
                     fs=seg.fs,
@@ -1595,6 +1611,7 @@ def extract_eeg_features_all_segments(
                     sqi=seg.sqi,
                     segment_idx=seg.segment_idx,
                     strategy=strategy,
+                    dominant_stage=dominant_stage,
                     logger=logger,
                 )
             

@@ -539,6 +539,7 @@ def process_single_patient(
         eeg_features = extract_eeg_features_all_segments(
             eeg_segments=recording.eeg_segments,
             eeg_strategies=eeg_strategies,
+            stages_per_segment=recording.stages_per_segment,
             logger=patient_logger,
         )
         

@@ -97,6 +97,7 @@ def extract_spindle_so_coupling_features(
     region: str = "unknown",
     sqi: float = 0.0,
     segment_idx: int = 0,
+    sleep_stage: str = "unknown",
     logger=None,
 ) -> Dict:
     """
@@ -116,6 +117,12 @@ def extract_spindle_so_coupling_features(
         features.update(_get_empty_so_features(prefix_so))
     if SPINDLE_DETECTION_ENABLED and SO_DETECTION_ENABLED:
         features.update(_get_empty_coupling_features(prefix_coup))
+
+    # Spindles and SOs only occur during NREM sleep (N1, N2, N3).
+    # Skip calculations for Wake (W) and REM to speed up and reduce false positives.
+    # If sleep_stage is "unknown" (e.g. annotation missing), run as fallback.
+    if sleep_stage in ["W", "REM"]:
+        return features
 
     if segment_data is None or len(segment_data) == 0:
         return features
