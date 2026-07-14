@@ -35,3 +35,7 @@ investigate_holdout_models.py
 
 # logs
 *.log
+
+# features
+features/
+scratch/
