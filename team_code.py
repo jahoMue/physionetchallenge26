@@ -81,6 +81,10 @@ TIME_TO_EVENT_COLUMN = "Time_to_Event"
 PREPROCESS_MANIFEST_FILENAME = "preprocessing_manifest.json"
 HOLDOUT_PREPROCESS_MARKER_FILENAME = "holdout_preprocessing_complete.json"
 
+_run_model_log_files = []
+_run_model_total_patients = None
+_run_model_processed_patients = 0
+
 
 # =============================================================================
 # Runtime training controls
@@ -431,12 +435,21 @@ def _remember_preprocessing_result(
 # =============================================================================
 
 class _SimpleLogger:
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, log_files: list = None):
         self.verbose = verbose
+        self.log_files = log_files or []
 
     def _print(self, level: str, msg: str):
+        formatted = f"{level:<7} | {msg}"
         if self.verbose:
-            print(f"{level:<7} | {msg}")
+            print(formatted)
+        for log_file in self.log_files:
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"{timestamp} | {formatted}\n")
+            except Exception:
+                pass
 
     def info(self, msg: str):
         self._print("INFO", msg)
@@ -465,6 +478,29 @@ def _setup_logger(verbose: bool):
         return logger
     except Exception:
         return _SimpleLogger(verbose=verbose)
+
+
+def _setup_run_model_logger(verbose: bool, log_files: list):
+    try:
+        from loguru import logger
+
+        logger.remove()
+        if verbose:
+            logger.add(
+                sys.stdout,
+                level="INFO",
+                format="{time:HH:mm:ss} | {level:<7} | {message}",
+            )
+        for log_file in log_files:
+            logger.add(
+                log_file,
+                level="INFO",
+                format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {message}",
+                enqueue=True,
+            )
+        return logger
+    except Exception:
+        return _SimpleLogger(verbose=verbose, log_files=log_files)
 
 
 # =============================================================================
@@ -2213,6 +2249,8 @@ def train_model(data_folder, model_folder, verbose):
 
     logger.info("Checking preprocessing cache for training subjects...")
 
+    processed_count = 0
+
     for i, record in enumerate(patient_metadata_list):
         patient_id_bids = record[HEADERS["bids_folder"]]
         site_id = record[HEADERS["site_id"]]
@@ -2236,6 +2274,10 @@ def train_model(data_folder, model_folder, verbose):
                 "sleep_summary": cached.get("sleep_summary"),
             }
             cached_subjects.append(pipeline_patient_id)
+            processed_count += 1
+            logger.info(
+                f"[{processed_count} of {num_records}] Using cached preprocessing for {pipeline_patient_id}"
+            )
             continue
 
         records_to_process.append(
@@ -2300,8 +2342,10 @@ def train_model(data_folder, model_folder, verbose):
 
                 try:
                     result = future.result()
+                    processed_count += 1
 
                     if result and result.get("success"):
+                        logger.info(f"[{processed_count} of {num_records}] Successfully processed {pid}")
                         successful_results[pid] = {
                             "seg_features_path": result.get("seg_features_path"),
                             "pat_features_path": result.get("pat_features_path"),
@@ -2316,10 +2360,11 @@ def train_model(data_folder, model_folder, verbose):
                             logger=logger if verbose else None,
                         )
                     else:
-                        logger.warning(f"Preprocessing failed for {pid}")
+                        logger.warning(f"[{processed_count} of {num_records}] Preprocessing failed for {pid}")
 
                 except Exception as e:
-                    logger.error(f"Error processing {pid}: {type(e).__name__}: {e}")
+                    processed_count += 1
+                    logger.error(f"[{processed_count} of {num_records}] Error processing {pid}: {type(e).__name__}: {e}")
 
         gc.collect()
 
@@ -2599,7 +2644,60 @@ def train_model(data_folder, model_folder, verbose):
 # Model loading
 # =============================================================================
 
+def _start_timeout_timer(verbose: bool):
+    try:
+        import config
+        enabled = getattr(config, "RUN_MODEL_TIMEOUT_ENABLED", False)
+        timeout_sec = getattr(config, "RUN_MODEL_TIMEOUT_SEC", None)
+        if enabled and timeout_sec is not None and timeout_sec > 0:
+            if verbose:
+                print(f"--- Timeout timer started: will abort run_model.py after {timeout_sec} seconds ---")
+            
+            import threading
+            import _thread
+            import sys
+            import time
+
+            def timeout_handler():
+                time.sleep(timeout_sec)
+                
+                total = _run_model_total_patients
+                processed = _run_model_processed_patients
+                
+                if total is None:
+                    try:
+                        data_folder = None
+                        for i in range(len(sys.argv) - 1):
+                            if sys.argv[i] in ("-d", "--data_folder"):
+                                data_folder = sys.argv[i + 1]
+                                break
+                        if data_folder:
+                            from helper_code import find_patients, DEMOGRAPHICS_FILE
+                            patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+                            patient_metadata_list = find_patients(patient_data_file)
+                            total = len(patient_metadata_list)
+                    except Exception:
+                        pass
+                
+                total_str = str(total) if total is not None else "unknown"
+                msg = f"\n!!! run_model.py aborted: Timeout of {timeout_sec} seconds reached. Processed {processed} out of {total_str} patients. !!!\n"
+                print(msg, file=sys.stderr)
+                sys.stderr.flush()
+                # Interrupt the main thread with KeyboardInterrupt
+                _thread.interrupt_main()
+                # If it doesn't exit after 5 seconds, force exit
+                time.sleep(5)
+                os._exit(1)
+
+            t = threading.Thread(target=timeout_handler, daemon=True)
+            t.start()
+    except Exception as e:
+        if verbose:
+            print(f"WARNING: Could not start timeout timer: {e}")
+
+
 def load_model(model_folder, verbose):
+    _start_timeout_timer(verbose)
     model_path = os.path.join(model_folder, "model.sav")
 
     if not os.path.exists(model_path):
@@ -2833,6 +2931,10 @@ def _ensure_holdout_preprocessed_parallel(
 
         if cached is not None:
             cached_subjects.append(pipeline_patient_id)
+            if verbose:
+                logger.info(
+                    f"[{len(cached_subjects)} of {num_records}] Using cached preprocessing for {pipeline_patient_id}"
+                )
             continue
 
         records_to_process.append(
@@ -2918,6 +3020,8 @@ def _ensure_holdout_preprocessed_parallel(
 
             futures[future] = item
 
+        processed_count = len(cached_subjects)
+
         for future in as_completed(futures):
             item = futures[future]
             pid = item["pipeline_patient_id"]
@@ -2925,9 +3029,12 @@ def _ensure_holdout_preprocessed_parallel(
 
             try:
                 result = future.result()
+                processed_count += 1
 
                 if result and result.get("success"):
                     newly_processed += 1
+                    if verbose:
+                        logger.info(f"[{processed_count} of {num_records}] Successfully processed holdout {pid}")
 
                     _remember_preprocessing_result(
                         feature_output_dir=feature_output_dir,
@@ -2939,13 +3046,14 @@ def _ensure_holdout_preprocessed_parallel(
                 else:
                     failed_subjects.append(pid)
                     if verbose:
-                        logger.warning(f"Holdout preprocessing failed for {pid}")
+                        logger.warning(f"[{processed_count} of {num_records}] Holdout preprocessing failed for {pid}")
 
             except Exception as e:
+                processed_count += 1
                 failed_subjects.append(pid)
                 if verbose:
                     logger.error(
-                        f"Error preprocessing holdout subject {pid}: "
+                        f"[{processed_count} of {num_records}] Error preprocessing holdout subject {pid}: "
                         f"{type(e).__name__}: {e}"
                     )
                     logger.error(traceback.format_exc())
@@ -3071,11 +3179,24 @@ def _add_demographics_safely(
 def run_model(model, record, data_folder, verbose):
     from helper_code import HEADERS
 
+    global _run_model_total_patients
+    global _run_model_processed_patients
+
+    if _run_model_total_patients is None:
+        try:
+            from helper_code import find_patients, DEMOGRAPHICS_FILE
+            patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+            patient_metadata_list = find_patients(patient_data_file)
+            _run_model_total_patients = len(patient_metadata_list)
+        except Exception:
+            _run_model_total_patients = "unknown"
+
     patient_id_bids = record[HEADERS["bids_folder"]]
     site_id = record[HEADERS["site_id"]]
     session_id = record[HEADERS["session_id"]]
 
     if model is None or model.get("fallback", False):
+        _run_model_processed_patients += 1
         return 0, 0.10
 
     tmp_main = None
@@ -3087,7 +3208,37 @@ def run_model(model, record, data_folder, verbose):
 
         import config
 
-        logger = _setup_logger(verbose)
+        global _run_model_log_files
+        if not _run_model_log_files:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dirs = []
+            model_folder = model.get("__model_folder") if isinstance(model, dict) else None
+            if model_folder:
+                dirs.append(Path(model_folder) / "logs")
+            try:
+                if hasattr(config, "PROJECT_DIR"):
+                    dirs.append(Path(config.PROJECT_DIR) / "output" / "logs")
+            except Exception:
+                pass
+            seen = set()
+            for d in dirs:
+                resolved = d.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    try:
+                        resolved.mkdir(parents=True, exist_ok=True)
+                        _run_model_log_files.append(resolved / f"run_model_{timestamp}.log")
+                    except Exception:
+                        pass
+            if not _run_model_log_files:
+                try:
+                    d = Path("output") / "logs"
+                    d.mkdir(parents=True, exist_ok=True)
+                    _run_model_log_files.append(d / f"run_model_{timestamp}.log")
+                except Exception:
+                    pass
+
+        logger = _setup_run_model_logger(verbose, _run_model_log_files)
 
         record_name = f"{patient_id_bids}_ses-{session_id}"
         pipeline_patient_id = f"{site_id}/{record_name}"
@@ -3230,7 +3381,26 @@ def run_model(model, record, data_folder, verbose):
         return 0, 0.10
 
     finally:
+        _run_model_processed_patients += 1
         gc.collect()
+
+        # Append logs from temporary directories to the global master log file
+        for tmp_dir in [tmp_worker_dir, tmp_main]:
+            if tmp_dir and os.path.exists(tmp_dir):
+                tmp_logs = Path(tmp_dir) / "logs"
+                if tmp_logs.exists() and tmp_logs.is_dir():
+                    for log_file in tmp_logs.glob("*.log"):
+                        try:
+                            with open(log_file, "r", encoding="utf-8", errors="ignore") as infile:
+                                content = infile.read()
+                            if content.strip():
+                                for master_log in _run_model_log_files:
+                                    with open(master_log, "a", encoding="utf-8") as outfile:
+                                        outfile.write(f"\n--- WORKER LOG FOR {patient_id_bids} (from {log_file.name}) ---\n")
+                                        outfile.write(content)
+                                        outfile.write(f"--- END WORKER LOG FOR {patient_id_bids} ---\n")
+                        except Exception:
+                            pass
 
         if tmp_worker_dir is not None:
             _cleanup_dir(tmp_worker_dir)
