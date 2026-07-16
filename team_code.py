@@ -505,16 +505,46 @@ def _setup_run_model_logger(verbose: bool, log_files: list):
 
 def _get_safe_workers(configured_workers: int, verbose: bool = False) -> int:
     available_gb = None
-    try:
-        if os.path.exists('/proc/meminfo'):
-            with open('/proc/meminfo', 'r') as f:
-                for line in f:
-                    if 'MemAvailable' in line:
-                        available_gb = int(line.split()[1]) / (1024 * 1024)
+    
+    # 1. First check cgroup memory limits (common in Docker/restricted environments)
+    cgroup_limit = None
+    cgroup_usage = None
+    for path in ['/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory.max']:
+        try:
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    val = int(f.read().strip())
+                    if val < 10**15:  # ignore if unlimited (very high value)
+                        cgroup_limit = val
                         break
-    except Exception:
-        pass
+        except Exception:
+            pass
+            
+    for path in ['/sys/fs/cgroup/memory/memory.usage_in_bytes', '/sys/fs/cgroup/memory.current']:
+        try:
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    cgroup_usage = int(f.read().strip())
+                    break
+        except Exception:
+            pass
+            
+    if cgroup_limit is not None and cgroup_usage is not None:
+        available_gb = max(0.1, (cgroup_limit - cgroup_usage) / (1024 ** 3))
 
+    # 2. Fallback to /proc/meminfo (Linux host available memory)
+    if available_gb is None:
+        try:
+            if os.path.exists('/proc/meminfo'):
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if 'MemAvailable' in line:
+                            available_gb = int(line.split()[1]) / (1024 * 1024)
+                            break
+        except Exception:
+            pass
+
+    # 3. Fallback to Windows GlobalMemoryStatusEx
     if available_gb is None:
         try:
             import ctypes
@@ -2379,6 +2409,8 @@ def train_model(data_folder, model_folder, verbose):
 
                 futures[future] = item
 
+            successfully_processed_batch = set()
+
             for future in as_completed(futures):
                 item = futures[future]
                 pid = item["pipeline_patient_id"]
@@ -2395,6 +2427,7 @@ def train_model(data_folder, model_folder, verbose):
                             "pat_features_path": result.get("pat_features_path"),
                             "sleep_summary": result.get("sleep_summary"),
                         }
+                        successfully_processed_batch.add(pid)
 
                         _remember_preprocessing_result(
                             feature_output_dir=feature_dir,
@@ -2409,6 +2442,61 @@ def train_model(data_folder, model_folder, verbose):
                 except Exception as e:
                     processed_count += 1
                     logger.error(f"[{processed_count} of {num_records}] Error processing {pid}: {type(e).__name__}: {e}")
+                    if "Broken" in type(e).__name__:
+                        logger.warning(
+                            "Process pool broke down (likely due to OOM/resource constraints). "
+                            "Switching to sequential fallback for remaining subjects in this batch..."
+                        )
+                        break
+
+            # Sequential fallback for any remaining subjects in this batch
+            remaining_batch = [
+                item for item in batch
+                if item["pipeline_patient_id"] not in successfully_processed_batch
+            ]
+            if remaining_batch:
+                logger.info(f"Processing {len(remaining_batch)} remaining subjects in batch sequentially...")
+                for item in remaining_batch:
+                    pid = item["pipeline_patient_id"]
+                    record_name = item["record_name"]
+                    patient_dir = item["patient_dir"]
+
+                    if not patient_dir.exists():
+                        continue
+
+                    logger.info(f"Sequential fallback: Processing {pid}...")
+                    try:
+                        result = process_single_patient(
+                            patient_id=pid,
+                            patient_dir=patient_dir,
+                            record_name=record_name,
+                            segment_length_sec=segment_length_sec,
+                            overlap_sec=overlap_sec,
+                            feature_output_dir=feature_dir,
+                        )
+                        processed_count += 1
+
+                        if result and result.get("success"):
+                            logger.info(f"[{processed_count} of {num_records}] Successfully processed {pid}")
+                            successful_results[pid] = {
+                                "seg_features_path": result.get("seg_features_path"),
+                                "pat_features_path": result.get("pat_features_path"),
+                                "sleep_summary": result.get("sleep_summary"),
+                            }
+                            successfully_processed_batch.add(pid)
+
+                            _remember_preprocessing_result(
+                                feature_output_dir=feature_dir,
+                                pipeline_patient_id=pid,
+                                record_name=record_name,
+                                result=result,
+                                logger=logger if verbose else None,
+                            )
+                        else:
+                            logger.warning(f"[{processed_count} of {num_records}] Preprocessing failed for {pid}")
+                    except Exception as seq_e:
+                        processed_count += 1
+                        logger.error(f"Error in sequential fallback for {pid}: {seq_e}")
 
         gc.collect()
 
@@ -3067,6 +3155,8 @@ def _ensure_holdout_preprocessed_parallel(
 
         processed_count = len(cached_subjects)
 
+        successfully_processed = set()
+
         for future in as_completed(futures):
             item = futures[future]
             pid = item["pipeline_patient_id"]
@@ -3078,6 +3168,7 @@ def _ensure_holdout_preprocessed_parallel(
 
                 if result and result.get("success"):
                     newly_processed += 1
+                    successfully_processed.add(pid)
                     if verbose:
                         logger.info(f"[{processed_count} of {num_records}] Successfully processed holdout {pid}")
 
@@ -3102,6 +3193,12 @@ def _ensure_holdout_preprocessed_parallel(
                         f"{type(e).__name__}: {e}"
                     )
                     logger.error(traceback.format_exc())
+                if "Broken" in type(e).__name__:
+                    logger.warning(
+                        "Process pool broke down (likely due to OOM/resource constraints). "
+                        "Switching to sequential fallback for remaining holdout subjects..."
+                    )
+                    break
 
             gc.collect()
 
@@ -3115,6 +3212,68 @@ def _ensure_holdout_preprocessed_parallel(
                     f"{len(failed_subjects)} failed, "
                     f"{elapsed:.0f}s elapsed."
                 )
+
+        # Sequential fallback for any remaining holdout subjects
+        remaining_to_process = [
+            item for item in records_to_process
+            if item["pipeline_patient_id"] not in successfully_processed
+            and item["pipeline_patient_id"] not in failed_subjects
+        ]
+        if remaining_to_process:
+            if verbose:
+                logger.info(f"Processing {len(remaining_to_process)} remaining holdout subjects sequentially...")
+            for item in remaining_to_process:
+                pid = item["pipeline_patient_id"]
+                record_name = item["record_name"]
+                patient_dir = item["patient_dir"]
+
+                if verbose:
+                    logger.info(f"Sequential fallback: Processing holdout {pid}...")
+                try:
+                    result = _preprocess_one_patient_worker(
+                        data_folder=data_folder,
+                        tmp_model_dir=tmp_model_dir,
+                        pipeline_patient_id=pid,
+                        patient_dir_str=str(patient_dir),
+                        record_name=record_name,
+                        segment_length_sec=segment_length_sec,
+                        overlap_sec=overlap_sec,
+                        feature_output_dir_str=str(feature_output_dir),
+                    )
+                    processed_count += 1
+
+                    if result and result.get("success"):
+                        newly_processed += 1
+                        successfully_processed.add(pid)
+                        if verbose:
+                            logger.info(f"[{processed_count} of {num_records}] Successfully processed holdout {pid}")
+
+                        _remember_preprocessing_result(
+                            feature_output_dir=feature_output_dir,
+                            pipeline_patient_id=pid,
+                            record_name=record_name,
+                            result=result,
+                            logger=logger if verbose else None,
+                        )
+                    else:
+                        failed_subjects.append(pid)
+                        if verbose:
+                            logger.warning(f"[{processed_count} of {num_records}] Holdout preprocessing failed for {pid}")
+                except Exception as seq_e:
+                    processed_count += 1
+                    failed_subjects.append(pid)
+                    logger.error(f"Error in sequential fallback for holdout {pid}: {seq_e}")
+
+                if verbose:
+                    elapsed = time.time() - total_start
+                    logger.info(
+                        f"Holdout preprocessing progress: "
+                        f"{newly_processed + len(failed_subjects)}/{len(records_to_process)} completed/failed, "
+                        f"{newly_processed} newly processed, "
+                        f"{len(cached_subjects)} initially cached, "
+                        f"{len(failed_subjects)} failed, "
+                        f"{elapsed:.0f}s elapsed."
+                    )
 
     _save_holdout_preprocess_marker(
         feature_output_dir,
