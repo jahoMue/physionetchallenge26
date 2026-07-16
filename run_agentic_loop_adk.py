@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-run_agentic_loop.py
-===================
-Orchestrator script for the multi-agent optimization loop.
-Coordinates Git, Docker, local metric parsing, and LLM-based code adaptation.
+run_agentic_loop_adk.py
+=======================
+Orchestrator script for the multi-agent optimization loop using the
+Google Agent Development Kit (ADK).
 """
 
 import os
@@ -12,9 +12,23 @@ import argparse
 import subprocess
 import shutil
 import json
-import urllib.request
-import urllib.parse
+import asyncio
 from pathlib import Path
+
+# Try to import Google ADK classes
+try:
+    from google.adk import Agent
+    from google.adk.runners import Runner
+except ImportError:
+    print("WARNING: 'google-adk' is not installed in the active environment.")
+    print("To install, run: pip install google-adk")
+    # Define placeholder classes for compilation check if run with --dry-run
+    class Agent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    class Runner:
+        def __init__(self, agent):
+            self.agent = agent
 
 # Paths configured according to user settings
 MODEL_HOST_PATH = Path(r"C:\Users\Biosig 3\Documents\Richard\Physionet26Data\model")
@@ -99,15 +113,10 @@ def parse_validation_metrics():
     """Parse runtime and F1 score metrics from the holdout output files."""
     metrics = {"runtime_sec": None, "f1_score": 0.0, "status": "failed"}
     try:
-        # Assuming the metrics are printed at the end of the run
-        # and written to outputs/demographics.csv or metrics.json
         demo_file = OUTPUTS_HOST_PATH / "demographics.csv"
         if demo_file.exists():
             metrics["status"] = "success"
-            # Simple file content scan (adjust depending on demographics structure)
-            with open(demo_file, "r") as f:
-                content = f.read()
-                # Parse metrics if logged or present
+            # Parse demographics output
             print(f"Demographics output located. Output file size: {demo_file.stat().st_size} bytes.")
     except Exception as e:
         print(f"Warning: Failed to parse execution metrics: {e}")
@@ -191,63 +200,70 @@ def apply_implemented_changes(response_text):
 
 
 # ==============================================================================
-# LLM INTEGRATION (SDK-free Gemini API caller)
+# GOOGLE ADK PROGRAMMATIC EXECUTION CALLER
 # ==============================================================================
 
-def call_gemini_api(api_key, model, system_instruction, prompt):
-    """SDK-free API call using urllib.request."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    headers = {"Content-Type": "application/json"}
-    
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_instruction}]}
-    }
-    
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST"
-    )
-    
+async def run_adk_agent(agent, prompt):
+    """Executes the ADK Agent asynchronously using the Runner context."""
+    # If google-adk is not installed, fallback to dry-run mockup
+    if 'google.adk' not in sys.modules:
+        print(f"[Mock ADK Run] Agent '{agent.name}' prompted with: {prompt[:80]}...")
+        return "Mock response: proposed algorithmic feature adaptations based on literature."
+
+    runner = Runner(agent=agent)
+    response_text = ""
     try:
-        with urllib.request.urlopen(req) as res:
-            resp_data = json.loads(res.read().decode("utf-8"))
-            return resp_data["candidates"][0]["content"]["parts"][0]["text"]
+        # standard run_async loop in Google ADK Python
+        async for event in runner.run_async(
+            user_id="pipeline_orchestrator",
+            session_id="optimization_session",
+            new_message=prompt
+        ):
+            if getattr(event, "is_final_response", False) or getattr(event, "content", None):
+                response_text = event.content
+        return response_text
     except Exception as e:
-        print(f"Error calling Gemini API: {e}")
+        print(f"Error running ADK agent: {e}")
         return None
-
-
-# ==============================================================================
-# CORE SYSTEM PROMPTS (Agent 2 & Agent 3 Role Instructions)
-# ==============================================================================
-
-RESEARCHER_INSTRUCTION = """
-You are the Scientific Researcher Agent. Your role is to analyze classification performance gaps and suggest feature extraction improvements.
-Analyze the files in the codebase context, find where feature extraction happens, and suggest mathematically rigorous features.
-"""
-
-IMPLEMENTER_INSTRUCTION = """
-You are the Feature & Code Implementer Agent. Your role is to implement coding suggestions strictly within the codebase. Write clean, error-free Python code.
-OUTPUT FORMAT CONSTRAINT:
-For every file you want to create or edit, you must output the full code of the file wrapped in a markdown block exactly like this:
-[FILE: path/to/file]
-```python
-file contents here...
-```
-Output only the file blocks. Do not add any conversational text before or after the blocks.
-"""
 
 
 # ==============================================================================
 # MAIN ITERATIVE LOOP
 # ==============================================================================
 
-def run_loop(api_key, max_iterations, target_benchmark, researcher_model, implementer_model):
+async def run_loop_async(max_iterations, target_benchmark, researcher_model, implementer_model):
     check_git_guardrails()
     
+    # Define Agents using Google ADK abstractions
+    print("Initializing ADK Agents...")
+    researcher_agent = Agent(
+        name="Scientific_Researcher",
+        model=researcher_model,
+        instruction=(
+            "You are the Scientific Researcher Agent. Your role is to analyze classification "
+            "performance gaps and suggest feature extraction improvements. Analyze the files "
+            "in the codebase context, find where feature extraction happens, and suggest mathematically "
+            "rigorous features."
+        )
+    )
+
+    implementer_agent = Agent(
+        name="Code_Implementer",
+        model=implementer_model,
+        instruction=(
+            "You are the Feature & Code Implementer Agent. Your role is to implement coding "
+            "suggestions strictly within the codebase. Write clean, error-free Python code.\n"
+            "OUTPUT FORMAT CONSTRAINT:\n"
+            "For every file you want to create or edit, you must output the full code of the file "
+            "wrapped in a markdown block exactly like this:\n"
+            "[FILE: path/to/file]\n"
+            "```python\n"
+            "file contents here...\n"
+            "```\n"
+            "Output only the file blocks. Do not add any conversational text before or after the blocks."
+        )
+    )
+
     print("==================================================")
     # 1. Establish Baseline on Small Dataset
     print("Step 1: Running baseline execution on small dataset...")
@@ -274,7 +290,7 @@ def run_loop(api_key, max_iterations, target_benchmark, researcher_model, implem
         # Get codebase context dynamically
         codebase_context = get_codebase_context()
 
-        # Agent 2: Literature Research
+        # Agent 2: Literature Research via ADK
         print("Agent 2 (Researcher) analyzing performance gaps...")
         research_prompt = (
             f"The pipeline baseline F1-score is {current_f1:.4f}.\n"
@@ -282,14 +298,14 @@ def run_loop(api_key, max_iterations, target_benchmark, researcher_model, implem
             "or feature extraction improvements.\n\n"
             f"Codebase Context:\n{codebase_context}"
         )
-        research_proposal = call_gemini_api(api_key, researcher_model, RESEARCHER_INSTRUCTION, research_prompt)
+        research_proposal = await run_adk_agent(researcher_agent, research_prompt)
         
         if not research_proposal:
             print("Research proposal generation failed. Aborting iteration.")
             continue
         print("\nResearch Proposal:\n", research_proposal[:500], "...\n")
         
-        # Agent 3: Implement Suggestions
+        # Agent 3: Implement Suggestions via ADK
         print("Agent 3 (Implementer) writing code...")
         implementation_prompt = (
             "You are tasked with implementing the following research proposal into the codebase.\n"
@@ -298,7 +314,7 @@ def run_loop(api_key, max_iterations, target_benchmark, researcher_model, implem
             f"Current Codebase Context:\n{codebase_context}\n\n"
             "Remember the OUTPUT FORMAT CONSTRAINT. Every modified file must be outputted with the [FILE: path/to/file] block."
         )
-        implemented_changes = call_gemini_api(api_key, implementer_model, IMPLEMENTER_INSTRUCTION, implementation_prompt)
+        implemented_changes = await run_adk_agent(implementer_agent, implementation_prompt)
         
         if not implemented_changes:
             print("Code generation failed. Aborting iteration.")
@@ -350,19 +366,17 @@ def run_loop(api_key, max_iterations, target_benchmark, researcher_model, implem
 # ==============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fully Autonomous Agent Pipeline Optimizer")
-    parser.add_argument("--key", type=str, default=os.environ.get("GEMINI_API_KEY"), help="Gemini API Key")
+    parser = argparse.ArgumentParser(description="Fully Autonomous ADK Agent Pipeline Optimizer")
     parser.add_argument("--iterations", type=int, default=5, help="Max iterations")
     parser.add_argument("--benchmark", type=float, default=0.01, help="Target F1 score improvement")
     parser.add_argument("--dry-run", action="store_true", help="Simulate git/docker commands without executing")
-    
     parser.add_argument("--researcher-model", type=str, default="gemini-3.5-flash", help="Gemini model for research tasks")
     parser.add_argument("--implementer-model", type=str, default="gemini-3.5-flash", help="Gemini model for coding tasks")
     
     args = parser.parse_args()
     
     if args.dry_run:
-        print("DRY-RUN SIMULATION:")
+        print("DRY-RUN SIMULATION (ADK Mode):")
         print(f"Docker small run cmd: {' '.join(DOCKER_CMD_SMALL)}")
         print(f"Docker large run cmd: {' '.join(DOCKER_CMD_LARGE)}")
         print("Verifying Git Branch Guardrails...")
@@ -377,8 +391,10 @@ if __name__ == "__main__":
             print(f"Git Check FAILED: {e}")
         sys.exit(0)
 
-    if not args.key:
-        print("ERROR: Gemini API Key not found. Please set GEMINI_API_KEY environment variable or pass --key.")
-        sys.exit(1)
-        
-    run_loop(args.key, args.iterations, args.benchmark, args.researcher_model, args.implementer_model)
+    # Run the main asynchronous workflow
+    asyncio.run(run_loop_async(
+        args.iterations, 
+        args.benchmark, 
+        args.researcher_model, 
+        args.implementer_model
+    ))
