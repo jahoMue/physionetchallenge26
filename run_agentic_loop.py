@@ -177,7 +177,7 @@ Write clean, error-free Python code. You will output the changes formatted as a 
 # MAIN ITERATIVE LOOP
 # ==============================================================================
 
-def run_loop(api_key, max_iterations, target_benchmark):
+def run_loop(api_key, max_iterations, target_benchmark, researcher_model, implementer_model):
     check_git_guardrails()
     
     print("==================================================")
@@ -206,7 +206,7 @@ def run_loop(api_key, max_iterations, target_benchmark):
         # Agent 2: Literature Research
         print("Agent 2 (Researcher) analyzing performance gaps...")
         research_prompt = f"The pipeline baseline F1-score is {current_f1:.4f}. Explore literature and suggest 3 features to improve sleep stage classification."
-        research_proposal = call_gemini_api(api_key, "gemini-2.5-pro", RESEARCHER_INSTRUCTION, research_prompt)
+        research_proposal = call_gemini_api(api_key, researcher_model, RESEARCHER_INSTRUCTION, research_prompt)
         
         if not research_proposal:
             print("Research proposal generation failed. Aborting iteration.")
@@ -216,7 +216,7 @@ def run_loop(api_key, max_iterations, target_benchmark):
         # Agent 3: Implement Suggestions
         print("Agent 3 (Implementer) writing code...")
         implementation_prompt = f"Implement the following research proposal in the codebase. Proposal: {research_proposal}"
-        implemented_changes = call_gemini_api(api_key, "gemini-2.5-pro", IMPLEMENTER_INSTRUCTION, implementation_prompt)
+        implemented_changes = call_gemini_api(api_key, implementer_model, IMPLEMENTER_INSTRUCTION, implementation_prompt)
         
         if not implemented_changes:
             print("Code generation failed. Aborting iteration.")
@@ -268,6 +268,9 @@ if __name__ == "__main__":
     parser.add_argument("--benchmark", type=float, default=0.01, help="Target F1 score improvement")
     parser.add_argument("--dry-run", action="store_true", help="Simulate git/docker commands without executing")
     
+    parser.add_argument("--researcher-model", type=str, default="gemini-3.5-flash", help="Gemini model for research tasks")
+    parser.add_argument("--implementer-model", type=str, default="gemini-3.5-flash", help="Gemini model for coding tasks")
+    
     args = parser.parse_args()
     
     if args.dry_run:
@@ -290,4 +293,4 @@ if __name__ == "__main__":
         print("ERROR: Gemini API Key not found. Please set GEMINI_API_KEY environment variable or pass --key.")
         sys.exit(1)
         
-    run_loop(args.key, args.iterations, args.benchmark)
+    run_loop(args.key, args.iterations, args.benchmark, args.researcher_model, args.implementer_model)
