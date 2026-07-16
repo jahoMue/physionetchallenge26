@@ -4,6 +4,7 @@ utils/logger.py
 Zentrales Logging-System für die gesamte Pipeline.
 """
 
+import os
 import sys
 from datetime import datetime
 from loguru import logger as _logger
@@ -47,7 +48,7 @@ def setup_logger(module_name: str = "pipeline"):
     # Datei-Handler: Hauptlog
     if LOG_TO_FILE:
         _logger.add(
-            LOG_DIR / f"{module_name}_{timestamp}.log",
+            LOG_DIR / f"{module_name}_{timestamp}_{os.getpid()}.log",
             format=log_format,
             level=LOG_LEVEL,
             rotation="50 MB",
@@ -59,7 +60,7 @@ def setup_logger(module_name: str = "pipeline"):
 
         # Separater Error-Log
         _logger.add(
-            LOG_DIR / f"{module_name}_{timestamp}_errors.log",
+            LOG_DIR / f"{module_name}_{timestamp}_errors_{os.getpid()}.log",
             format=log_format,
             level="WARNING",
             rotation="10 MB",

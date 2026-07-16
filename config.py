@@ -278,6 +278,6 @@ NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)
 # ==============================================================================
 # TIMEOUT CONFIGURATION (for run_model.py)
 # ==============================================================================
-RUN_MODEL_TIMEOUT_ENABLED = False  # Enable/disable aborting run_model.py after a timeout
+RUN_MODEL_TIMEOUT_ENABLED = True  # Enable/disable aborting run_model.py after a timeout
 RUN_MODEL_TIMEOUT_SEC = 47*3600       # Timeout duration in seconds (e.g., 30 minutes)
 

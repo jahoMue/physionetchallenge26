@@ -163,7 +163,7 @@ def extract_spindle_so_coupling_features(
             sigma_power = -1
             so_power = -1
 
-        logger.warning(
+        logger.debug(
             f"[SPINDLE_DIAG] Seg {segment_idx} [{region}]: "
             f"std={sig_std:.2f}, ptp={sig_ptp:.2f}, "
             f"fs={fs:.1f}, dur={duration_sec:.1f}s, "

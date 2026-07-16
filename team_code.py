@@ -503,6 +503,49 @@ def _setup_run_model_logger(verbose: bool, log_files: list):
         return _SimpleLogger(verbose=verbose, log_files=log_files)
 
 
+def _get_safe_workers(configured_workers: int, verbose: bool = False) -> int:
+    available_gb = None
+    try:
+        if os.path.exists('/proc/meminfo'):
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemAvailable' in line:
+                        available_gb = int(line.split()[1]) / (1024 * 1024)
+                        break
+    except Exception:
+        pass
+
+    if available_gb is None:
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            available_gb = stat.ullAvailPhys / (1024 ** 3)
+        except Exception:
+            pass
+
+    if available_gb is not None:
+        # Assume 1.5 GB per worker process
+        safe_workers = max(1, int(available_gb / 1.5))
+        return min(configured_workers, safe_workers)
+    
+    # Fallback to a safe number of workers (2) if memory cannot be determined
+    return min(configured_workers, 2)
+
+
 # =============================================================================
 # Config patching
 # =============================================================================
@@ -2301,7 +2344,8 @@ def train_model(data_folder, model_folder, verbose):
 
     configured_workers = int(getattr(config, "NUM_WORKERS", 1))
     configured_workers = max(1, configured_workers)
-    max_workers = min(configured_workers, max(1, len(records_to_process)))
+    safe_workers = _get_safe_workers(configured_workers, verbose)
+    max_workers = min(safe_workers, max(1, len(records_to_process)))
     max_workers = max(1, max_workers)
 
     total_start = time.time()
@@ -2974,7 +3018,8 @@ def _ensure_holdout_preprocessed_parallel(
         )
         return
 
-    max_workers = min(configured_workers, len(records_to_process))
+    safe_workers = _get_safe_workers(configured_workers, verbose)
+    max_workers = min(safe_workers, len(records_to_process))
     max_workers = max(1, max_workers)
     batch_size = max_workers
 

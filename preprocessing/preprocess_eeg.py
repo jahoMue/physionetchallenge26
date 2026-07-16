@@ -508,7 +508,7 @@ def _bandpass_filter(
     highcut: float, 
     order: int = 4
 ) -> np.ndarray:
-    """Butterworth Bandpassfilter."""
+    """Butterworth Bandpassfilter (Second-Order Sections for numerical stability)."""
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
@@ -516,8 +516,8 @@ def _bandpass_filter(
     low = max(low, 0.001)
     high = min(high, 0.999)
     
-    b, a = scipy_signal.butter(order, [low, high], btype='band')
-    filtered = scipy_signal.filtfilt(b, a, signal_data)
+    sos = scipy_signal.butter(order, [low, high], btype='band', output='sos')
+    filtered = scipy_signal.sosfiltfilt(sos, signal_data)
     return filtered.astype(SIGNAL_DTYPE)  # CHANGED: cast to float32
 
 
