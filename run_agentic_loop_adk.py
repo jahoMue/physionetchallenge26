@@ -165,19 +165,19 @@ def get_codebase_context():
 
 def apply_implemented_changes(response_text):
     """
-    Parse response text from the Implementer agent and apply edits to files.
-    The agent is instructed to output files in the format:
+    Parse response text from the agents and apply edits to files.
+    The agents are instructed to output files in the format:
     [FILE: path/to/file]
-    ```python
+    ```<language>
     code
     ```
     """
     import re
-    pattern = r"\[FILE:\s*([^\]\s]+)\]\s*```python\s*(.*?)\s*```"
+    pattern = r"\[FILE:\s*([^\]\s]+)\]\s*```[a-zA-Z0-9+_-]*\s*(.*?)\s*```"
     matches = re.findall(pattern, response_text, re.DOTALL)
     
     if not matches:
-        print("Warning: No file modification blocks found in the Implementer's response.")
+        print("Warning: No file modification blocks found in the agent's response.")
         return False
         
     applied_any = False
@@ -208,7 +208,21 @@ async def run_adk_agent(agent, prompt):
     # If google-adk is not installed, fallback to dry-run mockup
     if 'google.adk' not in sys.modules:
         print(f"[Mock ADK Run] Agent '{agent.name}' prompted with: {prompt[:80]}...")
-        return "Mock response: proposed algorithmic feature adaptations based on literature."
+        if agent.name == "Scientific_Researcher":
+            return "Mock response: proposed algorithmic feature adaptations based on literature."
+        elif agent.name == "Code_Implementer":
+            return "[FILE: feature_extraction/features_eeg_spindle_so.py]\n```python\n# Mock implemented changes\n```"
+        elif agent.name == "Quality_Manager":
+            # If reviewing code changes or documentation, return mock format
+            import re
+            m = re.search(r"\[FILE:\s*([^\]\s]+)\]\s*```([a-zA-Z0-9+_-]*)\s*(.*?)\s*```", prompt, re.DOTALL)
+            if m:
+                file_path, lang, content = m.groups()
+                return f"[FILE: {file_path}]\n```{lang}\n{content}\n# Reviewed by Quality Manager\n```"
+            return "[FILE: feature_extraction/features_eeg_spindle_so.py]\n```python\n# Mock reviewed changes by Quality Manager\n```"
+        elif agent.name == "Documentation_Agent":
+            return "[FILE: DOCUMENTATION.md]\n```markdown\n# Project Documentation\n\n## Medical Strategy\nClassification is based on sleep spindle and slow oscillation coupling.\n\n## Implementation\nImplemented in `feature_extraction/features_eeg_spindle_so.py`.\n\n## Iterations\n- Baseline run: F1 score.\n```"
+        return "Mock response: general agent execution."
 
     runner = Runner(agent=agent)
     response_text = ""
@@ -231,7 +245,7 @@ async def run_adk_agent(agent, prompt):
 # MAIN ITERATIVE LOOP
 # ==============================================================================
 
-async def run_loop_async(max_iterations, target_benchmark, researcher_model, implementer_model):
+async def run_loop_async(max_iterations, target_benchmark, researcher_model, implementer_model, documentation_model, quality_manager_model):
     check_git_guardrails()
     
     # Define Agents using Google ADK abstractions
@@ -258,6 +272,50 @@ async def run_loop_async(max_iterations, target_benchmark, researcher_model, imp
             "wrapped in a markdown block exactly like this:\n"
             "[FILE: path/to/file]\n"
             "```python\n"
+            "file contents here...\n"
+            "```\n"
+            "Output only the file blocks. Do not add any conversational text before or after the blocks."
+        )
+    )
+
+    documentation_agent = Agent(
+        name="Documentation_Agent",
+        model=documentation_model,
+        instruction=(
+            "You are the Documentation Agent. Your role is to document the medical strategy on which the "
+            "classification is based, how this is implemented by the software, what changes were made in "
+            "each iteration, and how these changes performed in the respective tests.\n"
+            "OUTPUT FORMAT CONSTRAINT:\n"
+            "For every file you want to create or edit (such as DOCUMENTATION.md), you must output the full code "
+            "or content of the file wrapped in a markdown block exactly like this:\n"
+            "[FILE: path/to/file]\n"
+            "```markdown\n"
+            "file contents here...\n"
+            "```\n"
+            "Output only the file blocks. Do not add any conversational text before or after the blocks."
+        )
+    )
+
+    quality_manager_agent = Agent(
+        name="Quality_Manager",
+        model=quality_manager_model,
+        instruction=(
+            "You are the Quality Manager Agent. Your role is to ensure that the code meets the quality "
+            "standards of good programming practice, that the documentation also complies with the standard "
+            "requirements for such a project, and that no typical machine learning errors occur during "
+            "training and testing (e.g., data leakage, overfitting, class imbalance issues, improper validation).\n"
+            "You will review proposed changes (both code and documentation), identify any flaws, and output "
+            "corrected versions of the files.\n"
+            "OUTPUT FORMAT CONSTRAINT:\n"
+            "For every file you want to edit or create, you must output the full code/content of the file "
+            "wrapped in a markdown block exactly like this:\n"
+            "[FILE: path/to/file]\n"
+            "```python\n"
+            "file contents here...\n"
+            "```\n"
+            "or for markdown files:\n"
+            "[FILE: path/to/file]\n"
+            "```markdown\n"
             "file contents here...\n"
             "```\n"
             "Output only the file blocks. Do not add any conversational text before or after the blocks."
@@ -321,8 +379,27 @@ async def run_loop_async(max_iterations, target_benchmark, researcher_model, imp
             continue
         print("\nImplemented Changes:\n", implemented_changes[:500], "...\n")
         
+        # Agent: Quality Manager reviews code changes
+        print("Agent (Quality Manager) reviewing proposed code changes...")
+        qm_code_prompt = (
+            "Review the proposed changes from the Code Implementer for good programming practices "
+            "and typical machine learning issues (e.g., data leakage, overfitting, scaling, incorrect validation).\n\n"
+            f"Current Codebase Context:\n{codebase_context}\n\n"
+            f"Proposed Changes:\n{implemented_changes}\n\n"
+            "If the proposed changes are correct and meet quality standards, output them exactly as is.\n"
+            "If there are any issues, output the corrected and improved files with the modifications applied.\n"
+            "Remember the OUTPUT FORMAT CONSTRAINT. Every modified/corrected file must be outputted with the [FILE: path/to/file] block."
+        )
+        reviewed_changes = await run_adk_agent(quality_manager_agent, qm_code_prompt)
+        
+        if not reviewed_changes:
+            print("Quality Manager code review failed or returned empty. Using Implementer's changes directly.")
+            reviewed_changes = implemented_changes
+        else:
+            print("\nQuality Manager Reviewed Changes:\n", reviewed_changes[:500], "...\n")
+        
         # Apply the changes to the disk!
-        changes_applied = apply_implemented_changes(implemented_changes)
+        changes_applied = apply_implemented_changes(reviewed_changes)
         if not changes_applied:
             print("No changes could be successfully applied to the filesystem. Skipping iteration.")
             continue
@@ -337,6 +414,50 @@ async def run_loop_async(max_iterations, target_benchmark, researcher_model, imp
             new_metrics = parse_validation_metrics()
             new_f1 = new_metrics.get("f1_score", 0.0)
             print(f"Iteration {iteration} F1 score: {new_f1:.4f} (Baseline: {best_f1:.4f})")
+            
+            # Agent: Documentation Agent documenting the iteration
+            print("Agent (Documentation) updating project documentation...")
+            doc_prompt = (
+                "You need to document the development process of this medical classification software.\n"
+                "Review the current codebase, the changes applied in this iteration, and the performance results:\n\n"
+                f"Iteration: {iteration}\n"
+                f"Previous best F1 score: {best_f1:.4f}\n"
+                f"New F1 score: {new_f1:.4f}\n"
+                f"Changes made:\n{reviewed_changes}\n\n"
+                "Please update or create a markdown file named 'DOCUMENTATION.md' in the root directory.\n"
+                "The document must detail:\n"
+                "1. The medical strategy on which the classification is based (e.g. EEG features, spindles, slow oscillations, sleep scoring).\n"
+                "2. How this strategy is implemented by the software.\n"
+                "3. What changes were made in each iteration (keep a running log/history of all iterations).\n"
+                "4. How these changes performed in the respective tests.\n"
+                "If DOCUMENTATION.md already exists in the codebase context, retrieve its contents and append/update the iteration log. Otherwise, create it.\n"
+                "Remember the OUTPUT FORMAT CONSTRAINT. Output the file wrapped in a [FILE: DOCUMENTATION.md] block."
+            )
+            proposed_doc = await run_adk_agent(documentation_agent, doc_prompt)
+            if not proposed_doc:
+                print("Documentation generation failed.")
+            else:
+                print("\nProposed Documentation:\n", proposed_doc[:500], "...\n")
+                
+                # Agent: Quality Manager reviews documentation
+                print("Agent (Quality Manager) reviewing proposed documentation...")
+                qm_doc_prompt = (
+                    "Review the proposed documentation to ensure it complies with the standard requirements for a medical/technical project "
+                    "(accuracy, clarity, completeness, proper formatting) and that there are no incorrect claims or typical ML errors in the description.\n\n"
+                    f"Proposed Documentation:\n{proposed_doc}\n\n"
+                    "If the proposed documentation is correct, output it exactly as is.\n"
+                    "If there are any issues, output the corrected and improved documentation.\n"
+                    "Remember the OUTPUT FORMAT CONSTRAINT. Output the file wrapped in a [FILE: DOCUMENTATION.md] block."
+                )
+                reviewed_doc = await run_adk_agent(quality_manager_agent, qm_doc_prompt)
+                if not reviewed_doc:
+                    print("Quality Manager documentation review failed. Using proposed documentation directly.")
+                    reviewed_doc = proposed_doc
+                else:
+                    print("\nQuality Manager Reviewed Documentation:\n", reviewed_doc[:500], "...\n")
+                
+                # Apply the documentation changes to the disk!
+                apply_implemented_changes(reviewed_doc)
             
             # Check improvement benchmark
             if new_f1 > best_f1 + target_benchmark:
@@ -372,6 +493,8 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Simulate git/docker commands without executing")
     parser.add_argument("--researcher-model", type=str, default="gemini-3.5-flash", help="Gemini model for research tasks")
     parser.add_argument("--implementer-model", type=str, default="gemini-3.5-flash", help="Gemini model for coding tasks")
+    parser.add_argument("--documentation-model", type=str, default="gemini-3.5-flash", help="Gemini model for documentation tasks")
+    parser.add_argument("--quality-manager-model", type=str, default="gemini-3.5-flash", help="Gemini model for quality management tasks")
     
     args = parser.parse_args()
     
@@ -396,5 +519,7 @@ if __name__ == "__main__":
         args.iterations, 
         args.benchmark, 
         args.researcher_model, 
-        args.implementer_model
+        args.implementer_model,
+        args.documentation_model,
+        args.quality_manager_model
     ))
