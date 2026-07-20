@@ -30,9 +30,12 @@ except ImportError:
     class InMemoryRunner:
         def __init__(self, agent, **kwargs):
             self.agent = agent
+            self.app_name = kwargs.get("app_name", "InMemoryRunner")
             self.context_cache_config = None
             class DummySessionService:
-                def delete_session_sync(self, user_id, session_id):
+                def delete_session_sync(self, user_id, session_id, **kwargs):
+                    pass
+                async def create_session(self, app_name, user_id, session_id, **kwargs):
                     pass
             self.session_service = DummySessionService()
         async def run_async(self, user_id, session_id, new_message):
@@ -337,10 +340,16 @@ async def run_adk_agent(runner, prompt, session_id="optimization_session"):
 
     response_text = ""
     try:
+        from google.genai import types
+        msg = types.Content(parts=[types.Part.from_text(text=prompt)], role="user")
+    except Exception:
+        msg = prompt
+
+    try:
         async for event in runner.run_async(
             user_id="pipeline_orchestrator",
             session_id=session_id,
-            new_message=prompt
+            new_message=msg
         ):
             if getattr(event, "is_final_response", False) or getattr(event, "content", None):
                 response_text = event.content
@@ -353,11 +362,27 @@ async def run_adk_agent(runner, prompt, session_id="optimization_session"):
 async def prepare_runner_session(runner, session_id):
     """Resets the runner session and runs a tiny pre-warm message to trigger context caching."""
     if 'google.adk' in sys.modules and hasattr(runner, "session_service"):
+        app_name = getattr(runner, "app_name", "pipeline_optimizer")
         try:
             print(f"Clearing previous session {session_id} to ensure clean iteration...")
-            runner.session_service.delete_session_sync(user_id="pipeline_orchestrator", session_id=session_id)
+            runner.session_service.delete_session_sync(
+                app_name=app_name,
+                user_id="pipeline_orchestrator",
+                session_id=session_id
+            )
         except Exception as e:
-            print(f"Warning clearing session: {e}")
+            # Session might not exist
+            pass
+            
+        try:
+            print(f"Creating session {session_id} explicitly...")
+            await runner.session_service.create_session(
+                app_name=app_name,
+                user_id="pipeline_orchestrator",
+                session_id=session_id
+            )
+        except Exception as e:
+            print(f"Warning creating session: {e}")
             
     # Pre-warm with a tiny hello turn so that the subsequent prompt triggers cache creation.
     print(f"Pre-warming session {session_id} for context caching...")
@@ -481,19 +506,19 @@ async def run_loop_async(
         min_tokens=0
     )
 
-    researcher_runner = InMemoryRunner(agent=researcher_agent)
+    researcher_runner = InMemoryRunner(agent=researcher_agent, app_name="pipeline_optimizer")
     researcher_runner.context_cache_config = cache_config
 
-    peer_reviewer_runner = InMemoryRunner(agent=peer_reviewer_agent)
+    peer_reviewer_runner = InMemoryRunner(agent=peer_reviewer_agent, app_name="pipeline_optimizer")
     peer_reviewer_runner.context_cache_config = cache_config
 
-    implementer_runner = InMemoryRunner(agent=implementer_agent)
+    implementer_runner = InMemoryRunner(agent=implementer_agent, app_name="pipeline_optimizer")
     implementer_runner.context_cache_config = cache_config
 
-    qm_runner = InMemoryRunner(agent=quality_manager_agent)
+    qm_runner = InMemoryRunner(agent=quality_manager_agent, app_name="pipeline_optimizer")
     qm_runner.context_cache_config = cache_config
 
-    doc_runner = InMemoryRunner(agent=documentation_agent)
+    doc_runner = InMemoryRunner(agent=documentation_agent, app_name="pipeline_optimizer")
     doc_runner.context_cache_config = cache_config
 
     print("==================================================")
