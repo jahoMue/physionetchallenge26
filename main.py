@@ -140,17 +140,26 @@ def extract_cap_features_for_patient(
     cap_features = {k: np.nan for k in cap_feature_keys_prefixed}
     cap_features["cap_ID"] = patient_id
     try:
+        if logger:
+            logger.info(f"CAP-Feature-Extraktion: Signal={len(eeg_signal)} samples ({len(eeg_signal)/fs/60.0:.1f} min), fs={fs} Hz")
+        t0 = time.time()
         eeg = SignalEEG(eeg_signal, fs, event, duration, eventtime, patient_id)
         eeg.eeg_features = get_features_paper(eeg.eeg, eeg.fs, eeg.event, eeg.duration, eeg.eventtime)
+        if logger:
+            logger.info(f"CAP: Papier-Features berechnet in {time.time()-t0:.1f}s, erstelle LSTM-Input...")
+        t1 = time.time()
         input_list = eeg.create_multi_class_input()
         stats = cap_classification(
             input_list, eeg, flags or {"Scoring": "CAP"},
         )
+        if logger:
+            logger.info(f"CAP: Klassifikation abgeschlossen in {time.time()-t1:.1f}s (Gesamt: {time.time()-t0:.1f}s)")
     except Exception as e:
         if logger:
             logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion fehlgeschlagen für {patient_id}: {e}")
         return cap_features
     return stats
+
 
 
 def process_single_patient(
@@ -485,15 +494,46 @@ def process_single_patient(
                 cap_ch_data = eeg_preprocessed[cap_eeg_channel]  # Corrected reference
                 cap_eeg_signal = (cap_ch_data["eeg_cleaned"] if isinstance(cap_ch_data, dict) and "eeg_cleaned" in cap_ch_data else cap_ch_data)
                 cap_fs = eeg_fs  # Sampling frequency
-                cap_event = annotation_data["stages_raw"].stage_numeric if annotation_data and "stages_raw" in annotation_data else None
-                cap_duration = annotation_data["stages_raw"].duration_sec if annotation_data and "stages_raw" in annotation_data else None
-                cap_eventtime = annotation_data["stages_raw"].start_sec if annotation_data and "stages_raw" in annotation_data else None
+
+                stages_raw = annotation_data.get("stages_raw") if annotation_data else None
+
+                if stages_raw is not None and not stages_raw.empty:
+                    try:
+                        from segmentation.segment_signals import _get_sleep_onset_and_offset
+                        from config import FILTER_SEGMENTS_SLEEP_ONSET_OFFSET
+
+                        if FILTER_SEGMENTS_SLEEP_ONSET_OFFSET:
+                            sleep_onset_sec, sleep_offset_sec = _get_sleep_onset_and_offset(
+                                annotation_data, total_duration_sec
+                            )
+                            if sleep_onset_sec > 0.0 or sleep_offset_sec < total_duration_sec:
+                                start_sample = int(sleep_onset_sec * cap_fs)
+                                end_sample = int(sleep_offset_sec * cap_fs)
+                                cap_eeg_signal = cap_eeg_signal[start_sample:end_sample]
+
+                                stages_mask = (stages_raw["end_sec"] > sleep_onset_sec) & (stages_raw["start_sec"] < sleep_offset_sec)
+                                stages_sleep = stages_raw[stages_mask].copy()
+                                if len(stages_sleep) > 0:
+                                    stages_sleep["start_sec"] = np.maximum(0.0, stages_sleep["start_sec"] - sleep_onset_sec)
+                                    stages_raw = stages_sleep
+                    except Exception as trim_e:
+                        if patient_logger:
+                            patient_logger.warning(f"CAP Schlafzeitraum-Trimming fehlgeschlagen: {trim_e}")
+
+                cap_event = stages_raw.stage_numeric.values if stages_raw is not None and "stage_numeric" in stages_raw.columns else None
+                cap_duration = stages_raw.duration_sec.values if stages_raw is not None and "duration_sec" in stages_raw.columns else None
+                cap_eventtime = stages_raw.start_sec.values if stages_raw is not None and "start_sec" in stages_raw.columns else None
+
                 if cap_event is not None and cap_duration is not None and cap_eventtime is not None:
+                    patient_logger.info(f"Starte CAP-Feature-Extraktion für Schlafzeitraum ({len(cap_eeg_signal)/cap_fs/60.0:.1f} min)...")
                     cap_features = extract_cap_features_for_patient(
                         cap_eeg_signal, cap_fs, cap_event, cap_duration, cap_eventtime, patient_id,
                         logger=patient_logger
                     )
+                    patient_logger.info(f"CAP-Feature-Extraktion abgeschlossen: {len(cap_features) if isinstance(cap_features, dict) else 'N/A'} Features")
+
         except Exception as e:
+
             if patient_logger:
                 patient_logger.warning(f"[CAP-Integration] CAP-Feature-Extraktion übersprungen: {e}")
 

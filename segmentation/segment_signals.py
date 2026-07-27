@@ -258,6 +258,50 @@ def segment_signal(
 # VOLLSTÄNDIGE SEGMENTIERUNG EINES PATIENTEN
 # ==============================================================================
 
+def _get_sleep_onset_and_offset(annotation_data: Optional[Dict], total_duration_sec: float) -> Tuple[float, float]:
+    """
+    Finds sleep onset (start of first non-Wake sleep epoch) and
+    sleep offset (end of last non-Wake sleep epoch) from annotation_data.
+    Returns (sleep_onset_sec, sleep_offset_sec).
+    Falls back to (0.0, total_duration_sec) if no sleep epochs are present.
+    """
+    if not annotation_data:
+        return 0.0, total_duration_sec
+
+    stages_df = annotation_data.get("stages_raw")
+    if stages_df is None or not isinstance(stages_df, pd.DataFrame) or len(stages_df) == 0:
+        return 0.0, total_duration_sec
+
+    if "stage_label" not in stages_df.columns:
+        return 0.0, total_duration_sec
+
+    # Identify non-Wake sleep stages
+    sleep_stages = stages_df[
+        stages_df["stage_label"].isin(["N1", "N2", "N3", "REM"]) |
+        ((stages_df["stage_label"] != "W") & (stages_df["stage_label"] != "Unknown"))
+    ]
+
+    if len(sleep_stages) == 0:
+        return 0.0, total_duration_sec
+
+    onset_sec = float(sleep_stages.iloc[0]["start_sec"])
+
+    # Determine end_sec for last non-Wake epoch
+    last_row = sleep_stages.iloc[-1]
+    if "end_sec" in last_row and pd.notna(last_row["end_sec"]):
+        offset_sec = float(last_row["end_sec"])
+    elif "duration_sec" in last_row and "start_sec" in last_row and pd.notna(last_row["duration_sec"]) and pd.notna(last_row["start_sec"]):
+        offset_sec = float(last_row["start_sec"] + last_row["duration_sec"])
+    else:
+        offset_sec = total_duration_sec
+
+    # Safety checks
+    onset_sec = max(0.0, onset_sec)
+    offset_sec = min(total_duration_sec, max(onset_sec + 1.0, offset_sec))
+
+    return onset_sec, offset_sec
+
+
 def segment_patient_recording(
     patient_id: str,
     ecg_preprocessed: Optional[Dict],
@@ -310,6 +354,33 @@ def segment_patient_recording(
     boundaries = compute_segment_boundaries(
         total_duration_sec, segment_length_sec, overlap_sec
     )
+    
+    # --- Filter segment boundaries by sleep period (sleep onset to offset) ---
+    try:
+        from config import FILTER_SEGMENTS_SLEEP_ONSET_OFFSET
+    except Exception:
+        FILTER_SEGMENTS_SLEEP_ONSET_OFFSET = True
+
+    if FILTER_SEGMENTS_SLEEP_ONSET_OFFSET and annotation_data is not None:
+        sleep_onset_sec, sleep_offset_sec = _get_sleep_onset_and_offset(
+            annotation_data, total_duration_sec
+        )
+        if sleep_onset_sec > 0.0 or sleep_offset_sec < total_duration_sec:
+            mask = (boundaries["end_sec"] > sleep_onset_sec) & (boundaries["start_sec"] < sleep_offset_sec)
+            filtered_boundaries = boundaries[mask].copy()
+            if len(filtered_boundaries) > 0:
+                orig_indices = filtered_boundaries.index.values
+                filtered_boundaries = filtered_boundaries.reset_index(drop=True)
+                filtered_boundaries["segment_idx"] = np.arange(len(filtered_boundaries))
+                filtered_boundaries.attrs["orig_indices"] = orig_indices
+                if logger:
+                    logger.info(
+                        f"Filter Segmente auf Schlafzeitraum "
+                        f"[{sleep_onset_sec/60.0:.1f} min bis {sleep_offset_sec/60.0:.1f} min]: "
+                        f"{len(filtered_boundaries)}/{len(boundaries)} Segmente beibehalten."
+                    )
+                boundaries = filtered_boundaries
+
     n_segments = len(boundaries)
     
     if logger:
@@ -324,6 +395,7 @@ def segment_patient_recording(
         segment_overlap_sec=overlap_sec,
         n_segments=n_segments,
     )
+
     
     # --- ECG segmentieren ---
     if ecg_preprocessed is not None and ecg_preprocessed.get("ecg_cleaned") is not None:

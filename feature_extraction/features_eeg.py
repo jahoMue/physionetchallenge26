@@ -1588,6 +1588,9 @@ def extract_eeg_features_all_segments(
         for i, seg in enumerate(segments):
             if i >= n_segments:
                 break
+            if logger and (i % 25 == 0 or i == len(segments) - 1):
+                logger.info(f"EEG Feature-Extraktion [{region}]: Segment {i+1}/{len(segments)}...")
+
             
             if seg is None:
                 prefix = f"eeg_{region}"

@@ -88,6 +88,8 @@ SEGMENT_LENGTH_SEC = 300           # 5 Minuten
 SEGMENT_OVERLAP_SEC = 0            # Keine Überlappung
 SLEEP_EPOCH_SEC = 30               # Standard-Schlafepoche
 SIGNAL_DTYPE = np.float32              # NEW: Halves memory for all signal arrays
+FILTER_SEGMENTS_SLEEP_ONSET_OFFSET = True  # Compute segments only between sleep onset and offset
+
 # ==============================================================================
 # QUALITÄT
 # ==============================================================================
@@ -273,7 +275,7 @@ DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
 # ==============================================================================
 # PARALLEL COMPUTING
 # ==============================================================================
-NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)
+NUM_WORKERS = 6 # max(1, (os.cpu_count() or 1) - 1)
 
 # ==============================================================================
 # TIMEOUT CONFIGURATION (for run_model.py)

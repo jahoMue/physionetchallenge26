@@ -10,11 +10,14 @@
 #  for saving your model's outputs, and -v is an optional verbosity flag.
 
 import argparse
+import gc
 import os
+import signal
 import sys
 
 from helper_code import *
-from team_code import load_model, run_model
+from team_code import load_model, run_model, log_timeout_progress, _run_model_total_patients, _release_native_memory
+
 
 # Parse arguments.
 def get_parser():
@@ -47,6 +50,21 @@ def run(args):
     if num_records == 0:
         raise Exception('No data were provided.')
 
+    import team_code
+    team_code._run_model_total_patients = num_records
+
+    # Setup signal handlers for timeout / termination info
+    def _handle_timeout_signal(signum, frame):
+        log_timeout_progress(num_records)
+        sys.exit(128 + signum)
+
+    for sig in (getattr(signal, 'SIGTERM', None), getattr(signal, 'SIGINT', None), getattr(signal, 'SIGALRM', None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _handle_timeout_signal)
+            except Exception:
+                pass
+
     # Create a folder for the Challenge outputs if it does not already exist.
     os.makedirs(args.output_folder, exist_ok=True)
 
@@ -57,32 +75,39 @@ def run(args):
     # Initialize a dictionary to hold all results.
     results = {}
 
-    # Iterate over the patients.
-    for i in range(num_records):
-        record = patient_metadata_list[i]
-        patient_id = record[HEADERS['bids_folder']]
-        site_id    = record[HEADERS['site_id']]
-        session_id = record[HEADERS['session_id']]
-        
-        if args.verbose:
-            width = len(str(num_records))
-            print(f'- {i+1:>{width}}/{num_records}: {patient_id} (Session {session_id})...')
+    try:
+        # Iterate over the patients.
+        for i in range(num_records):
+            record = patient_metadata_list[i]
+            patient_id = record[HEADERS['bids_folder']]
+            site_id    = record[HEADERS['site_id']]
+            session_id = record[HEADERS['session_id']]
+            
+            if args.verbose:
+                width = len(str(num_records))
+                print(f'- {i+1:>{width}}/{num_records}: {patient_id} (Session {session_id})...')
 
-        # Allow or disallow the model to fail on parts of the data; this can be helpful for debugging.
-        try:
-            binary_output, probability_output = run_model(model, record, args.data_folder, args.verbose) ### Teams: Implement this function!!!
-            assert(is_boolean(binary_output) or is_nan(binary_output))
-            assert(is_number(probability_output))
-        except:
-            if args.allow_failures:
-                if args.verbose:
-                    print('... failed.')
-                binary_output, probability_output = float('nan'), float('nan')
-            else:
-                raise
+            # Allow or disallow the model to fail on parts of the data; this can be helpful for debugging.
+            try:
+                binary_output, probability_output = run_model(model, record, args.data_folder, args.verbose) ### Teams: Implement this function!!!
+                assert(is_boolean(binary_output) or is_nan(binary_output))
+                assert(is_number(probability_output))
+            except:
+                if args.allow_failures:
+                    if args.verbose:
+                        print('... failed.')
+                    binary_output, probability_output = float('nan'), float('nan')
+                else:
+                    raise
 
-        # Store the results.
-        results[patient_id] = (binary_output, probability_output)
+            # Store the results.
+            results[patient_id] = (binary_output, probability_output)
+            _release_native_memory()
+
+
+    except BaseException as e:
+        log_timeout_progress(num_records)
+        raise e
 
     # Update the demographics table with the model outputs.
     if args.verbose:
@@ -97,3 +122,4 @@ def run(args):
 
 if __name__ == '__main__':
     run(get_parser().parse_args(sys.argv[1:]))
+

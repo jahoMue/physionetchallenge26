@@ -480,27 +480,92 @@ def _setup_logger(verbose: bool):
         return _SimpleLogger(verbose=verbose)
 
 
+_LOGGER_INITIALIZED_FILES = set()
+_LAST_FEATURE_OUTPUT_DIR = None
+
+
+def log_timeout_progress(total_records: Optional[int] = None, feature_output_dir=None):
+    global _run_model_processed_patients, _run_model_total_patients, _run_model_log_files, _LAST_FEATURE_OUTPUT_DIR, _GLOBAL_FALLBACK_CACHE_DIR
+    tot = total_records if total_records is not None else _run_model_total_patients
+
+    target_dir = feature_output_dir or _LAST_FEATURE_OUTPUT_DIR or _GLOBAL_FALLBACK_CACHE_DIR
+
+    disk_preprocessed_count = 0
+    if target_dir is not None and Path(target_dir).exists():
+        try:
+            manifest = _load_preprocess_manifest(target_dir)
+            if manifest:
+                disk_preprocessed_count = len({
+                    v.get("pipeline_patient_id")
+                    for v in manifest.values()
+                    if isinstance(v, dict) and v.get("pipeline_patient_id")
+                })
+        except Exception:
+            pass
+
+        if disk_preprocessed_count == 0:
+            try:
+                pat_files = list(Path(target_dir).rglob("*_patient_features.parquet"))
+                disk_preprocessed_count = len(pat_files)
+            except Exception:
+                pass
+
+    actual_processed = max(_run_model_processed_patients, disk_preprocessed_count)
+
+    tot_str = f" / {tot}" if tot else ""
+    pct_str = f" ({(float(actual_processed) / float(tot)) * 100.0:.1f}%)" if tot and tot > 0 else ""
+    
+    msg = (
+        f"\n============================================================\n"
+        f"TIMEOUT / OOM / INTERRUPT PROGRESS STATUS\n"
+        f"Preprocessed/processed subjects completed so far: {actual_processed}{tot_str}{pct_str}\n"
+        f"============================================================\n"
+    )
+    try:
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        print(msg)
+    except Exception:
+        pass
+    for log_file in _run_model_log_files:
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(msg)
+        except Exception:
+            pass
+
+
+
 def _setup_run_model_logger(verbose: bool, log_files: list):
+    global _LOGGER_INITIALIZED_FILES
     try:
         from loguru import logger
 
-        logger.remove()
-        if verbose:
-            logger.add(
-                sys.stdout,
-                level="INFO",
-                format="{time:HH:mm:ss} | {level:<7} | {message}",
-            )
-        for log_file in log_files:
-            logger.add(
-                log_file,
-                level="INFO",
-                format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {message}",
-                enqueue=True,
-            )
+        target_files = {str(Path(f).resolve()) for f in log_files if f}
+        if not _LOGGER_INITIALIZED_FILES.issuperset(target_files):
+            logger.remove()
+            if verbose:
+                logger.add(
+                    sys.stdout,
+                    level="INFO",
+                    format="{time:HH:mm:ss} | {level:<7} | {message}",
+                )
+            for log_file in log_files:
+                resolved = str(Path(log_file).resolve())
+                logger.add(
+                    log_file,
+                    level="INFO",
+                    format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {message}",
+                    enqueue=True,
+                )
+                _LOGGER_INITIALIZED_FILES.add(resolved)
         return logger
     except Exception:
         return _SimpleLogger(verbose=verbose, log_files=log_files)
+
 
 
 def _get_safe_workers(configured_workers: int, verbose: bool = False) -> int:
@@ -2916,12 +2981,13 @@ def _get_inference_feature_output_dir(
     data_folder: str,
     tmp_worker_dir: str,
 ) -> Path:
-    global _GLOBAL_FALLBACK_CACHE_DIR, _IS_FIRST_INFERENCE_CALL
+    global _GLOBAL_FALLBACK_CACHE_DIR, _IS_FIRST_INFERENCE_CALL, _LAST_FEATURE_OUTPUT_DIR
     runtime_model_folder = None
 
     if isinstance(model, dict):
         runtime_model_folder = model.get("__model_folder", None)
 
+    out_dir = None
     if runtime_model_folder is not None:
         fixed_dir = (
             Path(runtime_model_folder)
@@ -2930,21 +2996,26 @@ def _get_inference_feature_output_dir(
         )
 
         if _is_writable_dir(fixed_dir):
-            return fixed_dir
+            out_dir = fixed_dir
 
-    if _GLOBAL_FALLBACK_CACHE_DIR is None:
-        model_name = "default"
-        if isinstance(model, dict) and model.get("__model_folder"):
-            model_name = Path(model["__model_folder"]).name
-        _GLOBAL_FALLBACK_CACHE_DIR = Path(tempfile.gettempdir()) / f"physionet_run_cache_{model_name}" / "features"
+    if out_dir is None:
+        if _GLOBAL_FALLBACK_CACHE_DIR is None:
+            model_name = "default"
+            if isinstance(model, dict) and model.get("__model_folder"):
+                model_name = Path(model["__model_folder"]).name
+            _GLOBAL_FALLBACK_CACHE_DIR = Path(tempfile.gettempdir()) / f"physionet_run_cache_{model_name}" / "features"
 
-    if _IS_FIRST_INFERENCE_CALL:
-        import shutil
-        shutil.rmtree(_GLOBAL_FALLBACK_CACHE_DIR, ignore_errors=True)
-        _GLOBAL_FALLBACK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _IS_FIRST_INFERENCE_CALL = False
+        if _IS_FIRST_INFERENCE_CALL:
+            import shutil
+            shutil.rmtree(_GLOBAL_FALLBACK_CACHE_DIR, ignore_errors=True)
+            _GLOBAL_FALLBACK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            _IS_FIRST_INFERENCE_CALL = False
 
-    return _GLOBAL_FALLBACK_CACHE_DIR
+        out_dir = _GLOBAL_FALLBACK_CACHE_DIR
+
+    _LAST_FEATURE_OUTPUT_DIR = out_dir
+    return out_dir
+
 
 
 def _holdout_preprocess_marker_path(feature_output_dir: Path) -> Path:
@@ -3082,6 +3153,11 @@ def _ensure_holdout_preprocessed_parallel(
             }
         )
 
+    global _LAST_FEATURE_OUTPUT_DIR, _run_model_processed_patients
+    _LAST_FEATURE_OUTPUT_DIR = feature_output_dir
+    _run_model_processed_patients = max(_run_model_processed_patients, len(cached_subjects))
+
+
     configured_workers = int(getattr(config, "NUM_WORKERS", 1))
     configured_workers = max(1, configured_workers)
 
@@ -3168,9 +3244,11 @@ def _ensure_holdout_preprocessed_parallel(
 
                 if result and result.get("success"):
                     newly_processed += 1
+                    _run_model_processed_patients = max(_run_model_processed_patients, len(cached_subjects) + newly_processed)
                     successfully_processed.add(pid)
                     if verbose:
                         logger.info(f"[{processed_count} of {num_records}] Successfully processed holdout {pid}")
+
 
                     _remember_preprocessing_result(
                         feature_output_dir=feature_output_dir,
@@ -3196,8 +3274,12 @@ def _ensure_holdout_preprocessed_parallel(
                 if "Broken" in type(e).__name__:
                     logger.warning(
                         "Process pool broke down (likely due to OOM/resource constraints). "
-                        "Switching to sequential fallback for remaining holdout subjects..."
+                        "Cancelling pool and switching to sequential fallback for remaining holdout subjects..."
                     )
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
                     break
 
             gc.collect()
@@ -3213,67 +3295,71 @@ def _ensure_holdout_preprocessed_parallel(
                     f"{elapsed:.0f}s elapsed."
                 )
 
-        # Sequential fallback for any remaining holdout subjects
-        remaining_to_process = [
-            item for item in records_to_process
-            if item["pipeline_patient_id"] not in successfully_processed
-            and item["pipeline_patient_id"] not in failed_subjects
-        ]
-        if remaining_to_process:
+    # Sequential fallback for any remaining holdout subjects (OUTSIDE executor block to prevent shutdown deadlock)
+    remaining_to_process = [
+        item for item in records_to_process
+        if item["pipeline_patient_id"] not in successfully_processed
+        and item["pipeline_patient_id"] not in failed_subjects
+    ]
+    if remaining_to_process:
+        if verbose:
+            logger.info(f"Processing {len(remaining_to_process)} remaining holdout subjects sequentially...")
+        for item in remaining_to_process:
+            pid = item["pipeline_patient_id"]
+            record_name = item["record_name"]
+            patient_dir = item["patient_dir"]
+
             if verbose:
-                logger.info(f"Processing {len(remaining_to_process)} remaining holdout subjects sequentially...")
-            for item in remaining_to_process:
-                pid = item["pipeline_patient_id"]
-                record_name = item["record_name"]
-                patient_dir = item["patient_dir"]
+                logger.info(f"Sequential fallback: Processing holdout {pid}...")
+            try:
+                result = _preprocess_one_patient_worker(
+                    data_folder=data_folder,
+                    tmp_model_dir=tmp_model_dir,
+                    pipeline_patient_id=pid,
+                    patient_dir_str=str(patient_dir),
+                    record_name=record_name,
+                    segment_length_sec=segment_length_sec,
+                    overlap_sec=overlap_sec,
+                    feature_output_dir_str=str(feature_output_dir),
+                )
+                processed_count += 1
 
-                if verbose:
-                    logger.info(f"Sequential fallback: Processing holdout {pid}...")
-                try:
-                    result = _preprocess_one_patient_worker(
-                        data_folder=data_folder,
-                        tmp_model_dir=tmp_model_dir,
+                if result and result.get("success"):
+                    newly_processed += 1
+                    _run_model_processed_patients = max(_run_model_processed_patients, len(cached_subjects) + newly_processed)
+                    successfully_processed.add(pid)
+                    if verbose:
+                        logger.info(f"[{processed_count} of {num_records}] Successfully processed holdout {pid}")
+
+                    _remember_preprocessing_result(
+                        feature_output_dir=feature_output_dir,
                         pipeline_patient_id=pid,
-                        patient_dir_str=str(patient_dir),
                         record_name=record_name,
-                        segment_length_sec=segment_length_sec,
-                        overlap_sec=overlap_sec,
-                        feature_output_dir_str=str(feature_output_dir),
+                        result=result,
+                        logger=logger if verbose else None,
                     )
-                    processed_count += 1
-
-                    if result and result.get("success"):
-                        newly_processed += 1
-                        successfully_processed.add(pid)
-                        if verbose:
-                            logger.info(f"[{processed_count} of {num_records}] Successfully processed holdout {pid}")
-
-                        _remember_preprocessing_result(
-                            feature_output_dir=feature_output_dir,
-                            pipeline_patient_id=pid,
-                            record_name=record_name,
-                            result=result,
-                            logger=logger if verbose else None,
-                        )
-                    else:
-                        failed_subjects.append(pid)
-                        if verbose:
-                            logger.warning(f"[{processed_count} of {num_records}] Holdout preprocessing failed for {pid}")
-                except Exception as seq_e:
-                    processed_count += 1
+                else:
                     failed_subjects.append(pid)
-                    logger.error(f"Error in sequential fallback for holdout {pid}: {seq_e}")
+                    if verbose:
+                        logger.warning(f"[{processed_count} of {num_records}] Holdout preprocessing failed for {pid}")
+            except Exception as seq_e:
+                processed_count += 1
+                failed_subjects.append(pid)
+                logger.error(f"Error in sequential fallback for holdout {pid}: {seq_e}")
 
-                if verbose:
-                    elapsed = time.time() - total_start
-                    logger.info(
-                        f"Holdout preprocessing progress: "
-                        f"{newly_processed + len(failed_subjects)}/{len(records_to_process)} completed/failed, "
-                        f"{newly_processed} newly processed, "
-                        f"{len(cached_subjects)} initially cached, "
-                        f"{len(failed_subjects)} failed, "
-                        f"{elapsed:.0f}s elapsed."
-                    )
+            _release_native_memory()
+
+            if verbose:
+                elapsed = time.time() - total_start
+                logger.info(
+                    f"Holdout preprocessing progress: "
+                    f"{newly_processed + len(failed_subjects)}/{len(records_to_process)} completed/failed, "
+                    f"{newly_processed} newly processed, "
+                    f"{len(cached_subjects)} initially cached, "
+                    f"{len(failed_subjects)} failed, "
+                    f"{elapsed:.0f}s elapsed."
+                )
+
 
     _save_holdout_preprocess_marker(
         feature_output_dir,
@@ -3586,7 +3672,21 @@ def run_model(model, record, data_folder, verbose):
 
     finally:
         _run_model_processed_patients += 1
-        gc.collect()
+        try:
+            del patient_features
+        except Exception:
+            pass
+        try:
+            del seg_df
+        except Exception:
+            pass
+        try:
+            del result
+        except Exception:
+            pass
+        _release_native_memory()
+
+
 
         # Append logs from temporary directories to the global master log file
         for tmp_dir in [tmp_worker_dir, tmp_main]:
@@ -3613,6 +3713,25 @@ def run_model(model, record, data_folder, verbose):
             _cleanup_dir(tmp_main)
 
 
+def _release_native_memory():
+    """
+    Releases unused C++ memory from PyArrow's native memory pool back to the OS,
+    closes lingering Matplotlib figure windows, and triggers multi-generational GC.
+    """
+    try:
+        import pyarrow as pa
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        import matplotlib.pyplot as plt
+        plt.close("all")
+    except Exception:
+        pass
+    for g in range(3):
+        gc.collect(g)
+
+
 def _predict_single_patient(
     model_dict: dict,
     patient_features: pd.DataFrame,
@@ -3630,6 +3749,8 @@ def _predict_single_patient(
     binary_output = int(pred_df["prediction"].iloc[0])
     probability_output = float(pred_df["probability"].iloc[0])
 
+    del pred_df
+
     if not np.isfinite(probability_output):
         probability_output = 0.10
         binary_output = 0
@@ -3638,6 +3759,7 @@ def _predict_single_patient(
     binary_output = int(1 if binary_output else 0)
 
     return binary_output, probability_output
+
 
 
 # =============================================================================
