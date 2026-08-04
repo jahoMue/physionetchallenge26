@@ -633,8 +633,8 @@ def _get_safe_workers(configured_workers: int, verbose: bool = False) -> int:
             pass
 
     if available_gb is not None:
-        # Assume 1.5 GB per worker process
-        safe_workers = max(1, int(available_gb / 1.5))
+        # Assume conservative 4.0 GB per worker process to account for outlier PSG signal buffers
+        safe_workers = max(1, int(available_gb / 4.0))
         return min(configured_workers, safe_workers)
     
     # Fallback to a safe number of workers (2) if memory cannot be determined
@@ -3312,16 +3312,26 @@ def _ensure_holdout_preprocessed_parallel(
             if verbose:
                 logger.info(f"Sequential fallback: Processing holdout {pid}...")
             try:
-                result = _preprocess_one_patient_worker(
-                    data_folder=data_folder,
-                    tmp_model_dir=tmp_model_dir,
-                    pipeline_patient_id=pid,
-                    patient_dir_str=str(patient_dir),
-                    record_name=record_name,
-                    segment_length_sec=segment_length_sec,
-                    overlap_sec=overlap_sec,
-                    feature_output_dir_str=str(feature_output_dir),
-                )
+                with ProcessPoolExecutor(max_workers=1) as single_executor:
+                    future = single_executor.submit(
+                        _preprocess_one_patient_worker,
+                        data_folder=data_folder,
+                        tmp_model_dir=tmp_model_dir,
+                        pipeline_patient_id=pid,
+                        patient_dir_str=str(patient_dir),
+                        record_name=record_name,
+                        segment_length_sec=segment_length_sec,
+                        overlap_sec=overlap_sec,
+                        feature_output_dir_str=str(feature_output_dir),
+                    )
+                    try:
+                        result = future.result(timeout=600)
+                    except Exception as fe:
+                        try:
+                            single_executor.shutdown(wait=False, cancel_futures=True)
+                        except Exception:
+                            pass
+                        raise fe
                 processed_count += 1
 
                 if result and result.get("success"):
@@ -3599,7 +3609,7 @@ def run_model(model, record, data_folder, verbose):
                 )
 
                 try:
-                    result = future.result()
+                    result = future.result(timeout=600)
 
                     if result and result.get("success"):
                         _remember_preprocessing_result(
@@ -3611,9 +3621,13 @@ def run_model(model, record, data_folder, verbose):
                         )
 
                 except Exception as e:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
                     if verbose:
                         print(
-                            f"  ! Worker failed for {pipeline_patient_id}: "
+                            f"  ! Worker failed/timed out for {pipeline_patient_id}: "
                             f"{type(e).__name__}: {e}"
                         )
                         traceback.print_exc()
@@ -3716,11 +3730,17 @@ def run_model(model, record, data_folder, verbose):
 def _release_native_memory():
     """
     Releases unused C++ memory from PyArrow's native memory pool back to the OS,
-    closes lingering Matplotlib figure windows, and triggers multi-generational GC.
+    flushes glibc heap arenas back to the OS via malloc_trim, closes lingering
+    Matplotlib figure windows, and triggers multi-generational GC.
     """
     try:
         import pyarrow as pa
         pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
     except Exception:
         pass
     try:

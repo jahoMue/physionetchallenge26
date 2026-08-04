@@ -134,14 +134,14 @@ def extract_spindle_so_coupling_features(
     if duration_sec < 10.0:
         return features
 
-    data_f64 = segment_data.astype(np.float64)
+    data_f64 = segment_data.astype(SIGNAL_DTYPE)
 
     # ==================================================================
     # DIAGNOSTIC LOGGING — Remove after debugging
     # ==================================================================
     if logger and segment_idx < 5:
-        sig_std = np.std(data_f64)
-        sig_ptp = np.ptp(data_f64)
+        sig_std = float(np.std(data_f64))
+        sig_ptp = float(np.ptp(data_f64))
 
         try:
             nperseg_d = min(len(data_f64), int(fs * 4))
