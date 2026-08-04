@@ -275,7 +275,7 @@ DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
 # ==============================================================================
 # PARALLEL COMPUTING
 # ==============================================================================
-NUM_WORKERS = 6 # max(1, (os.cpu_count() or 1) - 1)
+NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)
 
 # ==============================================================================
 # TIMEOUT CONFIGURATION (for run_model.py)
