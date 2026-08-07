@@ -276,7 +276,7 @@ DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
 # PARALLEL COMPUTING
 # ==============================================================================
 NUM_WORKERS = 4 # max(1, (os.cpu_count() or 1) - 1)
-INFERENCE_PARALLEL = True  # Set to False to disable batch parallel prefetching and run sequential record-by-record inference during run_model.py
+INFERENCE_PARALLEL = False  # Set to False to disable batch parallel prefetching and run sequential record-by-record inference during run_model.py
 
 
 # ==============================================================================
