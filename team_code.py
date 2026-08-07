@@ -3325,7 +3325,7 @@ def _ensure_holdout_preprocessed_parallel(
                         feature_output_dir_str=str(feature_output_dir),
                     )
                     try:
-                        result = future.result(timeout=600)
+                        result = future.result(timeout=1200)
                     except Exception as fe:
                         try:
                             single_executor.shutdown(wait=False, cancel_futures=True)
