@@ -100,12 +100,21 @@ python train_model.py -d path/to/training_data -m path/to/save_model -v
 ### 2. Running the Model (`run_model.py`)
 Executes the trained model against a new (unseen) dataset.
 ```bash
+# Default mode (controlled by INFERENCE_PARALLEL in config.py):
 python run_model.py -d path/to/test_data -m path/to/saved_model -o path/to/outputs -v
+
+# Explicit sequential mode (record-by-record):
+python run_model.py -d path/to/test_data -m path/to/saved_model -o path/to/outputs -v --sequential
+
+# Explicit parallel mode (batch prefetching):
+python run_model.py -d path/to/test_data -m path/to/saved_model -o path/to/outputs -v --parallel
 ```
 * **Integration:** 
   1. Calls `team_code.load_model()` to load the `.sav` file into memory.
   2. Calls `team_code.run_model()` iteratively for every patient in `demographics.csv`.
-  3. To maximize efficiency during testing, the very first call to `run_model` fires a background prefetching thread pool that preprocesses all patients in parallel (mirroring the training behavior).
+  3. Processing mode is controlled via `INFERENCE_PARALLEL` in `config.py` (or overridden via `--sequential` / `--parallel` flags):
+     - **Parallel Mode (`INFERENCE_PARALLEL = True` or `--parallel`)**: Fires a background pool on the first call to preprocess all patients in parallel into a fixed cache for maximum throughput.
+     - **Sequential Mode (`INFERENCE_PARALLEL = False` or `--sequential`)**: Preprocesses each record individually on-demand as `run_model.py` iterates over records.
   4. Outputs (binary predictions and probabilities) are mapped back to an updated `demographics.csv` saved in the `-o` output folder.
 
 ### 3. Evaluating the Model (`evaluate_model.py`)

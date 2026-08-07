@@ -28,13 +28,22 @@ def get_parser():
     parser.add_argument('-o', '--output_folder', type=str, required=True)
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('-f', '--allow_failures', action='store_true')
+    parser.add_argument('--sequential', action='store_true', help='Run inference sequentially (record-by-record)')
+    parser.add_argument('--parallel', action='store_true', help='Run inference in parallel (batch prefetching)')
     return parser
 
 # Run the code.
 def run(args):
+    import config
+    if args.sequential:
+        config.INFERENCE_PARALLEL = False
+    elif args.parallel:
+        config.INFERENCE_PARALLEL = True
+
     # Load the models.
     if args.verbose:
-        print('Loading the Challenge model...')
+        mode_str = "parallel" if getattr(config, "INFERENCE_PARALLEL", True) else "sequential"
+        print(f'Loading the Challenge model (Inference Mode: {mode_str})...')
 
     # You can use these functions to perform tasks, such as loading your model, that you only need to perform once.
     model = load_model(args.model_folder, args.verbose) ### Teams: Implement this function!!!

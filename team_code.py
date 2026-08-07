@@ -3158,7 +3158,11 @@ def _ensure_holdout_preprocessed_parallel(
     _run_model_processed_patients = max(_run_model_processed_patients, len(cached_subjects))
 
 
-    configured_workers = int(getattr(config, "NUM_WORKERS", 1))
+    inference_parallel = getattr(config, "INFERENCE_PARALLEL", True)
+    if not inference_parallel:
+        configured_workers = 1
+    else:
+        configured_workers = int(getattr(config, "NUM_WORKERS", 1))
     configured_workers = max(1, configured_workers)
 
     if len(records_to_process) == 0:
@@ -3325,7 +3329,7 @@ def _ensure_holdout_preprocessed_parallel(
                         feature_output_dir_str=str(feature_output_dir),
                     )
                     try:
-                        result = future.result(timeout=600)
+                        result = future.result(timeout=1200)
                     except Exception as fe:
                         try:
                             single_executor.shutdown(wait=False, cancel_futures=True)
@@ -3562,17 +3566,25 @@ def run_model(model, record, data_folder, verbose):
             f"{Path(feature_output_dir).resolve()}"
         )
 
-        if model.get("__holdout_preprocess_state_key") != preprocess_state_key:
-            _ensure_holdout_preprocessed_parallel(
-                data_folder=data_folder,
-                tmp_model_dir=tmp_worker_dir,
-                feature_output_dir=feature_output_dir,
-                verbose=verbose,
-            )
-            model["__holdout_preprocess_state_key"] = preprocess_state_key
+        inference_parallel = getattr(config, "INFERENCE_PARALLEL", True)
+
+        if inference_parallel:
+            if model.get("__holdout_preprocess_state_key") != preprocess_state_key:
+                _ensure_holdout_preprocessed_parallel(
+                    data_folder=data_folder,
+                    tmp_model_dir=tmp_worker_dir,
+                    feature_output_dir=feature_output_dir,
+                    verbose=verbose,
+                )
+                model["__holdout_preprocess_state_key"] = preprocess_state_key
+            else:
+                if verbose:
+                    print("  - Global holdout preprocessing/cache check already done; skipping.")
         else:
-            if verbose:
-                print("  - Global holdout preprocessing/cache check already done; skipping.")
+            if model.get("__holdout_preprocess_state_key") != preprocess_state_key:
+                if verbose:
+                    print("  - Sequential inference mode enabled: processing patients record-by-record on demand.")
+                model["__holdout_preprocess_state_key"] = preprocess_state_key
 
         result = _find_cached_preprocessing(
             feature_output_dir=feature_output_dir,
