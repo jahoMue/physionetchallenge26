@@ -24,6 +24,7 @@ ORP_SYMBOLVALUES_DIR = r'./feature_extraction/SymbolValues.txt'
 CALCULATE_ONLY_SELECTED_FEATURES = True
 SELECTED_FEATURES_FILE = PROJECT_DIR / "feature_names.json"
 
+CAP_CLASSIFICATION_ENABLED = False
 
 # Training-Set Verzeichnis
 TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
