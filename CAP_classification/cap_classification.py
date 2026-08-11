@@ -1,9 +1,26 @@
 import numpy as np
 import onnxruntime as ort
 from CAP_classification.post_processing import label_reconstruction, post_processing_multi_class, cap_sequences, get_output_statistics
-from config import CAP_MODEL_DIR
+from config import CAP_MODEL_DIR, CAP_CLASSIFICATION_ENABLED
 
 _GLOBAL_ORT_SESSION = None
+
+_CAP_PARAM_KEYS = [
+    "cap_SLDUR",
+    "cap_NRAPH", "cap_APHDUR", "cap_AVGAPHDUR", "cap_NRAPHPH", "cap_RAPHSL",
+    "cap_NRA1", "cap_A1DUR", "cap_AVGA1DUR", "cap_RA1APH", "cap_RA1NRE", "cap_A1IND",
+    "cap_NRA2", "cap_A2DUR", "cap_AVGA2DUR", "cap_RA2APH", "cap_RA2NRE", "cap_A2IND",
+    "cap_NRA3", "cap_A3DUR", "cap_AVGA3DUR", "cap_RA3APH", "cap_RA3NRE", "cap_A3IND",
+    "cap_NRCAP", "cap_CAPDUR", "cap_RCAPSL", "cap_AVGCAPDUR",
+    "cap_AVGCYCLEDUR", "cap_AVGBPHADUR",
+]
+
+def _nan_cap_stats(name=''):
+    """Gibt das CAP-Statistik-Dict mit allen Parametern auf NaN zurück."""
+    stats = {'ID': name}
+    for key in _CAP_PARAM_KEYS:
+        stats[key] = np.nan
+    return stats
 
 def _get_ort_session():
     global _GLOBAL_ORT_SESSION
@@ -18,6 +35,8 @@ def cap_classification(input_list, eeg, flags):
     flags: Dict mit Optionen
     lstm_predict_fn: Funktion, die ein Input-Array (seq_len, features) nimmt und Vorhersagen zurückgibt
     """
+    if not CAP_CLASSIFICATION_ENABLED:
+        return _nan_cap_stats(getattr(eeg, 'name', ''))
 
     ort_session = _get_ort_session()
 
