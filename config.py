@@ -24,7 +24,7 @@ ORP_SYMBOLVALUES_DIR = r'./feature_extraction/SymbolValues.txt'
 CALCULATE_ONLY_SELECTED_FEATURES = True
 SELECTED_FEATURES_FILE = PROJECT_DIR / "feature_names.json"
 
-CAP_CLASSIFICATION_ENABLED = False
+CAP_CLASSIFICATION_ENABLED = True
 
 # Training-Set Verzeichnis
 TRAINING_SET_DIR = Path(r"D:\Physionet26Data\training_set")
@@ -258,7 +258,7 @@ EEG_CORRELATION_THRESHOLD = 0.7 # Mindestkorrelation für Kanal-Mittelung
 #   - skip compute_delta_power_entropy(...)
 #   - do not add Delta_Power_Entropy, ORP_*, Artifact_Fraction, CSI to patient features
 #   - do not keep these columns during compact training feature loading
-enable_delta_power_entropy = True
+enable_delta_power_entropy = False
 
 DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
     "Delta_Power_Entropy",

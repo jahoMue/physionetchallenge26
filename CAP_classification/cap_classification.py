@@ -25,10 +25,14 @@ def _nan_cap_stats(name=''):
 def _get_ort_session():
     global _GLOBAL_ORT_SESSION
     if _GLOBAL_ORT_SESSION is None:
-        _GLOBAL_ORT_SESSION = ort.InferenceSession(CAP_MODEL_DIR)
+        so = ort.SessionOptions()
+        # Verhindert, dass der Arena-Allocator sehr grosse zusammenhaengende
+        # Puffer fuer lange Sequenzen spekulativ reserviert.
+        so.enable_cpu_mem_arena = False
+        _GLOBAL_ORT_SESSION = ort.InferenceSession(CAP_MODEL_DIR, sess_options=so)
     return _GLOBAL_ORT_SESSION
 
-def cap_classification(input_list, eeg, flags):
+def cap_classification(input_list, eeg, flags, chunk_sec=3600, overlap_sec=120):
     """
     input_list: Liste von Feature-Fenstern (L x 30)
     eeg: SignalEEG-Objekt
@@ -39,42 +43,48 @@ def cap_classification(input_list, eeg, flags):
         return _nan_cap_stats(getattr(eeg, 'name', ''))
 
     ort_session = _get_ort_session()
+    input_name = ort_session.get_inputs()[0].name
 
-    # Normalisierung (medianiqr)
-    def medianiqr_norm(x):
-        med = np.median(x, axis=0, keepdims=True)
-        iqr = np.subtract(*np.percentile(x, [75, 25], axis=0, keepdims=True))
-        return (x - med) / (iqr + 1e-8)
-    
-    input_norm = [medianiqr_norm(x) for x in input_list]
+    # Per-Zeitschritt-Normalisierung (median/iqr ueber die 14 Feature-Dims).
+    # Vektorisiert statt Python-Liste aus T Kopien -> deutlich weniger Speicher.
+    X = np.asarray(input_list, dtype=np.float32)
+    med = np.median(X, axis=1, keepdims=True)
+    q75, q25 = np.percentile(X, [75, 25], axis=1, keepdims=True)
+    X_norm = ((X - med) / ((q75 - q25) + 1e-8)).astype(np.float32)
 
-    # LSTM Initialisieren
-    def lstm_predict_fn(input_norm):
-        # x_batch: (batch, seq_len, features)
-        x = np.array(input_norm)
-        x_batch = np.expand_dims(x.astype(np.float32), axis=0)
-        input_name = ort_session.get_inputs()[0].name
+    T = X_norm.shape[0]
+
+    def _run_chunk(arr2d):
+        x_batch = np.expand_dims(arr2d, axis=0)
         outputs = ort_session.run(None, {input_name: x_batch})
-        pred = np.argmax(outputs[0], axis=-1)
-        return np.atleast_1d(pred)  # Immer 1D-Array zurückgeben
-    # LSTM-Vorhersage
-    predictions = lstm_predict_fn(input_norm)
-    # Mehrheitsvoting
-    pred_arr = np.stack(predictions)
-    pred_1 = np.sum(predictions == 1, axis=0)
-    pred_2 = np.sum(predictions == 2, axis=0)
-    pred_3 = np.sum(predictions == 3, axis=0)
-    n_pred = pred_arr.shape[0]
-    pred = (pred_1 > n_pred//2).astype(int) + 2*(pred_2 > n_pred//2) + 3*(pred_3 > n_pred//2)
-    # Label-Rekonstruktion und Postprocessing
-    x = input_list
-    pred_rec, x_rec = label_reconstruction(eeg, predictions, x, 30)
+        return np.atleast_1d(np.argmax(outputs[0], axis=-1)).reshape(-1)
+
+    # Chunking entlang der Zeitachse deckelt den Aktivierungsspeicher
+    # unabhaengig von der Nachtlaenge. Overlap dient als LSTM-"Warmup",
+    # der verworfen wird (CAP-A-Phasen sind < 60 s, 120 s Overlap genuegt).
+    if T <= chunk_sec:
+        predictions = _run_chunk(X_norm)
+    else:
+        predictions = np.empty(T, dtype=np.int64)
+        step = max(1, chunk_sec - overlap_sec)
+        start = 0
+        while start < T:
+            end = min(start + chunk_sec, T)
+            chunk_pred = _run_chunk(X_norm[start:end])
+            keep_from = 0 if start == 0 else overlap_sec
+            predictions[start + keep_from:end] = chunk_pred[keep_from:]
+            if end >= T:
+                break
+            start += step
+
+    del X_norm, X
+
+    pred_rec, x_rec = label_reconstruction(eeg, predictions, input_list, 30)
     pred_rec = post_processing_multi_class(pred_rec, x_rec)
-    # Event-Vektor für CAPsequences
     events_vec = np.repeat(eeg.event, 30)
     if flags.get('Scoring', '') == 'CAP':
         pred_rec, CAP_start, CAP_stop = cap_sequences(pred_rec, events_vec)
     else:
         CAP_start, CAP_stop = [], []
-    stats = get_output_statistics(predictions, pred_rec, CAP_start, CAP_stop, eeg.name)
-    return stats
+
+    return get_output_statistics(predictions, pred_rec, CAP_start, CAP_stop, eeg.name)
