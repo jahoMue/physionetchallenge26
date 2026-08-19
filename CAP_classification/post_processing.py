@@ -1,28 +1,27 @@
 import numpy as np
 
 def label_reconstruction(eeg, labels, x, seq_length):
-    labels_rec = np.concatenate([np.zeros(seq_length-1), labels])
-    x_rec = x.copy()
+    # x_rec (2D) wird von KEINER nachgelagerten Funktion genutzt
+    # (post_processing_multi_class ignoriert sein zweites Argument),
+    # verursachte aber durch wiederholtes np.concatenate eine
+    # O(T^2)-Speicherexplosion -> OOM. Wir rekonstruieren daher nur
+    # den 1D-Label-Vektor und geben None statt x_rec zurueck.
+    labels_rec = np.concatenate([np.zeros(seq_length - 1), labels])
     for i in range(len(eeg.event)):
         if eeg.event[i] == 0 or eeg.event[i] == 5 or eeg.event[i] > 8:
+            dur = int(eeg.duration[i])
             if eeg.eventtime[i] == 0:
-                labels_rec = np.concatenate([np.zeros(int(eeg.duration[i])), labels_rec])
-                x_rec = np.concatenate([np.zeros((x_rec.shape[0], int(eeg.duration[i]))), x_rec], axis=1)
+                labels_rec = np.concatenate([np.zeros(dur), labels_rec])
             elif eeg.eventtime[i] > len(labels_rec):
-                labels_rec = np.concatenate([labels_rec, np.zeros(int(eeg.duration[i]))])
-                x_rec = np.concatenate([x_rec, np.zeros((x_rec.shape[0], int(eeg.duration[i])))], axis=1)
+                labels_rec = np.concatenate([labels_rec, np.zeros(dur)])
             else:
+                et = int(eeg.eventtime[i])
                 labels_rec = np.concatenate([
-                    labels_rec[:int(eeg.eventtime[i])],
-                    np.zeros(int(eeg.duration[i])),
-                    labels_rec[int(eeg.eventtime[i]):]
+                    labels_rec[:et],
+                    np.zeros(dur),
+                    labels_rec[et:],
                 ])
-                x_rec = np.concatenate([
-                    x_rec[:, :int(eeg.eventtime[i])],
-                    np.zeros((x_rec.shape[0], int(eeg.duration[i]))),
-                    x_rec[:, int(eeg.eventtime[i]):]
-                ], axis=1)
-    return labels_rec, x_rec
+    return labels_rec, None
 
 def post_processing_multi_class(y, x):
     # Entspricht postProcessingMultiClass.m
