@@ -258,7 +258,7 @@ EEG_CORRELATION_THRESHOLD = 0.7 # Mindestkorrelation für Kanal-Mittelung
 #   - skip compute_delta_power_entropy(...)
 #   - do not add Delta_Power_Entropy, ORP_*, Artifact_Fraction, CSI to patient features
 #   - do not keep these columns during compact training feature loading
-enable_delta_power_entropy = False
+enable_delta_power_entropy = True
 
 DELTA_POWER_ENTROPY_FEATURE_COLUMNS = [
     "Delta_Power_Entropy",
