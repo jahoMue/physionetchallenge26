@@ -32,7 +32,7 @@ def _get_ort_session():
         _GLOBAL_ORT_SESSION = ort.InferenceSession(CAP_MODEL_DIR, sess_options=so)
     return _GLOBAL_ORT_SESSION
 
-def cap_classification(input_list, eeg, flags, chunk_sec=600, overlap_sec=120):
+def cap_classification(input_list, eeg, flags, chunk_sec=3600, overlap_sec=120):
     """
     input_list: Liste von Feature-Fenstern (L x 30)
     eeg: SignalEEG-Objekt
